@@ -1,0 +1,301 @@
+import { randomInt, randomUUID } from "node:crypto";
+import { z } from "zod";
+import type { Config } from "./config.js";
+import type { Media } from "./media.js";
+import type { Meeting, Participant, Store } from "./store.js";
+import {
+  checkPassword,
+  digest,
+  HttpError,
+  keyedDigest,
+  passwordHash,
+  randomToken,
+  safeEqual,
+} from "./security.js";
+
+export const PHONE_LEASE_MS = 10_000;
+export const activePhone = (p: Participant) =>
+  p.transport === "phone" &&
+  (["waiting", "admitted"].includes(p.status) || !!p.enforcementPending);
+export const recordingInProgress = (m: Meeting) =>
+  m.recordings.some((r) =>
+    ["starting", "recording", "stopping"].includes(r.status),
+  );
+export const phoneCallSchema = z
+  .object({
+    locator: z.string().regex(/^\d{12}$/),
+    pin: z.string().regex(/^\d{8}$/),
+    callId: z.string().uuid(),
+    trunkId: z.string().regex(/^[A-Za-z0-9_.:-]{1,80}$/),
+    callerId: z
+      .string()
+      .regex(/^\+[1-9]\d{6,14}$/)
+      .optional(),
+  })
+  .strict();
+export const phonePollSchema = z
+  .object({
+    callId: z.string().uuid(),
+    sessionToken: z.string().min(32).max(128),
+    action: z.enum(["poll", "leave", "toggle-mute", "toggle-hand"]),
+  })
+  .strict();
+
+export function revokePhoneParticipants(m: Meeting) {
+  const revoked: Participant[] = [];
+  for (const p of m.participants)
+    if (p.transport === "phone" && ["waiting", "admitted"].includes(p.status)) {
+      p.status = "left";
+      p.mediaVersion++;
+      p.enforcementPending = true;
+      p.phone!.leaseExpiresAt = 0;
+      revoked.push(structuredClone(p));
+    }
+  return revoked;
+}
+
+export class PhoneService {
+  constructor(
+    readonly config: Config,
+    readonly store: Store,
+    readonly media: Media,
+  ) {}
+  requireEnabled() {
+    if (!this.config.phoneEnabled)
+      throw new HttpError(503, "Phone access is disabled");
+  }
+  authenticate(headers: Record<string, unknown>) {
+    this.requireEnabled();
+    if (
+      headers.origin !== undefined ||
+      headers["x-requested-with"] !== "CovemeetPhone" ||
+      !safeEqual(
+        String(headers.authorization ?? ""),
+        `Bearer ${this.config.phoneGatewayKey}`,
+      )
+    )
+      throw new HttpError(403, "Phone gateway authentication required");
+  }
+  async credentials() {
+    this.requireEnabled();
+    const locator = randomInt(0, 1_000_000_000_000)
+      .toString()
+      .padStart(12, "0");
+    const pin = randomInt(0, 100_000_000).toString().padStart(8, "0");
+    return { locator, pin, pinHash: await passwordHash(pin) };
+  }
+  settings(m: Meeting) {
+    return {
+      enabled: this.config.phoneEnabled && !!m.phoneAccess?.enabled,
+      locator: m.phoneAccess?.enabled ? m.phoneAccess.locator : undefined,
+      dialInNumber: this.config.phoneDialInNumber,
+      sipAddress: this.config.phoneSipAddress,
+    };
+  }
+  async create(raw: unknown) {
+    this.requireEnabled();
+    const body = phoneCallSchema.parse(raw);
+    if (body.trunkId !== this.config.phoneTrunkId)
+      throw new HttpError(403, "Phone access unavailable");
+    const now = Date.now();
+    // Persist attempts across restarts/API instances. The trunk gate also bounds
+    // the number of distinct locator counters an authenticated gateway can create.
+    for (const [scope, limit] of [
+      [`trunk:${body.trunkId}`, 30],
+      [`locator:${body.trunkId}:${body.locator}`, 10],
+    ] as const) {
+      if (
+        !(await this.store.phoneAttempt(
+          keyedDigest(this.config.secret, `phone-attempt:${scope}`),
+          limit,
+          now,
+        ))
+      )
+        throw new HttpError(429, "Phone access attempts exceeded");
+    }
+    const found = await this.store.byPhoneLocator(body.locator);
+    if (
+      !found?.phoneAccess?.enabled ||
+      !(await checkPassword(found.phoneAccess.pinHash, body.pin))
+    )
+      throw new HttpError(403, "Phone access unavailable");
+    const participantId = randomUUID(),
+      sessionToken = randomToken();
+    const callerHash = body.callerId
+      ? keyedDigest(
+          this.config.secret,
+          `phone-caller:${found.id}:${body.trunkId}:${body.callerId}`,
+        )
+      : undefined;
+    return this.store.reservePhone(
+      found.code,
+      body.callId,
+      participantId,
+      this.config.phoneMaxCalls,
+      (m) => {
+        if (
+          m.ended ||
+          m.locked ||
+          !m.phoneAccess?.enabled ||
+          m.phoneAccess.locator !== body.locator ||
+          m.phoneAccess.pinHash !== found.phoneAccess!.pinHash ||
+          recordingInProgress(m)
+        )
+          throw new HttpError(403, "Phone access unavailable");
+        if (callerHash && m.bans.caller?.includes(callerHash))
+          throw new HttpError(403, "Phone access unavailable");
+        const occupied = m.participants.filter(
+          (p) =>
+            ["waiting", "admitted"].includes(p.status) &&
+            p.expiresAt > Date.now(),
+        );
+        if (
+          m.mode === "meeting"
+            ? occupied.length >= 100
+            : occupied.filter((p) => p.role === "viewer").length >= 1000
+        )
+          throw new HttpError(409, "Meeting capacity is full");
+        const current = Date.now();
+        const callExpiresAt =
+          current + this.config.phoneMaxDurationSeconds * 1000;
+        const p: Participant = {
+          id: participantId,
+          name: `Phone caller ${participantId.slice(0, 4).toUpperCase()}`,
+          transport: "phone",
+          role: m.mode === "webinar" ? "viewer" : "participant",
+          status: "waiting",
+          audioAllowed: m.mode === "meeting",
+          videoAllowed: false,
+          mediaVersion: 1,
+          tokenHash: digest(sessionToken),
+          ipHash: "",
+          deviceHash: "",
+          breakoutId: null,
+          expiresAt: Math.min(
+            callExpiresAt,
+            current + this.config.phoneLobbySeconds * 1000,
+          ),
+          phone: {
+            callId: body.callId,
+            trunkId: body.trunkId,
+            callerHash,
+            muted: true,
+            handRaised: false,
+            leaseExpiresAt: current + PHONE_LEASE_MS,
+            callExpiresAt,
+          },
+        };
+        m.participants.push(p);
+        return {
+          code: m.code,
+          participantId,
+          sessionToken,
+          expiresAt: p.expiresAt,
+        };
+      },
+    );
+  }
+  async update(code: string, id: string, raw: unknown) {
+    this.requireEnabled();
+    const body = phonePollSchema.parse(raw);
+    const snapshot = await this.store.change(code, (m) => {
+      const p = m.participants.find((p) => p.id === id);
+      if (
+        !p?.phone ||
+        p.transport !== "phone" ||
+        p.phone.callId !== body.callId ||
+        p.phone.trunkId !== this.config.phoneTrunkId ||
+        !safeEqual(p.tokenHash, digest(body.sessionToken))
+      )
+        throw new HttpError(403, "Phone session unavailable");
+      const now = Date.now();
+      const ended =
+        body.action === "leave" ||
+        m.ended ||
+        !m.phoneAccess?.enabled ||
+        p.expiresAt <= now ||
+        p.phone.leaseExpiresAt <= now ||
+        !["waiting", "admitted"].includes(p.status) ||
+        recordingInProgress(m);
+      if (ended) {
+        if (["waiting", "admitted"].includes(p.status)) {
+          p.status = "left";
+          p.mediaVersion++;
+          p.enforcementPending = true;
+        }
+        p.phone.leaseExpiresAt = 0;
+      } else {
+        p.phone.leaseExpiresAt = Math.min(p.expiresAt, now + PHONE_LEASE_MS);
+        if (
+          body.action === "toggle-mute" &&
+          p.status === "admitted" &&
+          !p.enforcementPending &&
+          p.audioAllowed &&
+          p.role !== "viewer"
+        ) {
+          p.phone.muted = !p.phone.muted;
+          p.mediaVersion++;
+          p.enforcementPending = true;
+        }
+        if (body.action === "toggle-hand")
+          p.phone.handRaised = !p.phone.handRaised;
+      }
+      return {
+        meeting: structuredClone(m),
+        participant: structuredClone(p),
+        ended,
+      };
+    });
+    const { meeting: m, participant: p, ended } = snapshot;
+    if (p.enforcementPending) {
+      await this.media.remove(m, p);
+      await this.store.change(code, (state) => {
+        const current = state.participants.find((x) => x.id === id);
+        if (current?.mediaVersion === p.mediaVersion) {
+          current.enforcementPending = false;
+          delete current.previousRoom;
+        }
+      });
+      p.enforcementPending = false;
+    }
+    if (body.action === "leave") {
+      // The trusted gateway sends leave only after both audio legs are closed.
+      // Lease expiry alone never releases a billable/concurrent-call reservation.
+      await this.store.releasePhone(body.callId, code, id);
+    }
+    const admitted = !ended && p.status === "admitted";
+    const grant = admitted
+      ? {
+          token: await this.media.token(m, p),
+          url: this.config.origin.replace(/^http/, "ws"),
+          cookie: `mp_${m.code}=${body.sessionToken}`,
+          subscribeParticipantIds: m.participants
+            .filter(
+              (x) =>
+                x.id !== p.id &&
+                x.status === "admitted" &&
+                !x.enforcementPending &&
+                x.role !== "viewer" &&
+                x.breakoutId === null &&
+                x.expiresAt > Date.now() &&
+                (!x.phone || x.phone.leaseExpiresAt > Date.now()),
+            )
+            .map((x) => x.id),
+        }
+      : undefined;
+    return {
+      state: ended
+        ? ("ended" as const)
+        : admitted
+          ? ("admitted" as const)
+          : ("waiting" as const),
+      mediaVersion: p.mediaVersion,
+      muted: p.phone!.muted,
+      handRaised: p.phone!.handRaised,
+      audioAllowed: p.role !== "viewer" && p.audioAllowed,
+      leaseExpiresAt: p.phone!.leaseExpiresAt,
+      expiresAt: p.expiresAt,
+      ...(grant ? { grant } : {}),
+    };
+  }
+}

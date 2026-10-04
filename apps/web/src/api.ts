@@ -19,6 +19,7 @@ export type Config = {
   brandName: string;
   recordingAvailable: boolean;
   mediaAvailable: boolean;
+  phoneAvailable: boolean;
   creationRequiresKey: boolean;
   branding?: Branding;
   portalOrigin?: string;
@@ -35,6 +36,19 @@ export type Participant = {
   mediaVersion: number;
   breakoutId: string | null;
   enforcementPending?: boolean;
+  transport: "browser" | "phone";
+  phone?: {
+    muted: boolean;
+    handRaised: boolean;
+    canBanCallerId: boolean;
+  };
+};
+
+export type PhoneAccess = {
+  enabled: boolean;
+  locator?: string;
+  dialInNumber?: string;
+  sipAddress?: string;
 };
 
 export type MeetingState = {

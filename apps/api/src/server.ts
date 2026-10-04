@@ -25,6 +25,7 @@ import {
   verifyDevice,
 } from "./security.js";
 import { RecordingService } from "./recordings.js";
+import { PhoneService, revokePhoneParticipants } from "./phone.js";
 
 const name = z.string().trim().min(1).max(80),
   password = z.string().min(8).max(256);
@@ -87,6 +88,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       : undefined,
   });
   const recordings = new RecordingService(config, store, mail);
+  const phone = new PhoneService(config, store, media);
   const defaults = {
     brandName: config.brandName,
     headline: "Meetings",
@@ -117,6 +119,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' wss:; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'",
       );
     if (["POST", "PATCH", "DELETE", "PUT"].includes(req.method)) {
+      if (req.url.startsWith("/api/internal/phone/")) {
+        phone.authenticate(req.headers);
+        if (
+          !String(req.headers["content-type"] ?? "").startsWith(
+            "application/json",
+          )
+        )
+          throw new HttpError(415, "JSON required");
+        return;
+      }
       const machine =
         req.headers["x-requested-with"] === "MeetingPlatformHosted" &&
         !!config.creationKey &&
@@ -175,6 +187,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
       (x) => safeEqual(x.tokenHash, digest(token)) && x.expiresAt > Date.now(),
     );
     if (!p) throw new HttpError(401, "Join this meeting first");
+    if (p.transport === "phone")
+      throw new HttpError(403, "Phone sessions use the phone gateway");
     if (host && p.role !== "host")
       throw new HttpError(403, "Host permission required");
     if (host && p.status !== "admitted")
@@ -247,6 +261,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
   }
   app.get("/api/health", async () => ({ ok: true }));
   app.get("/api/config", async () => ({
+    phoneAvailable: config.phoneEnabled,
     edition: config.edition,
     portalOrigin: config.portalOrigin,
     meetingOrigin: config.origin,
@@ -256,6 +271,67 @@ export async function createApp(config: Config, store: Store, media: Media) {
     mediaAvailable: media.available,
     creationRequiresKey: !!config.creationKey,
   }));
+  app.post(
+    "/api/internal/phone/calls",
+    { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
+    async (req) => {
+      phone.authenticate(req.headers);
+      return phone.create(req.body);
+    },
+  );
+  app.post(
+    "/api/internal/phone/calls/:code/:id",
+    { config: { rateLimit: { max: 3000, timeWindow: "1 minute" } } },
+    async (req) => {
+      phone.authenticate(req.headers);
+      return phone.update(codeOf(req), (req.params as any).id, req.body);
+    },
+  );
+  app.get("/api/meetings/:code/phone", async (req) => {
+    const m = await find(req);
+    actor(req, m, true);
+    return phone.settings(m);
+  });
+  app.post(
+    "/api/meetings/:code/phone",
+    { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
+    async (req) => {
+      z.object({}).strict().parse(req.body);
+      const initial = await find(req);
+      active(initial);
+      actor(req, initial, true);
+      const credentials = await phone.credentials();
+      let revoked: Participant[] = [];
+      const m = await store.change(codeOf(req), (m) => {
+        active(m);
+        actor(req, m, true);
+        revoked = revokePhoneParticipants(m);
+        m.phoneAccess = {
+          enabled: true,
+          locator: credentials.locator,
+          pinHash: credentials.pinHash,
+        };
+        return structuredClone(m);
+      });
+      await enforce(m, revoked);
+      await store.audit(m.code, "host", "phone.rotate");
+      return { ...phone.settings(m), pin: credentials.pin };
+    },
+  );
+  app.delete("/api/meetings/:code/phone", async (req) => {
+    z.object({}).strict().parse(req.body);
+    let revoked: Participant[] = [];
+    const m = await store.change(codeOf(req), (m) => {
+      active(m);
+      actor(req, m, true);
+      if (m.phoneAccess) m.phoneAccess.enabled = false;
+      revoked = revokePhoneParticipants(m);
+      return structuredClone(m);
+    });
+    await enforce(m, revoked);
+    await store.audit(m.code, "host", "phone.disable");
+    return { ok: true };
+  });
   app.post(
     "/api/admin/session",
     { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } },
@@ -498,6 +574,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
       const m = await find(req),
         p = actor(req, m);
       const pub = (x: Participant) => ({
+        transport: x.transport ?? "browser",
+        ...(x.phone
+          ? {
+              phone: {
+                muted: x.phone.muted,
+                handRaised: x.phone.handRaised,
+                canBanCallerId: !!x.phone.callerHash,
+              },
+            }
+          : {}),
         id: x.id,
         name: x.name,
         role: x.role,
@@ -583,9 +669,12 @@ export async function createApp(config: Config, store: Store, media: Media) {
           "block-video",
           "promote",
           "demote",
+          "rename",
         ]),
         banIp: z.boolean().optional(),
         banDevice: z.boolean().optional(),
+        banCallerId: z.boolean().optional(),
+        name: name.optional(),
       })
       .strict()
       .parse(req.body);
@@ -599,6 +688,20 @@ export async function createApp(config: Config, store: Store, media: Media) {
         throw new HttpError(400, "Select a guest participant");
       if (!occupiesSeat(p))
         throw new HttpError(409, "Participant session is inactive");
+      if (p.transport === "phone") {
+        if (body.banIp || body.banDevice)
+          throw new HttpError(
+            400,
+            "Phone callers do not have browser IP or device bans",
+          );
+        if (body.action === "allow-video" || body.action === "block-video")
+          throw new HttpError(400, "Phone callers use audio only");
+        if (body.banCallerId && !p.phone?.callerHash)
+          throw new HttpError(400, "Caller identity is unavailable");
+      } else if (body.banCallerId)
+        throw new HttpError(400, "Select a phone caller");
+      if (body.action === "rename" && !body.name)
+        throw new HttpError(400, "Participant name is required");
       if (
         (body.action === "allow-audio" || body.action === "allow-video") &&
         p.role === "viewer"
@@ -640,6 +743,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
         if (m.locked)
           throw new HttpError(403, "Unlock the meeting before admitting");
         p.status = "admitted";
+        if (p.phone) {
+          if (p.phone.leaseExpiresAt <= Date.now())
+            throw new HttpError(409, "Phone call is no longer active");
+          p.expiresAt = p.phone.callExpiresAt;
+        }
       } else {
         p.previousRoom ??= participantRoom(m, p);
         p.mediaVersion++;
@@ -649,22 +757,29 @@ export async function createApp(config: Config, store: Store, media: Media) {
           if (body.action === "ban") {
             if (body.banIp) m.bans.ip.push(p.ipHash);
             if (body.banDevice) m.bans.device.push(p.deviceHash);
+            if (body.banCallerId && p.phone?.callerHash)
+              (m.bans.caller ??= []).push(p.phone.callerHash);
           }
         }
         if (body.action === "allow-audio") p.audioAllowed = true;
-        if (body.action === "block-audio") p.audioAllowed = false;
+        if (body.action === "block-audio") {
+          p.audioAllowed = false;
+          if (p.phone) p.phone.muted = true;
+        }
         if (body.action === "allow-video") p.videoAllowed = true;
         if (body.action === "block-video") p.videoAllowed = false;
         if (body.action === "promote") {
           p.role = "participant";
           p.audioAllowed = true;
-          p.videoAllowed = true;
+          p.videoAllowed = p.transport !== "phone";
         }
         if (body.action === "demote") {
           p.role = "viewer";
           p.audioAllowed = false;
           p.videoAllowed = false;
+          if (p.phone) p.phone.muted = true;
         }
+        if (body.action === "rename") p.name = body.name!;
       }
       changed = structuredClone(p);
       return structuredClone(m);
@@ -805,6 +920,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
         for (const p of targets) {
           if (!p || p.status !== "admitted")
             throw new HttpError(400, "Participant is not admitted");
+          if (p.transport === "phone")
+            throw new HttpError(
+              409,
+              "Phone breakout transfers are not available",
+            );
           if (p.enforcementPending)
             throw new HttpError(
               409,
@@ -954,14 +1074,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
           m.participants.some(
             (p) =>
               ["admitted", "waiting"].includes(p.status) &&
-              p.expiresAt <= Date.now(),
+              (p.expiresAt <= Date.now() ||
+                (p.phone && p.phone.leaseExpiresAt <= Date.now())),
           )
         )
           m = await store.change(m.code, (state) => {
             for (const p of state.participants)
               if (
                 ["admitted", "waiting"].includes(p.status) &&
-                p.expiresAt <= Date.now()
+                (p.expiresAt <= Date.now() ||
+                  (p.phone && p.phone.leaseExpiresAt <= Date.now()))
               ) {
                 p.status = "left";
                 p.mediaVersion++;

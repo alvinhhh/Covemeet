@@ -26,6 +26,7 @@ import {
 } from "@meeting-platform/recording";
 import type { Config } from "./config.js";
 import type { Meeting, Recording, Store } from "./store.js";
+import { activePhone } from "./phone.js";
 import { HttpError, safeEqual } from "./security.js";
 
 export type RecorderClient = Pick<
@@ -328,6 +329,11 @@ export class RecordingService {
       createdAt: Date.now(),
     };
     await this.store.change(meeting.code, (m) => {
+      if (m.participants.some(activePhone))
+        throw new HttpError(
+          409,
+          "Recording is unavailable while phone calls are active; phone recording announcements are not implemented",
+        );
       if (m.ended || !m.recordingAllowed)
         throw new HttpError(403, "Enable recording first");
       if (!m.hostEmailVerified)

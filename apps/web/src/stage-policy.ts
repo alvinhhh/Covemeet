@@ -3,6 +3,7 @@ type StageMember = {
   role: "host" | "participant" | "viewer";
   status: string;
   breakoutId: string | null;
+  transport?: "browser" | "phone";
 };
 export type StageCandidate = {
   key: string;
@@ -30,10 +31,19 @@ export function selectStage<T extends StageCandidate>(
       (context.mode !== "webinar" || member.role !== "viewer"),
   );
   const roles = new Map(eligible.map((member) => [member.id, member.role]));
+  const phoneIds = new Set(
+    eligible
+      .filter((member) => member.transport === "phone")
+      .map((member) => member.id),
+  );
   const tracks = [
     ...new Map(
       candidates
-        .filter((track) => roles.has(track.participantId))
+        .filter(
+          (track) =>
+            roles.has(track.participantId) &&
+            !(track.source === "camera" && phoneIds.has(track.participantId)),
+        )
         .map((track) => [track.key, track]),
     ).values(),
   ];

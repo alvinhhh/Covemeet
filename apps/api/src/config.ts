@@ -70,6 +70,54 @@ export function loadConfig(env = process.env) {
     recordingLocalKeys[legacyKeyId] = env.RECORDING_KEK;
   }
   const recordingMaxBytes = Number(env.RECORDING_MAX_BYTES ?? 64 * 1024 ** 3);
+  const phoneEnabled = env.PHONE_ENABLED === "true";
+  const phoneGatewayKey = env.PHONE_GATEWAY_KEY ?? "";
+  const phoneTrunkId = env.PHONE_TRUNK_ID ?? "";
+  const phoneDialInNumber = env.PHONE_DIAL_IN_NUMBER ?? "";
+  const phoneSipAddress = env.PHONE_SIP_ADDRESS ?? "";
+  const boundedPhoneValue = (
+    value: string | undefined,
+    fallback: number,
+    maximum: number,
+  ) => {
+    const n = Number(value ?? fallback);
+    if (!Number.isSafeInteger(n) || n < 1 || n > maximum)
+      throw new Error(`Phone limit must be between 1 and ${maximum}`);
+    return n;
+  };
+  const phoneMaxCalls = boundedPhoneValue(env.PHONE_MAX_CALLS, 20, 20);
+  const phoneLobbySeconds = boundedPhoneValue(
+    env.PHONE_LOBBY_SECONDS,
+    300,
+    300,
+  );
+  const phoneMaxDurationSeconds = boundedPhoneValue(
+    env.PHONE_MAX_DURATION_SECONDS,
+    7200,
+    7200,
+  );
+  if (phoneEnabled) {
+    if (
+      phoneGatewayKey.length < 32 ||
+      [
+        secret,
+        env.CREATION_KEY,
+        env.LIVEKIT_API_SECRET,
+        env.LIVEKIT_SECRET,
+      ].includes(phoneGatewayKey)
+    )
+      throw new Error(
+        "Phone gateway requires an independent random key of at least 32 characters",
+      );
+    if (!/^[A-Za-z0-9_.:-]{1,80}$/.test(phoneTrunkId))
+      throw new Error("PHONE_TRUNK_ID is required");
+    if (!phoneDialInNumber && !phoneSipAddress)
+      throw new Error("Configure a phone dial-in number or SIP address");
+    if (phoneDialInNumber && !/^\+[1-9]\d{6,14}$/.test(phoneDialInNumber))
+      throw new Error("PHONE_DIAL_IN_NUMBER must be E.164");
+    if (phoneSipAddress && !/^sips?:[^\s<>]{1,200}$/.test(phoneSipAddress))
+      throw new Error("PHONE_SIP_ADDRESS must be a SIP address");
+  }
   if (
     !Number.isSafeInteger(recordingMaxBytes) ||
     recordingMaxBytes < 93 ||
@@ -92,6 +140,14 @@ export function loadConfig(env = process.env) {
     livekitKey: env.LIVEKIT_API_KEY ?? "",
     livekitSecret: env.LIVEKIT_API_SECRET ?? env.LIVEKIT_SECRET ?? "",
     mediaUrl: env.LIVEKIT_PUBLIC_URL ?? "ws://localhost:4100",
+    phoneEnabled,
+    phoneGatewayKey,
+    phoneTrunkId,
+    phoneDialInNumber,
+    phoneSipAddress,
+    phoneMaxCalls,
+    phoneLobbySeconds,
+    phoneMaxDurationSeconds,
     recordingEnabled: env.RECORDING_ENABLED === "true",
     recordingKek: env.RECORDING_KEK ?? "",
     recordingKeyProvider,

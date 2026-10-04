@@ -1,6 +1,16 @@
 import pg from "pg";
 import { HttpError } from "./security.js";
 export type Participant = {
+  transport?: "browser" | "phone";
+  phone?: {
+    callId: string;
+    trunkId: string;
+    callerHash?: string;
+    muted: boolean;
+    handRaised: boolean;
+    leaseExpiresAt: number;
+    callExpiresAt: number;
+  };
   id: string;
   name: string;
   role: "host" | "participant" | "viewer";
@@ -28,6 +38,11 @@ export type Recording = {
   error?: string;
 };
 export type Meeting = {
+  phoneAccess?: {
+    enabled: boolean;
+    locator: string;
+    pinHash: string;
+  };
   id: string;
   code: string;
   room: string;
@@ -42,7 +57,7 @@ export type Meeting = {
   hostTokenHash?: string;
   hostTokenExpiresAt: number;
   participants: Participant[];
-  bans: { ip: string[]; device: string[] };
+  bans: { ip: string[]; device: string[]; caller?: string[] };
   breakouts: { id: string; name: string; room: string }[];
   messages: {
     id: string;
@@ -74,6 +89,20 @@ export interface Store {
   byRoom(room: string): Promise<Meeting | null>;
   all(): Promise<Meeting[]>;
   change<T>(code: string, fn: (m: Meeting) => Promise<T> | T): Promise<T>;
+  byPhoneLocator(locator: string): Promise<Meeting | null>;
+  reservePhone<T>(
+    code: string,
+    callId: string,
+    participantId: string,
+    limit: number,
+    fn: (m: Meeting) => T,
+  ): Promise<T>;
+  releasePhone(
+    callId: string,
+    code: string,
+    participantId: string,
+  ): Promise<void>;
+  phoneAttempt(key: string, limit: number, now: number): Promise<boolean>;
   audit(
     code: string,
     actor: string,
@@ -91,6 +120,11 @@ export class PgStore implements Store {
     await this.pool.query(
       `CREATE TABLE IF NOT EXISTS settings(id text PRIMARY KEY,data jsonb NOT NULL); CREATE TABLE IF NOT EXISTS assets(id text PRIMARY KEY,mime text NOT NULL,data text NOT NULL); CREATE TABLE IF NOT EXISTS meetings(code text PRIMARY KEY,room text UNIQUE NOT NULL,data jsonb NOT NULL); CREATE TABLE IF NOT EXISTS audit_events(id bigserial PRIMARY KEY,meeting_code text NOT NULL,actor text NOT NULL,action text NOT NULL,target text,created_at timestamptz NOT NULL DEFAULT now());`,
     );
+    await this.pool
+      .query(`CREATE UNIQUE INDEX IF NOT EXISTS meetings_phone_locator ON meetings ((data->'phoneAccess'->>'locator')) WHERE data->'phoneAccess'->>'locator' IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS phone_calls(call_id uuid PRIMARY KEY, meeting_code text NOT NULL REFERENCES meetings(code), participant_id text NOT NULL, released boolean NOT NULL DEFAULT false);
+      CREATE TABLE IF NOT EXISTS phone_attempts(key text PRIMARY KEY, bucket bigint NOT NULL, attempts integer NOT NULL);
+      CREATE INDEX IF NOT EXISTS phone_attempts_bucket ON phone_attempts(bucket);`);
   }
   async getSettings() {
     return (
@@ -133,6 +167,86 @@ export class PgStore implements Store {
       (await this.pool.query("SELECT data FROM meetings WHERE room=$1", [room]))
         .rows[0]?.data ?? null
     );
+  }
+  async byPhoneLocator(locator: string) {
+    return (
+      (
+        await this.pool.query(
+          "SELECT data FROM meetings WHERE data->'phoneAccess'->>'locator'=$1",
+          [locator],
+        )
+      ).rows[0]?.data ?? null
+    );
+  }
+  async reservePhone<T>(
+    code: string,
+    callId: string,
+    participantId: string,
+    limit: number,
+    fn: (m: Meeting) => T,
+  ): Promise<T> {
+    const c = await this.pool.connect();
+    try {
+      await c.query("BEGIN");
+      // All API instances serialize installation-wide reservations on this lock.
+      await c.query("SELECT pg_advisory_xact_lock(704621938)");
+      if (
+        (await c.query("SELECT 1 FROM phone_calls WHERE call_id=$1", [callId]))
+          .rowCount
+      )
+        throw new HttpError(409, "Call identity has already been used");
+      if (
+        Number(
+          (
+            await c.query(
+              "SELECT count(*) AS count FROM phone_calls WHERE released=false",
+            )
+          ).rows[0].count,
+        ) >= limit
+      )
+        throw new HttpError(409, "Phone capacity is full");
+      const m = (
+        await c.query("SELECT data FROM meetings WHERE code=$1 FOR UPDATE", [
+          code,
+        ])
+      ).rows[0]?.data as Meeting | undefined;
+      if (!m) throw new HttpError(403, "Phone access unavailable");
+      const result = fn(m);
+      m.revision++;
+      await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+        code,
+        JSON.stringify(m),
+      ]);
+      await c.query(
+        "INSERT INTO phone_calls(call_id,meeting_code,participant_id) VALUES($1,$2,$3)",
+        [callId, code, participantId],
+      );
+      await c.query("COMMIT");
+      return result;
+    } catch (e) {
+      await c.query("ROLLBACK");
+      throw e;
+    } finally {
+      c.release();
+    }
+  }
+  async releasePhone(callId: string, code: string, participantId: string) {
+    await this.pool.query(
+      "UPDATE phone_calls SET released=true WHERE call_id=$1 AND meeting_code=$2 AND participant_id=$3",
+      [callId, code, participantId],
+    );
+  }
+  async phoneAttempt(key: string, limit: number, now: number) {
+    const bucket = Math.floor(now / 60000);
+    await this.pool.query("DELETE FROM phone_attempts WHERE bucket<$1", [
+      bucket - 2,
+    ]);
+    const r = await this.pool.query(
+      `INSERT INTO phone_attempts(key,bucket,attempts) VALUES($1,$2,1)
+      ON CONFLICT(key) DO UPDATE SET bucket=$2,attempts=CASE WHEN phone_attempts.bucket=$2 THEN phone_attempts.attempts+1 ELSE 1 END RETURNING attempts`,
+      [key, bucket],
+    );
+    return Number(r.rows[0].attempts) <= limit;
   }
   async all() {
     return (await this.pool.query("SELECT data FROM meetings")).rows.map(
@@ -179,6 +293,11 @@ export class PgStore implements Store {
 }
 // Test adapter only; production always uses PostgreSQL transactions.
 export class MemoryStore implements Store {
+  phoneCalls = new Map<
+    string,
+    { code: string; participantId: string; released: boolean }
+  >();
+  phoneAttempts = new Map<string, { bucket: number; attempts: number }>();
   settings: any = null;
   assets = new Map<string, { mime: string; data: string }>();
   async getSettings() {
@@ -206,6 +325,48 @@ export class MemoryStore implements Store {
     return structuredClone(
       [...this.data.values()].find((m) => m.room === room) ?? null,
     );
+  }
+  async byPhoneLocator(locator: string) {
+    return structuredClone(
+      [...this.data.values()].find((m) => m.phoneAccess?.locator === locator) ??
+        null,
+    );
+  }
+  async reservePhone<T>(
+    code: string,
+    callId: string,
+    participantId: string,
+    limit: number,
+    fn: (m: Meeting) => T,
+  ): Promise<T> {
+    return this.change(code, (m) => {
+      if (this.phoneCalls.has(callId))
+        throw new HttpError(409, "Call identity has already been used");
+      if (
+        [...this.phoneCalls.values()].filter((c) => !c.released).length >= limit
+      )
+        throw new HttpError(409, "Phone capacity is full");
+      const result = fn(m);
+      this.phoneCalls.set(callId, { code, participantId, released: false });
+      return result;
+    });
+  }
+  async releasePhone(callId: string, code: string, participantId: string) {
+    const call = this.phoneCalls.get(callId);
+    if (call?.code === code && call.participantId === participantId)
+      call.released = true;
+  }
+  async phoneAttempt(key: string, limit: number, now: number) {
+    const bucket = Math.floor(now / 60000);
+    for (const [stored, value] of this.phoneAttempts)
+      if (value.bucket < bucket - 2) this.phoneAttempts.delete(stored);
+    const old = this.phoneAttempts.get(key);
+    const value = {
+      bucket,
+      attempts: old?.bucket === bucket ? old.attempts + 1 : 1,
+    };
+    this.phoneAttempts.set(key, value);
+    return value.attempts <= limit;
   }
   async all() {
     return structuredClone([...this.data.values()]);

@@ -48,8 +48,10 @@ export class LiveMedia implements Media {
       },
     );
     const sources: TrackSource[] = [];
-    const audioAllowed = p.role !== "viewer" && p.audioAllowed;
-    const videoAllowed = p.role !== "viewer" && p.videoAllowed;
+    const audioAllowed =
+      p.role !== "viewer" && p.audioAllowed && (!p.phone || !p.phone.muted);
+    const videoAllowed =
+      p.transport !== "phone" && p.role !== "viewer" && p.videoAllowed;
     if (audioAllowed) sources.push(TrackSource.MICROPHONE);
     if (videoAllowed)
       sources.push(TrackSource.CAMERA, TrackSource.SCREEN_SHARE);
@@ -84,6 +86,8 @@ export class LiveMedia implements Media {
       p.status !== "admitted" ||
       p.enforcementPending ||
       p.expiresAt < Date.now() ||
+      (p.phone && p.phone.leaseExpiresAt <= Date.now()) ||
+      (p.transport === "phone" && !this.config.phoneEnabled) ||
       data.v !== p.mediaVersion ||
       room !== participantRoom(m, p)
     )
@@ -162,14 +166,20 @@ export class LiveMedia implements Media {
             try {
               const state = await this.store.get(m.code);
               const member = state?.participants.find((x) => x.id === p.id);
-              if (!state || !member || member.expiresAt <= Date.now()) {
+              const deadline = member
+                ? Math.min(
+                    member.expiresAt,
+                    member.phone?.leaseExpiresAt ?? Infinity,
+                  )
+                : 0;
+              if (!state || !member || deadline <= Date.now()) {
                 stop();
                 await this.remove(m, p);
                 return;
               }
               expiryTimer = setTimeout(
                 () => void checkExpiry(),
-                Math.min(member.expiresAt - Date.now(), 2147483647),
+                Math.min(deadline - Date.now(), 2147483647),
               );
               expiryTimer.unref();
             } catch {
@@ -216,6 +226,8 @@ export class LiveMedia implements Media {
                   fresh.ended ||
                   current?.status !== "admitted" ||
                   current.expiresAt <= Date.now() ||
+                  (current.phone &&
+                    current.phone.leaseExpiresAt <= Date.now()) ||
                   current.enforcementPending ||
                   current.mediaVersion !== p.mediaVersion
                 ) {

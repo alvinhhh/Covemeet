@@ -3,6 +3,9 @@ meet.example.com {
   tls {
     protocols tls1.3
   }
+  # Machine-only phone control is reachable on the private application network.
+  # Never forward it through a public meeting origin, even with a valid key.
+  respond /api/internal/* 404
   reverse_proxy 127.0.0.1:4100
   # Do not enable URL access logging: paths/query strings may contain capabilities.
   header Strict-Transport-Security "max-age=31536000"

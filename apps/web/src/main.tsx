@@ -31,6 +31,7 @@ import {
   type MeetingState,
   type Participant,
   type Branding,
+  type PhoneAccess,
 } from "./api";
 import { Icon } from "./icons";
 import "./styles.css";
@@ -862,7 +863,7 @@ function Conference({
   refresh: () => void;
 }) {
   const [panel, setPanel] = useState<
-    "participants" | "chat" | "recordings" | "breakouts" | null
+    "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
   >(() => (window.innerWidth < 760 ? null : "participants"));
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -1118,7 +1119,9 @@ function Conference({
                     ? "Meeting chat"
                     : panel === "breakouts"
                       ? "Breakout rooms"
-                      : "Recordings"}
+                      : panel === "phone"
+                        ? "Phone access"
+                        : "Recordings"}
                 {panel === "participants" && (
                   <span className="count">{admitted.length}</span>
                 )}
@@ -1135,6 +1138,11 @@ function Conference({
               <Participants
                 state={state}
                 busy={busy}
+                openPhone={
+                  host && config.phoneAvailable
+                    ? () => setPanel("phone")
+                    : undefined
+                }
                 action={(id, data) =>
                   mutate(`/participants/${encodeURIComponent(id)}/action`, data)
                 }
@@ -1147,6 +1155,8 @@ function Conference({
               />
             ) : panel === "breakouts" ? (
               <Breakouts state={state} busy={busy} mutate={mutate} />
+            ) : panel === "phone" && host && config.phoneAvailable ? (
+              <PhoneAccessPanel key={code} code={code} />
             ) : (
               <Recordings state={state} config={config} refresh={refresh} />
             )}
@@ -1435,19 +1445,197 @@ function MediaControls({ me }: { me: Participant }) {
   );
 }
 
+function PhoneAccessPanel({ code }: { code: string }) {
+  const [access, setAccess] = useState<PhoneAccess>();
+  const [pin, setPin] = useState<string>();
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    setBusy(true);
+    setError("");
+    setAccess(undefined);
+    setPin(undefined);
+    api<PhoneAccess>(
+      meetingPath(code, "/phone"),
+      undefined,
+      undefined,
+      controller.signal,
+    )
+      .then((details) => {
+        if (!controller.signal.aborted) setAccess(details);
+      })
+      .catch((e) => {
+        if (!controller.signal.aborted) setError(messageOf(e));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setBusy(false);
+      });
+    return () => controller.abort();
+  }, [code, attempt]);
+  async function change(enabled: boolean) {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    setPin(undefined);
+    try {
+      if (enabled) {
+        const issued = await api<PhoneAccess & { pin: string }>(
+          meetingPath(code, "/phone"),
+          {},
+        );
+        const { pin: nextPin, ...details } = issued;
+        setAccess(details);
+        setPin(nextPin);
+      } else {
+        await api(meetingPath(code, "/phone"), {}, "DELETE");
+        setAccess(
+          (current) =>
+            current && { ...current, enabled: false, locator: undefined },
+        );
+        setNotice("Phone access disabled.");
+      }
+    } catch (e) {
+      setError(messageOf(e));
+      setAccess(undefined);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function copy(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setNotice(`${label} copied.`);
+    } catch {
+      setError("Copy failed. Select the value and copy it manually.");
+    }
+  }
+  return (
+    <div className="panel-scroll">
+      {error && <Notice>{error}</Notice>}
+      {notice && <Notice kind="info">{notice}</Notice>}
+      {!access ? (
+        busy ? (
+          <p>Loading phone access…</p>
+        ) : (
+          <Button onClick={() => setAttempt((value) => value + 1)}>
+            Retry
+          </Button>
+        )
+      ) : (
+        <div className="form-stack">
+          <strong>
+            {access.enabled ? "Phone access enabled" : "Phone access disabled"}
+          </strong>
+          {access.dialInNumber && (
+            <Field label="Dial-in number">
+              <input readOnly value={access.dialInNumber} />
+            </Field>
+          )}
+          {access.sipAddress && (
+            <Field label="SIP address">
+              <input readOnly value={access.sipAddress} />
+            </Field>
+          )}
+          {!access.dialInNumber && !access.sipAddress && (
+            <Notice kind="info">
+              No dial-in number or SIP address is configured.
+            </Notice>
+          )}
+          {access.enabled && access.locator && (
+            <>
+              <Field label="Phone meeting code">
+                <input readOnly value={access.locator} />
+              </Field>
+              <Button
+                className="small"
+                onClick={() => void copy(access.locator!, "Phone meeting code")}
+              >
+                Copy phone code
+              </Button>
+              {pin ? (
+                <>
+                  <Field label="Access PIN">
+                    <input readOnly autoComplete="off" value={pin} />
+                  </Field>
+                  <Button
+                    className="small"
+                    onClick={() => void copy(pin, "Access PIN")}
+                  >
+                    Copy PIN
+                  </Button>
+                  <p className="panel-note">
+                    Save this PIN before closing the panel. It is shown only
+                    when generated.
+                  </p>
+                </>
+              ) : (
+                <p className="panel-note">
+                  Regenerate phone access to issue a new PIN.
+                </p>
+              )}
+            </>
+          )}
+          <Button
+            className="small primary"
+            disabled={busy}
+            onClick={() => {
+              if (
+                !access.enabled ||
+                window.confirm(
+                  "Regenerate phone access? This ends existing phone calls and replaces the phone code and PIN.",
+                )
+              )
+                void change(true);
+            }}
+          >
+            {access.enabled ? "Regenerate phone access" : "Enable phone access"}
+          </Button>
+          {access.enabled && (
+            <Button
+              className="small"
+              disabled={busy}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Disable phone access and end existing phone calls?",
+                  )
+                )
+                  void change(false);
+              }}
+            >
+              Disable phone access
+            </Button>
+          )}
+          <p className="panel-note">
+            Callers enter the phone code and PIN, then wait for host admission.
+            Caller ID does not verify identity.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Participants({
   state,
   busy,
   action,
+  openPhone,
 }: {
   state: MeetingState;
   busy: boolean;
   action: (id: string, data: object) => Promise<boolean>;
+  openPhone?: () => void;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [ban, setBan] = useState<Participant | null>(null);
   const [banIp, setBanIp] = useState(false);
   const [banDevice, setBanDevice] = useState(true);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [name, setName] = useState("");
   const host = state.me.role === "host";
   const webinar = state.meeting.webinar;
   const stageFull = !!webinar && webinar.presenters >= webinar.presenterLimit;
@@ -1456,6 +1644,11 @@ function Participants({
   const admitted = state.participants.filter((p) => p.status === "admitted");
   return (
     <div className="panel-scroll">
+      {openPhone && (
+        <Button className="small full-width" onClick={openPhone}>
+          Phone access
+        </Button>
+      )}
       {host && waiting.length > 0 && (
         <section className="waiting-list">
           <div className="section-label">
@@ -1466,7 +1659,11 @@ function Participants({
               <span className="avatar small-avatar">{initials(p.name)}</span>
               <div className="participant-name">
                 <strong>{p.name}</strong>
-                <small>Waiting for admission</small>
+                <small>
+                  {p.transport === "phone"
+                    ? "Phone caller · Waiting for admission"
+                    : "Waiting for admission"}
+                </small>
               </div>
               <Button
                 className="small primary"
@@ -1480,14 +1677,24 @@ function Participants({
               >
                 Admit
               </Button>
-              <button
-                className="icon-button"
-                aria-label={`Remove ${p.name} from waiting room`}
-                disabled={busy}
-                onClick={() => void action(p.id, { action: "kick" })}
-              >
-                <Icon name="close" size={16} />
-              </button>
+              {p.transport === "phone" ? (
+                <Button
+                  className="small"
+                  disabled={busy}
+                  onClick={() => void action(p.id, { action: "kick" })}
+                >
+                  End call
+                </Button>
+              ) : (
+                <button
+                  className="icon-button"
+                  aria-label={`Remove ${p.name} from waiting room`}
+                  disabled={busy}
+                  onClick={() => void action(p.id, { action: "kick" })}
+                >
+                  <Icon name="close" size={16} />
+                </button>
+              )}
             </div>
           ))}
         </section>
@@ -1513,6 +1720,7 @@ function Participants({
                 {p.id === state.me.id ? " (you)" : ""}
               </strong>
               <small>
+                {p.transport === "phone" && "Phone caller · "}
                 {p.role === "host"
                   ? "Host"
                   : p.role === "viewer"
@@ -1521,6 +1729,16 @@ function Participants({
                       ? "Presenter"
                       : "Participant"}
               </small>
+              {p.transport === "phone" && (
+                <small>
+                  {!p.audioAllowed
+                    ? "Speaking blocked"
+                    : p.phone?.muted
+                      ? "Muted"
+                      : "Speaking allowed"}
+                </small>
+              )}
+              {p.phone?.handRaised && <small>Hand raised</small>}
             </div>
             <span
               className={`permission-icon ${p.audioAllowed ? "" : "blocked"}`}
@@ -1530,12 +1748,14 @@ function Participants({
             >
               <Icon name="mic" size={14} />
             </span>
-            <span
-              className={`permission-icon ${p.videoAllowed ? "" : "blocked"}`}
-              title={p.videoAllowed ? "Camera permitted" : "Camera blocked"}
-            >
-              <Icon name="video" size={14} />
-            </span>
+            {p.transport !== "phone" && (
+              <span
+                className={`permission-icon ${p.videoAllowed ? "" : "blocked"}`}
+                title={p.videoAllowed ? "Camera permitted" : "Camera blocked"}
+              >
+                <Icon name="video" size={14} />
+              </span>
+            )}
             {host && p.id !== state.me.id && (
               <button
                 className="icon-button"
@@ -1553,7 +1773,9 @@ function Participants({
                 disabled={busy || p.role === "viewer"}
                 title={
                   p.role === "viewer"
-                    ? "Invite to stage to allow devices"
+                    ? p.transport === "phone"
+                      ? "Invite to stage to allow speaking"
+                      : "Invite to stage to allow devices"
                     : undefined
                 }
                 onClick={() =>
@@ -1562,25 +1784,76 @@ function Participants({
                   })
                 }
               >
-                {p.audioAllowed
-                  ? "Mute and block microphone"
-                  : "Allow microphone"}
+                {p.transport === "phone"
+                  ? p.audioAllowed
+                    ? "Mute and block speaking"
+                    : "Allow speaking"
+                  : p.audioAllowed
+                    ? "Mute and block microphone"
+                    : "Allow microphone"}
               </button>
-              <button
-                disabled={busy || p.role === "viewer"}
-                title={
-                  p.role === "viewer"
-                    ? "Invite to stage to allow devices"
-                    : undefined
-                }
-                onClick={() =>
-                  void action(p.id, {
-                    action: p.videoAllowed ? "block-video" : "allow-video",
-                  })
-                }
-              >
-                {p.videoAllowed ? "Turn off and block camera" : "Allow camera"}
-              </button>
+              {p.transport !== "phone" && (
+                <button
+                  disabled={busy || p.role === "viewer"}
+                  title={
+                    p.role === "viewer"
+                      ? "Invite to stage to allow devices"
+                      : undefined
+                  }
+                  onClick={() =>
+                    void action(p.id, {
+                      action: p.videoAllowed ? "block-video" : "allow-video",
+                    })
+                  }
+                >
+                  {p.videoAllowed
+                    ? "Turn off and block camera"
+                    : "Allow camera"}
+                </button>
+              )}
+              {p.transport === "phone" && (
+                <button
+                  disabled={busy}
+                  onClick={() => {
+                    setRenaming(p.id);
+                    setName(p.name);
+                  }}
+                >
+                  Rename caller
+                </button>
+              )}
+              {renaming === p.id && (
+                <form
+                  className="form-stack"
+                  onSubmit={async (event) => {
+                    event.preventDefault();
+                    if (
+                      await action(p.id, {
+                        action: "rename",
+                        name: name.trim(),
+                      })
+                    )
+                      setRenaming(null);
+                  }}
+                >
+                  <Field label="Caller name">
+                    <input
+                      value={name}
+                      onChange={(event) => setName(event.target.value)}
+                      maxLength={80}
+                      required
+                    />
+                  </Field>
+                  <div className="button-row">
+                    <button type="submit" disabled={busy || !name.trim()}>
+                      Save name
+                    </button>
+                    <button type="button" onClick={() => setRenaming(null)}>
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              )}
               {state.meeting.mode === "webinar" && (
                 <button
                   disabled={
@@ -1607,19 +1880,23 @@ function Participants({
                 disabled={busy}
                 onClick={() => void action(p.id, { action: "kick" })}
               >
-                Kick from meeting
+                {p.transport === "phone" ? "End call" : "Kick from meeting"}
               </button>
-              <button
-                className="danger-text"
-                disabled={busy}
-                onClick={() => {
-                  setBan(p);
-                  setBanIp(false);
-                  setBanDevice(true);
-                }}
-              >
-                Ban from meeting…
-              </button>
+              {(p.transport !== "phone" || p.phone?.canBanCallerId) && (
+                <button
+                  className="danger-text"
+                  disabled={busy}
+                  onClick={() => {
+                    setBan(p);
+                    setBanIp(false);
+                    setBanDevice(true);
+                  }}
+                >
+                  {p.transport === "phone"
+                    ? "Block caller ID…"
+                    : "Ban from meeting…"}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -1628,35 +1905,54 @@ function Participants({
         <p className="panel-note">
           Permission changes reconnect media. Participants choose when to turn
           allowed devices back on.
+          {admitted.some((p) => p.transport === "phone") &&
+            " Allowing a phone caller to speak leaves the call muted until the caller unmutes."}
         </p>
       )}
       {ban && (
         <div className="ban-form">
-          <h3>Ban {ban.name}</h3>
-          <p>
-            This participant cannot rejoin this meeting with the current
-            session.
-          </p>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={banDevice}
-              onChange={(e) => setBanDevice(e.target.checked)}
-            />
-            Also block this browser
-          </label>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={banIp}
-              onChange={(e) => setBanIp(e.target.checked)}
-            />
-            Also block this IP address
-          </label>
-          <small>
-            Browser data can be cleared. IP blocking can affect others on the
-            same network.
-          </small>
+          <h3>
+            {ban.transport === "phone" ? "Block caller ID" : "Ban"}: {ban.name}
+          </h3>
+          {ban.transport === "phone" ? (
+            <>
+              <p>
+                End this call and block calls using this caller ID for this
+                meeting.
+              </p>
+              <small>
+                Caller ID can be changed or spoofed. This does not verify or
+                permanently block a person.
+              </small>
+            </>
+          ) : (
+            <>
+              <p>
+                This participant cannot rejoin this meeting with the current
+                session.
+              </p>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={banDevice}
+                  onChange={(e) => setBanDevice(e.target.checked)}
+                />
+                Also block this browser
+              </label>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={banIp}
+                  onChange={(e) => setBanIp(e.target.checked)}
+                />
+                Also block this IP address
+              </label>
+              <small>
+                Browser data can be cleared. IP blocking can affect others on
+                the same network.
+              </small>
+            </>
+          )}
           <div className="button-row">
             <Button className="small" onClick={() => setBan(null)}>
               Cancel
@@ -1665,11 +1961,20 @@ function Participants({
               className="small danger"
               disabled={busy}
               onClick={async () => {
-                if (await action(ban.id, { action: "ban", banIp, banDevice }))
+                if (
+                  await action(
+                    ban.id,
+                    ban.transport === "phone"
+                      ? { action: "ban", banCallerId: true }
+                      : { action: "ban", banIp, banDevice },
+                  )
+                )
                   setBan(null);
               }}
             >
-              Ban participant
+              {ban.transport === "phone"
+                ? "Block caller ID"
+                : "Ban participant"}
             </Button>
           </div>
         </div>
@@ -1751,7 +2056,12 @@ function Breakouts({
                 <label>
                   <span className="sr-only">Room for {p.name}</span>
                   <select
-                    disabled={busy}
+                    disabled={busy || p.transport === "phone"}
+                    title={
+                      p.transport === "phone"
+                        ? "Phone callers cannot move to breakout rooms yet"
+                        : undefined
+                    }
                     value={p.breakoutId || ""}
                     onChange={(e) =>
                       void mutate("/move", {
@@ -1825,6 +2135,8 @@ function Breakouts({
       <p className="panel-note">
         Moving rooms reconnects audio and video. Participants choose when to
         turn their devices back on.
+        {admitted.some((p) => p.transport === "phone") &&
+          " Phone callers stay in the main room."}
       </p>
     </div>
   );
@@ -1925,6 +2237,12 @@ function Recordings({
   const code = state.meeting.code;
   const active = state.recordings.some((r) =>
     ["starting", "recording", "active", "stopping"].includes(r.status),
+  );
+  const phonePresent = state.participants.some(
+    (participant) =>
+      participant.transport === "phone" &&
+      (["waiting", "admitted"].includes(participant.status) ||
+        !!participant.enforcementPending),
   );
   async function request(suffix: string, body: object = {}, method?: string) {
     setError("");
@@ -2034,12 +2352,19 @@ function Recordings({
             Download links expire after 24 hours. A separate password is emailed
             to the verified host.
           </p>
+          {phonePresent && (
+            <Notice kind="info">
+              Recording is unavailable while phone callers are connected. Phone
+              recording announcements are not configured.
+            </Notice>
+          )}
           <Button
             className="primary full-width"
             disabled={
               busy ||
               !state.meeting.recordingAllowed ||
               !(verified || state.meeting.hostEmailVerified) ||
+              phonePresent ||
               active
             }
             onClick={() => void request("/recordings")}

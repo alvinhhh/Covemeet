@@ -18,6 +18,7 @@ https://meet.localhost:8443 {
   tls internal {
     protocols tls1.3
   }
+  respond /api/internal/* 404
   reverse_proxy core:4100 {
     header_up X-Forwarded-For {remote_host}
     header_up -Forwarded
@@ -28,6 +29,7 @@ https://portal.localhost:8443 {
   tls internal {
     protocols tls1.3
   }
+  respond /api/internal/* 404
   reverse_proxy {$PORTAL_UPSTREAM:core:4100} {
     header_up X-Forwarded-For {remote_host}
     header_up -Forwarded

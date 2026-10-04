@@ -102,3 +102,38 @@ test("unknown, waiting, removed and other-room publishers are excluded; stale pa
   );
   assert.equal(selectStage([], [], context, 0).pageCount, 1);
 });
+
+test("admitted phone callers retain audio eligibility without consuming video tiles", () => {
+  const people = members(20).map((member, i) => ({
+    ...member,
+    transport: i >= 10 ? ("phone" as const) : ("browser" as const),
+  }));
+  const selected = selectStage(cameras(20), people, context, 0);
+  assert.equal(selected.total, 10);
+  assert.equal(selected.pageCount, 1);
+  assert.equal(selected.eligibleIds.size, 20);
+  for (const caller of people.slice(10)) {
+    assert(selected.eligibleIds.has(caller.id));
+    assert(
+      !selected.visible.some((track) => track.participantId === caller.id),
+    );
+  }
+});
+
+test("phone transport does not bypass admission, room isolation, or webinar viewer policy", () => {
+  const people = members(5).map((member, i) => ({
+    ...member,
+    transport: "phone" as const,
+    status: i === 1 ? "waiting" : i === 2 ? "kicked" : "admitted",
+    breakoutId: i === 3 ? "other-room" : null,
+    role: i === 4 ? ("viewer" as const) : member.role,
+  }));
+  const selected = selectStage(
+    cameras(5),
+    people,
+    { ...context, mode: "webinar" },
+    0,
+  );
+  assert.deepEqual([...selected.eligibleIds], ["p0"]);
+  assert.equal(selected.visible.length, 0);
+});
