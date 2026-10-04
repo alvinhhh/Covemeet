@@ -534,7 +534,23 @@ test("webinar viewers cannot publish until the host grants presenter permissions
   const f = await fixture(t);
   const m = await f.meeting({ mode: "webinar" });
   const viewer = await f.join(m.code);
+  rejected(
+    await f.host.request(
+      "POST",
+      `/api/meetings/${m.code}/participants/${viewer.id}/action`,
+      { action: "promote" },
+    ),
+  );
   await f.action(m.code, viewer.id, "admit");
+  for (const action of ["allow-audio", "allow-video"]) {
+    rejected(
+      await f.host.request(
+        "POST",
+        `/api/meetings/${m.code}/participants/${viewer.id}/action`,
+        { action },
+      ),
+    );
+  }
   ok(await viewer.client.request("POST", `/api/meetings/${m.code}/media`, {}));
   assert.equal(f.media.issued.at(-1)?.participant.role, "viewer");
   assert.equal(f.media.issued.at(-1)?.participant.audioAllowed, false);
@@ -553,6 +569,150 @@ test("webinar viewers cannot publish until the host grants presenter permissions
   await f.action(m.code, viewer.id, "demote");
   ok(await viewer.client.request("POST", `/api/meetings/${m.code}/media`, {}));
   assert.equal(f.media.issued.at(-1)?.participant.videoAllowed, false);
+});
+
+test("concurrent promotions cannot exceed ten webinar presenters including the host", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting({ mode: "webinar" });
+  const first = await f.join(m.code);
+  const second = await f.join(m.code, "198.51.100.21");
+  await f.action(m.code, first.id, "admit");
+  await f.action(m.code, second.id, "admit");
+  await f.store.change(m.code, (state) => {
+    const template = state.participants.find((p) => p.id === first.id)!;
+    for (let i = 0; i < 8; i++)
+      state.participants.push({
+        ...template,
+        id: `presenter-${i}`,
+        role: "participant",
+        tokenHash: `unusable-${i}`,
+      });
+  });
+  const responses = await Promise.all(
+    [first, second].map((guest) =>
+      f.host.request(
+        "POST",
+        `/api/meetings/${m.code}/participants/${guest.id}/action`,
+        { action: "promote" },
+      ),
+    ),
+  );
+  assert.deepEqual(responses.map((r) => r.statusCode).sort(), [200, 409]);
+  const state = (await f.store.get(m.code))!;
+  const winner = [first, second].find(
+    (guest) =>
+      state.participants.find((p) => p.id === guest.id)?.role === "participant",
+  )!;
+  const remaining = winner === first ? second : first;
+  assert.equal(
+    state.participants.filter((p) => p.role !== "viewer").length,
+    10,
+  );
+  await f.action(m.code, winner.id, "kick");
+  await f.action(m.code, remaining.id, "promote");
+  const publicState = await f.host.request(
+    "GET",
+    `/api/meetings/${m.code}/state`,
+  );
+  assert.equal(publicState.json().meeting.webinar.presenters, 10);
+  assert.equal(publicState.json().meeting.webinar.presenterLimit, 10);
+});
+
+test("the webinar audience has its own 1000-seat limit and demotion cannot overflow it", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting({ mode: "webinar" });
+  const viewer = await f.join(m.code);
+  await f.action(m.code, viewer.id, "admit");
+  await f.store.change(m.code, (state) => {
+    const template = state.participants.find((p) => p.id === viewer.id)!;
+    for (let i = 0; i < 998; i++)
+      state.participants.push({
+        ...template,
+        id: `viewer-${i}`,
+        status: "waiting",
+        tokenHash: `unusable-${i}`,
+      });
+  });
+  const clients = [
+    new Client(f.app, "198.51.100.31"),
+    new Client(f.app, "198.51.100.32"),
+  ];
+  const responses = await Promise.all(
+    clients.map((c) =>
+      c.request("POST", `/api/meetings/${m.code}/join`, {
+        name: "Viewer",
+        password,
+      }),
+    ),
+  );
+  assert.deepEqual(responses.map((r) => r.statusCode).sort(), [200, 409]);
+  await f.action(m.code, viewer.id, "promote");
+  const replacement = await f.join(m.code, "198.51.100.33");
+  const full = await f.host.request(
+    "POST",
+    `/api/meetings/${m.code}/participants/${viewer.id}/action`,
+    { action: "demote" },
+  );
+  assert.equal(full.statusCode, 409);
+  assert.match(full.json().error, /audience is full/i);
+  await f.action(m.code, replacement.id, "kick");
+  await f.action(m.code, viewer.id, "demote");
+  const state = await f.host.request("GET", `/api/meetings/${m.code}/state`);
+  assert.equal(state.json().meeting.webinar.viewers, 1000);
+  assert.equal(state.json().meeting.webinar.presenters, 1);
+  // Expired sessions must neither reserve a seat nor regain admission.
+  await f.store.change(m.code, (meeting) => {
+    meeting.participants.find((p) => p.id === "viewer-0")!.expiresAt =
+      Date.now() - 1;
+  });
+  rejected(
+    await f.host.request(
+      "POST",
+      `/api/meetings/${m.code}/participants/viewer-0/action`,
+      { action: "admit" },
+    ),
+  );
+  await f.join(m.code, "198.51.100.34");
+});
+
+test("meeting capacity includes the host and stage actions cannot cross meeting boundaries", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  await f.action(m.code, guest.id, "admit");
+  for (const action of ["promote", "demote"])
+    rejected(
+      await f.host.request(
+        "POST",
+        `/api/meetings/${m.code}/participants/${guest.id}/action`,
+        { action },
+      ),
+    );
+  const webinar = await f.meeting({ mode: "webinar" });
+  rejected(
+    await f.host.request(
+      "POST",
+      `/api/meetings/${webinar.code}/participants/${guest.id}/action`,
+      { action: "promote" },
+    ),
+  );
+  await f.store.change(m.code, (state) => {
+    const template = state.participants.find((p) => p.id === guest.id)!;
+    for (let i = 0; i < 98; i++)
+      state.participants.push({
+        ...template,
+        id: `participant-${i}`,
+        tokenHash: `unusable-${i}`,
+      });
+  });
+  const response = await new Client(f.app, "198.51.100.40").request(
+    "POST",
+    `/api/meetings/${m.code}/join`,
+    { name: "Over capacity", password },
+  );
+  assert.equal(response.statusCode, 409);
+  await f.action(m.code, guest.id, "kick");
+  await f.join(m.code, "198.51.100.41");
 });
 
 test("branding administration requires operator authority and rejects executable asset formats", async (t) => {

@@ -42,6 +42,12 @@ export type MeetingState = {
     code: string;
     title: string;
     mode: "meeting" | "webinar";
+    webinar?: {
+      presenters: number;
+      viewers: number;
+      presenterLimit: number;
+      viewerLimit: number;
+    };
     locked: boolean;
     ended: boolean;
     recordingAllowed: boolean;

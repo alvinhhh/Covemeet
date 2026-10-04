@@ -1267,14 +1267,16 @@ function MediaStage({ me }: { me: Participant }) {
 function MediaControls({ me }: { me: Participant }) {
   const { localParticipant } = useLocalParticipant();
   const [error, setError] = useState("");
+  const audioAllowed = me.role !== "viewer" && me.audioAllowed;
+  const videoAllowed = me.role !== "viewer" && me.videoAllowed;
   useEffect(() => {
-    if (!me.audioAllowed)
+    if (!audioAllowed)
       void localParticipant
         .setMicrophoneEnabled(false)
         .catch((e) => setError(messageOf(e)));
-  }, [localParticipant, me.audioAllowed]);
+  }, [localParticipant, audioAllowed]);
   useEffect(() => {
-    if (!me.videoAllowed) {
+    if (!videoAllowed) {
       void localParticipant
         .setCameraEnabled(false)
         .catch((e) => setError(messageOf(e)));
@@ -1282,7 +1284,7 @@ function MediaControls({ me }: { me: Participant }) {
         .setScreenShareEnabled(false)
         .catch((e) => setError(messageOf(e)));
     }
-  }, [localParticipant, me.videoAllowed]);
+  }, [localParticipant, videoAllowed]);
   return (
     <>
       {error && (
@@ -1293,31 +1295,31 @@ function MediaControls({ me }: { me: Participant }) {
       <TrackToggle
         className="button media-toggle"
         source={Track.Source.Microphone}
-        disabled={!me.audioAllowed}
+        disabled={!audioAllowed}
         showIcon={false}
         onDeviceError={(e) => setError(e.message)}
         title={
-          me.audioAllowed ? "Toggle microphone" : "Microphone blocked by host"
+          audioAllowed ? "Toggle microphone" : "Microphone blocked by host"
         }
       >
         <Icon name="mic" />
-        <span>{me.audioAllowed ? "Microphone" : "Mic blocked"}</span>
+        <span>{audioAllowed ? "Microphone" : "Mic blocked"}</span>
       </TrackToggle>
       <TrackToggle
         className="button media-toggle"
         source={Track.Source.Camera}
-        disabled={!me.videoAllowed}
+        disabled={!videoAllowed}
         showIcon={false}
         onDeviceError={(e) => setError(e.message)}
-        title={me.videoAllowed ? "Toggle camera" : "Camera blocked by host"}
+        title={videoAllowed ? "Toggle camera" : "Camera blocked by host"}
       >
         <Icon name="video" />
-        <span>{me.videoAllowed ? "Camera" : "Camera blocked"}</span>
+        <span>{videoAllowed ? "Camera" : "Camera blocked"}</span>
       </TrackToggle>
       <TrackToggle
         className="button media-toggle"
         source={Track.Source.ScreenShare}
-        disabled={!me.videoAllowed || me.role === "viewer"}
+        disabled={!videoAllowed || me.role === "viewer"}
         showIcon={false}
         onDeviceError={(e) => setError(e.message)}
       >
@@ -1342,6 +1344,9 @@ function Participants({
   const [banIp, setBanIp] = useState(false);
   const [banDevice, setBanDevice] = useState(true);
   const host = state.me.role === "host";
+  const webinar = state.meeting.webinar;
+  const stageFull = !!webinar && webinar.presenters >= webinar.presenterLimit;
+  const audienceFull = !!webinar && webinar.viewers >= webinar.viewerLimit;
   const waiting = state.participants.filter((p) => p.status === "waiting");
   const admitted = state.participants.filter((p) => p.status === "admitted");
   return (
@@ -1382,6 +1387,12 @@ function Participants({
           ))}
         </section>
       )}
+      {host && webinar && (
+        <p className="panel-note">
+          Stage: {webinar.presenters}/{webinar.presenterLimit} · Audience:{" "}
+          {webinar.viewers}/{webinar.viewerLimit}
+        </p>
+      )}
       <div className="section-label">IN MEETING</div>
       {admitted.map((p) => (
         <div className="participant-entry" key={p.id}>
@@ -1401,7 +1412,9 @@ function Participants({
                   ? "Host"
                   : p.role === "viewer"
                     ? "Viewer"
-                    : "Participant"}
+                    : state.meeting.mode === "webinar"
+                      ? "Presenter"
+                      : "Participant"}
               </small>
             </div>
             <span
@@ -1432,7 +1445,12 @@ function Participants({
           {expanded === p.id && (
             <div className="participant-actions">
               <button
-                disabled={busy}
+                disabled={busy || p.role === "viewer"}
+                title={
+                  p.role === "viewer"
+                    ? "Invite to stage to allow devices"
+                    : undefined
+                }
                 onClick={() =>
                   void action(p.id, {
                     action: p.audioAllowed ? "block-audio" : "allow-audio",
@@ -1444,7 +1462,12 @@ function Participants({
                   : "Allow microphone"}
               </button>
               <button
-                disabled={busy}
+                disabled={busy || p.role === "viewer"}
+                title={
+                  p.role === "viewer"
+                    ? "Invite to stage to allow devices"
+                    : undefined
+                }
                 onClick={() =>
                   void action(p.id, {
                     action: p.videoAllowed ? "block-video" : "allow-video",
@@ -1455,7 +1478,16 @@ function Participants({
               </button>
               {state.meeting.mode === "webinar" && (
                 <button
-                  disabled={busy}
+                  disabled={
+                    busy || (p.role === "viewer" ? stageFull : audienceFull)
+                  }
+                  title={
+                    p.role === "viewer" && stageFull
+                      ? "Stage is full"
+                      : p.role !== "viewer" && audienceFull
+                        ? "Audience is full"
+                        : undefined
+                  }
                   onClick={() =>
                     void action(p.id, {
                       action: p.role === "viewer" ? "promote" : "demote",

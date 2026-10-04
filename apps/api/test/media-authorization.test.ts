@@ -105,6 +105,12 @@ test("media token claims deny data publishing, metadata changes, and blocked tra
   });
   assert.equal(viewer.video?.canPublish, false);
   assert.deepEqual(viewer.video?.canPublishSources, []);
+  const inconsistentViewer = await inspect({
+    ...f.participant,
+    role: "viewer",
+  });
+  assert.equal(inconsistentViewer.video?.canPublish, false);
+  assert.deepEqual(inconsistentViewer.video?.canPublishSources, []);
 });
 
 test("kick, ban, lobby, expired session, and pending enforcement all deny existing tokens", async (t) => {

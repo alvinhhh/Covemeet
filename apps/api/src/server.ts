@@ -28,6 +28,12 @@ import { RecordingService } from "./recordings.js";
 
 const name = z.string().trim().min(1).max(80),
   password = z.string().min(8).max(256);
+const meetingLimit = 100,
+  webinarViewerLimit = 1000,
+  webinarPresenterLimit = 10;
+const occupiesSeat = (p: Participant) =>
+  (p.status === "admitted" || p.status === "waiting") &&
+  p.expiresAt > Date.now();
 const imageUrl = z
   .string()
   .max(400)
@@ -433,12 +439,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
           m.bans.ip.includes(ids.ipHash)
         )
           throw new HttpError(403, "Entry is blocked for this meeting");
-        if (
-          m.participants.filter(
-            (x) => x.status === "admitted" || x.status === "waiting",
-          ).length >= (m.mode === "webinar" ? 1010 : 100)
-        )
+        const occupied = m.participants.filter(occupiesSeat);
+        if (m.mode === "webinar") {
+          if (
+            occupied.filter((p) => p.role === "viewer").length >=
+            webinarViewerLimit
+          )
+            throw new HttpError(409, "Webinar audience is full");
+        } else if (occupied.length >= meetingLimit) {
           throw new HttpError(409, "Meeting is full");
+        }
         const p: Participant = {
           id: randomUUID(),
           name: body.name,
@@ -491,6 +501,19 @@ export async function createApp(config: Config, store: Store, media: Media) {
           code: m.code,
           title: m.title,
           mode: m.mode,
+          webinar:
+            m.mode === "webinar"
+              ? {
+                  presenters: m.participants.filter(
+                    (x) => occupiesSeat(x) && x.role !== "viewer",
+                  ).length,
+                  viewers: m.participants.filter(
+                    (x) => occupiesSeat(x) && x.role === "viewer",
+                  ).length,
+                  presenterLimit: webinarPresenterLimit,
+                  viewerLimit: webinarViewerLimit,
+                }
+              : undefined,
           locked: m.locked,
           ended: m.ended,
           recordingAllowed: m.recordingAllowed,
@@ -561,6 +584,43 @@ export async function createApp(config: Config, store: Store, media: Media) {
       const p = m.participants.find((x) => x.id === target);
       if (!p || p.role === "host")
         throw new HttpError(400, "Select a guest participant");
+      if (!occupiesSeat(p))
+        throw new HttpError(409, "Participant session is inactive");
+      if (
+        (body.action === "allow-audio" || body.action === "allow-video") &&
+        p.role === "viewer"
+      )
+        throw new HttpError(
+          409,
+          "Invite the viewer to stage before allowing devices",
+        );
+      if (body.action === "promote" || body.action === "demote") {
+        if (m.mode !== "webinar" || p.status !== "admitted")
+          throw new HttpError(
+            409,
+            "Stage changes require an admitted webinar participant",
+          );
+        const expectedRole =
+          body.action === "promote" ? "viewer" : "participant";
+        if (p.role !== expectedRole)
+          throw new HttpError(409, "Participant already has this role");
+        const occupied = m.participants.filter(occupiesSeat);
+        if (
+          body.action === "promote" &&
+          occupied.filter((x) => x.role !== "viewer").length >=
+            webinarPresenterLimit
+        )
+          throw new HttpError(
+            409,
+            "Webinar stage is full (10 including the host)",
+          );
+        if (
+          body.action === "demote" &&
+          occupied.filter((x) => x.role === "viewer").length >=
+            webinarViewerLimit
+        )
+          throw new HttpError(409, "Webinar audience is full");
+      }
       if (body.action === "admit") {
         if (p.status !== "waiting")
           throw new HttpError(409, "Participant is not waiting");
@@ -568,8 +628,6 @@ export async function createApp(config: Config, store: Store, media: Media) {
           throw new HttpError(403, "Unlock the meeting before admitting");
         p.status = "admitted";
       } else {
-        if (p.status !== "admitted" && p.status !== "waiting")
-          throw new HttpError(409, "Participant session is inactive");
         p.previousRoom ??= participantRoom(m, p);
         p.mediaVersion++;
         p.enforcementPending = true;

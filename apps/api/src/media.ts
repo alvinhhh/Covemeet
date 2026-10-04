@@ -48,10 +48,12 @@ export class LiveMedia implements Media {
       },
     );
     const sources: TrackSource[] = [];
-    if (p.audioAllowed) sources.push(TrackSource.MICROPHONE);
-    if (p.videoAllowed)
+    const audioAllowed = p.role !== "viewer" && p.audioAllowed;
+    const videoAllowed = p.role !== "viewer" && p.videoAllowed;
+    if (audioAllowed) sources.push(TrackSource.MICROPHONE);
+    if (videoAllowed)
       sources.push(TrackSource.CAMERA, TrackSource.SCREEN_SHARE);
-    if (p.audioAllowed && p.videoAllowed)
+    if (audioAllowed && videoAllowed)
       sources.push(TrackSource.SCREEN_SHARE_AUDIO);
     token.addGrant({
       room: participantRoom(m, p),
