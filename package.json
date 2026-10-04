@@ -19,7 +19,7 @@
     "test:sip": "node scripts/sip-test.mjs"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.6.4",
     "concurrently": "^9.2.0",
     "prettier": "3.6.2",
     "tsx": "^4.20.0",
