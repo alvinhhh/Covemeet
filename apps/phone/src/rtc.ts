@@ -17,6 +17,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { serviceUrl, type CallPolicy, type MeetingGrant } from "./authority.js";
 import { openGateway, type GatewayProxy } from "./gateway.js";
 import { FrameQueue } from "./audio.js";
+import { isHoldingRoom } from "./holding-name.js";
 import { AudioBridgeOpenError, type AudioBridge } from "./relay.js";
 
 const RATE = 48000,
@@ -70,7 +71,7 @@ async function bounded<T>(promise: Promise<T>, ms = 5000): Promise<T> {
 function validateHolding(holding: HoldingLeg, development = false) {
   serviceUrl(holding.url, ["wss:", "ws:"], development);
   if (
-    !/^phone-hold-[A-Za-z0-9-]{16,128}$/.test(holding.roomName) ||
+    !isHoldingRoom(holding.roomName) ||
     !holding.participantIdentity ||
     holding.participantIdentity.length > 256
   )

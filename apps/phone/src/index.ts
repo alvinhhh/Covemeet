@@ -22,3 +22,15 @@ export {
   type HoldingLeg,
   type RtcBridgeConfig,
 } from "./rtc.js";
+export {
+  AriClient,
+  AriRequestError,
+  type AriConfig,
+  type AriEvent,
+} from "./ari.js";
+export {
+  SipSupervisor,
+  type SupervisorConfig,
+  type SupervisedMedia,
+} from "./supervisor.js";
+export { SipHolding, type SipHoldingConfig } from "./sip-holding.js";

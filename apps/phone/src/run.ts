@@ -6,6 +6,7 @@ import { dispose } from "@livekit/rtc-node";
 import { HttpAuthority, joinSchema, serviceUrl } from "./authority.js";
 import { PhoneRelay } from "./relay.js";
 import { openRtcBridge } from "./rtc.js";
+import { isHoldingRoom } from "./holding-name.js";
 
 process.umask(0o077);
 if (process.env.PHONE_ENABLED !== "true") {
@@ -90,7 +91,7 @@ if (process.env.PHONE_ENABLED !== "true") {
           dtmf,
         ),
       async terminateNative() {
-        if (!/^phone-hold-[A-Za-z0-9-]{16,128}$/.test(config.holding.roomName))
+        if (!isHoldingRoom(config.holding.roomName))
           throw new Error("Invalid holding room");
         try {
           await media.removeParticipant(
