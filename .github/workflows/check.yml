@@ -18,3 +18,12 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run build
+      - name: Isolated phone admission and audio relay
+        run: node scripts/phone-test.mjs
+      - name: Phone validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phone-validation
+          path: test-results/phone/*.json
+          if-no-files-found: ignore

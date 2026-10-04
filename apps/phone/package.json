@@ -1,0 +1,22 @@
+{
+  "name": "@meeting-platform/phone",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "start": "node dist/run.js"
+  },
+  "dependencies": {
+    "@livekit/rtc-node": "1.1.0",
+    "livekit-server-sdk": "2.19.1",
+    "ws": "8.22.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.2"
+  }
+}

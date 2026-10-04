@@ -48,6 +48,8 @@ docker compose config --quiet
 
 Unit and API tests do not establish WebRTC interoperability, resilience, or capacity. The silent real-media harness in `scripts/validation` tests selected deployed controls. The evidence and remaining gates are tracked in [security-controls.md](docs/security-controls.md) and the [requirements ledger](docs/requirements-ledger.md).
 
+The experimental phone admission and audio-relay implementation is disabled by default. `node scripts/phone-test.mjs` builds a separate disposable PostgreSQL/SFU fixture, tests concurrent admission through independent API instances, and checks generated audio through programmatic sinks without speakers or personal devices. It does not connect to a carrier or prove SIP trunk negotiation. Read [phone-sip-design.md](docs/phone-sip-design.md) before configuring it; native SIP must never dispatch directly into meeting rooms.
+
 ## Deployment and scope
 
 Use [deployment.md](docs/deployment.md) for configuration and [infrastructure-plan.md](docs/infrastructure-plan.md) for the complete design. The production Compose file is a staging template; it needs TLS, TURN, backup/restore, network isolation, abuse controls, and the documented security gates before public operation.

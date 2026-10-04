@@ -1,0 +1,49 @@
+# Disposable, private fixture. scripts/phone-test.mjs creates its secrets and removes it.
+name: covemeet-phone-test
+services:
+  phone-postgres:
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_USER: phone
+      POSTGRES_DB: covemeet_phone_test
+      POSTGRES_PASSWORD: ${PHONE_TEST_DB_PASSWORD:?Use scripts/phone-test.mjs}
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U phone -d covemeet_phone_test]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  phone-livekit:
+    image: livekit/livekit-server:v1.13.7
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ../runtime/phone-test/livekit.yaml:/etc/livekit.yaml:ro
+    networks:
+      default:
+        aliases: [livekit]
+  phone-runner:
+    build:
+      context: ..
+      dockerfile: infra/phone-validation.Dockerfile
+    environment:
+      PHONE_TEST_DATABASE_URL: postgresql://phone:${PHONE_TEST_DB_PASSWORD}@phone-postgres:5432/covemeet_phone_test
+      LIVEKIT_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${PHONE_TEST_LIVEKIT_KEY}
+      LIVEKIT_API_SECRET: ${PHONE_TEST_LIVEKIT_SECRET}
+      PHONE_VALIDATION_REPORT: /results/phone-media.json
+      RUST_LOG: error
+    volumes:
+      - ../test-results/phone:/results
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      phone-postgres:
+        condition: service_healthy
+      phone-livekit:
+        condition: service_started
+    user: "${PHONE_TEST_UID:-1000}:${PHONE_TEST_GID:-1000}"
+networks:
+  default:
+    internal: true
