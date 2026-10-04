@@ -1,6 +1,6 @@
-# MeetingPlatform
+# Covemeet
 
-Browser meeting software with guest access, host moderation, and an independently deployable core. The intended public source is this repository, under Apache-2.0. The paid service lives in the separate private `MeetingPlatformHosted` repository and consumes a pinned core revision.
+Browser meeting software with guest access, host moderation, and an independently deployable core. The intended public source is this repository, under Apache-2.0. The paid service lives in the separate private `CovemeetHosted` repository and consumes a pinned core revision.
 
 This is milestone one. It is for local evaluation and controlled development. The 100-participant meeting and 1,000-viewer webinar numbers are design targets, not demonstrated capacity. Phone/SIP, end-to-end encrypted rooms, billing, and audited operational controls are not part of this release.
 

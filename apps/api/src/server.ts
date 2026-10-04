@@ -1,0 +1,918 @@
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import cookie from "@fastify/cookie";
+import rateLimit from "@fastify/rate-limit";
+import staticFiles from "@fastify/static";
+import { existsSync } from "node:fs";
+import { randomUUID, randomInt } from "node:crypto";
+import nodemailer from "nodemailer";
+import { z } from "zod";
+import type { Config } from "./config.js";
+import type { Meeting, Participant, Store } from "./store.js";
+import { participantRoom } from "./store.js";
+import type { Media } from "./media.js";
+import { LiveMedia } from "./media.js";
+import {
+  checkPassword,
+  digest,
+  HttpError,
+  keyedDigest,
+  meetingCode,
+  normalizeCode,
+  passwordHash,
+  randomToken,
+  safeEqual,
+  signedDevice,
+  verifyDevice,
+} from "./security.js";
+import { RecordingService } from "./recordings.js";
+
+const name = z.string().trim().min(1).max(80),
+  password = z.string().min(8).max(256);
+const imageUrl = z
+  .string()
+  .max(400)
+  .refine(
+    (s) => s === "" || /^\/api\/assets\/[a-f0-9]{64}$/.test(s),
+    "Upload an image through the asset endpoint",
+  );
+const webUrl = z
+  .string()
+  .max(500)
+  .refine((s) => {
+    try {
+      return s === "" || new URL(s).protocol === "https:";
+    } catch {
+      return false;
+    }
+  }, "Use an HTTPS URL");
+export const brandingSchema = z
+  .object({
+    brandName: name,
+    headline: z.string().max(120),
+    description: z.string().max(500),
+    accentColor: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+    backgroundColor: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+    font: z.enum(["sans", "serif", "system"]),
+    borderRadius: z.enum(["square", "rounded", "pill"]),
+    logoUrl: imageUrl.optional(),
+    backgroundUrl: imageUrl.optional(),
+    supportUrl: webUrl.optional(),
+    supportLabel: z.string().max(50).optional(),
+    footerText: z.string().max(150).optional(),
+    showHostButton: z.boolean(),
+  })
+  .strict();
+export async function createApp(config: Config, store: Store, media: Media) {
+  const app = Fastify({
+    logger: false,
+    trustProxy: config.trustProxy,
+    bodyLimit: 3 * 1024 * 1024,
+  });
+  await app.register(cookie);
+  await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
+  const mail = nodemailer.createTransport({
+    host: config.smtpHost,
+    port: config.smtpPort,
+    secure: config.smtpSecure,
+    requireTLS: config.production,
+    tls: { rejectUnauthorized: true },
+    auth: config.smtpUser
+      ? { user: config.smtpUser, pass: config.smtpPass }
+      : undefined,
+  });
+  const recordings = new RecordingService(config, store, mail);
+  const defaults = {
+    brandName: config.brandName,
+    headline: "Meetings",
+    description: "",
+    accentColor: "#0d766e",
+    backgroundColor: "#f5f5ef",
+    font: "sans",
+    borderRadius: "rounded",
+    logoUrl: "",
+    backgroundUrl: "",
+    supportUrl: "",
+    supportLabel: "Support",
+    footerText: "",
+    showHostButton: true,
+  };
+  app.addHook("onRequest", async (req, reply) => {
+    reply
+      .header("Cache-Control", "no-store")
+      .header("Referrer-Policy", "no-referrer")
+      .header("X-Content-Type-Options", "nosniff");
+    reply.header(
+      "Permissions-Policy",
+      "camera=(self), microphone=(self), display-capture=(self), geolocation=()",
+    );
+    if (config.production)
+      reply.header(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' wss:; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'",
+      );
+    if (["POST", "PATCH", "DELETE", "PUT"].includes(req.method)) {
+      const machine =
+        req.headers["x-requested-with"] === "MeetingPlatformHosted" &&
+        !!config.creationKey &&
+        safeEqual(
+          String(req.headers.authorization ?? ""),
+          `Bearer ${config.creationKey}`,
+        ) &&
+        !req.headers.origin;
+      if (!machine && req.headers["x-requested-with"] !== "MeetingPlatform")
+        throw new HttpError(403, "Request verification failed");
+      const portalAction =
+        config.edition === "self-hosted" &&
+        (req.url === "/api/meetings" || req.url.startsWith("/api/admin/"));
+      if (
+        req.headers.origin &&
+        req.headers.origin !== config.origin &&
+        !(portalAction && req.headers.origin === config.portalOrigin)
+      )
+        throw new HttpError(403, "Origin not allowed");
+      if (
+        !String(req.headers["content-type"] ?? "").startsWith(
+          "application/json",
+        )
+      )
+        throw new HttpError(415, "JSON required");
+    }
+  });
+  app.setErrorHandler((error, req, reply) => {
+    if (error instanceof z.ZodError)
+      return reply
+        .code(400)
+        .send({ error: error.issues[0]?.message ?? "Invalid request" });
+    if (error instanceof HttpError)
+      return reply.code(error.status).send({ error: error.message });
+    const status = (error as any).statusCode;
+    if (status === 429)
+      return reply
+        .code(429)
+        .send({ error: "Too many attempts. Try again shortly." });
+    if (status && status < 500)
+      return reply.code(status).send({ error: "Invalid request" });
+    req.log.error({ name: (error as Error).name }, "Request failed");
+    return reply.code(503).send({ error: "Service unavailable. Try again." });
+  });
+  const cookieOpts = {
+    httpOnly: true,
+    secure: config.origin.startsWith("https:"),
+    sameSite: "strict" as const,
+    path: "/",
+    maxAge: 43200,
+  };
+  const authCookie = (code: string) => `mp_${code}`;
+  function actor(req: FastifyRequest, m: Meeting, host = false) {
+    const token = req.cookies[authCookie(m.code)] ?? "";
+    const p = m.participants.find(
+      (x) => safeEqual(x.tokenHash, digest(token)) && x.expiresAt > Date.now(),
+    );
+    if (!p) throw new HttpError(401, "Join this meeting first");
+    if (host && p.role !== "host")
+      throw new HttpError(403, "Host permission required");
+    if (host && p.status !== "admitted")
+      throw new HttpError(403, "Host session is inactive");
+    return p;
+  }
+  function active(m: Meeting) {
+    if (m.ended) throw new HttpError(410, "Meeting ended");
+  }
+  const codeOf = (req: FastifyRequest) =>
+    normalizeCode((req.params as any).code ?? "");
+  async function find(req: FastifyRequest) {
+    const m = await store.get(codeOf(req));
+    if (!m) throw new HttpError(404, "Meeting unavailable");
+    return m;
+  }
+  function identity(req: FastifyRequest, reply: FastifyReply, code: string) {
+    let device = verifyDevice(config.secret, req.cookies.mp_device);
+    if (!device) {
+      const signed = signedDevice(config.secret);
+      device = signed.split(".")[0];
+      reply.setCookie("mp_device", signed, {
+        ...cookieOpts,
+        maxAge: 30 * 86400,
+      });
+    }
+    return {
+      ipHash: keyedDigest(config.secret, `ip:${code}:${req.ip}`),
+      deviceHash: keyedDigest(config.secret, `device:${code}:${device}`),
+    };
+  }
+  function admin(req: FastifyRequest) {
+    if (!config.creationKey)
+      throw new HttpError(503, "Set a creation key to enable administration");
+    const bearer = String(req.headers.authorization ?? "").replace(
+      /^Bearer /,
+      "",
+    );
+    if (safeEqual(bearer, config.creationKey)) return;
+    const value = req.cookies.mp_admin ?? "";
+    const [expiry, sig] = value.split(".");
+    if (
+      !expiry ||
+      Number(expiry) < Date.now() ||
+      !safeEqual(sig ?? "", keyedDigest(config.secret, `admin:${expiry}`))
+    )
+      throw new HttpError(401, "Administrator sign-in required");
+  }
+  async function enforce(m: Meeting, ps: Participant[]) {
+    let failed = false;
+    for (const p of ps) {
+      try {
+        await media.remove(m, p);
+        await store.change(m.code, (state) => {
+          const live = state.participants.find((x) => x.id === p.id);
+          if (live && live.mediaVersion === p.mediaVersion) {
+            live.enforcementPending = false;
+            delete live.previousRoom;
+          }
+        });
+      } catch {
+        failed = true;
+      }
+    }
+    if (failed)
+      throw new HttpError(
+        503,
+        "Restriction saved; media disconnect is pending. Retry or end the meeting.",
+      );
+  }
+  app.get("/api/health", async () => ({ ok: true }));
+  app.get("/api/config", async () => ({
+    edition: config.edition,
+    portalOrigin: config.portalOrigin,
+    meetingOrigin: config.origin,
+    brandName: config.brandName,
+    branding: (await store.getSettings()) ?? defaults,
+    recordingAvailable: recordings.available,
+    mediaAvailable: media.available,
+    creationRequiresKey: !!config.creationKey,
+  }));
+  app.post(
+    "/api/admin/session",
+    { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } },
+    async (req, reply) => {
+      const { creationKey } = z
+        .object({ creationKey: z.string().max(256) })
+        .parse(req.body);
+      if (!config.creationKey || !safeEqual(creationKey, config.creationKey))
+        throw new HttpError(401, "Invalid creation key");
+      const expiry = String(Date.now() + 3600000);
+      reply.setCookie(
+        "mp_admin",
+        `${expiry}.${keyedDigest(config.secret, `admin:${expiry}`)}`,
+        { ...cookieOpts, maxAge: 3600 },
+      );
+      return { ok: true };
+    },
+  );
+  app.patch("/api/admin/branding", async (req) => {
+    admin(req);
+    const branding = brandingSchema.parse(req.body);
+    await store.setSettings(branding);
+    await store.audit("installation", "operator", "branding.update");
+    return { ok: true, branding };
+  });
+  app.post("/api/admin/assets", async (req) => {
+    admin(req);
+    const body = z
+      .object({
+        mime: z.enum(["image/png", "image/jpeg", "image/webp"]),
+        data: z.string().max(2800000),
+      })
+      .strict()
+      .parse(req.body);
+    const data = Buffer.from(body.data, "base64");
+    if (data.length > 2 * 1024 * 1024 || data.length < 12)
+      throw new HttpError(400, "Image must be under 2 MB");
+    const valid =
+      body.mime === "image/png"
+        ? data.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))
+        : body.mime === "image/jpeg"
+          ? data[0] === 255 && data[1] === 216 && data[2] === 255
+          : data.subarray(0, 4).toString() === "RIFF" &&
+            data.subarray(8, 12).toString() === "WEBP";
+    if (!valid) throw new HttpError(400, "Image format does not match");
+    const id = digest(data.toString("base64"));
+    await store.setAsset(id, body.mime, data.toString("base64"));
+    return { url: `/api/assets/${id}` };
+  });
+  app.get("/api/assets/:id", async (req, reply) => {
+    const id = z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .parse((req.params as any).id);
+    const asset = await store.getAsset(id);
+    if (!asset) throw new HttpError(404, "Image unavailable");
+    return reply
+      .type(asset.mime)
+      .header("Cache-Control", "public, max-age=86400, immutable")
+      .send(Buffer.from(asset.data, "base64"));
+  });
+  app.post(
+    "/api/meetings",
+    { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
+    async (req) => {
+      const body = z
+        .object({
+          title: name,
+          hostName: name,
+          password,
+          mode: z.enum(["meeting", "webinar"]),
+          customCode: z.string().max(64).optional(),
+          creationKey: z.string().max(256).optional(),
+        })
+        .strict()
+        .parse(req.body);
+      if (
+        config.creationKey &&
+        !safeEqual(body.creationKey ?? "", config.creationKey)
+      )
+        throw new HttpError(401, "Creation key required");
+      if (config.edition === "hosted" && body.customCode !== undefined)
+        throw new HttpError(
+          400,
+          "Hosted meeting codes are generated automatically",
+        );
+      const code = body.customCode
+        ? normalizeCode(
+            z
+              .string()
+              .regex(/^[a-zA-Z0-9-]{6,48}$/)
+              .parse(body.customCode),
+          )
+        : meetingCode();
+      if (!/^[A-Z0-9]{6,48}$/.test(code))
+        throw new HttpError(
+          400,
+          "Meeting code must contain 6 to 48 letters or digits",
+        );
+      if (await store.get(code))
+        throw new HttpError(409, "Meeting code unavailable");
+      const hostToken = randomToken();
+      const m: Meeting = {
+        id: randomUUID(),
+        code,
+        room: `m_${randomUUID()}`,
+        title: body.title,
+        mode: body.mode,
+        locked: false,
+        ended: false,
+        recordingAllowed: false,
+        createdAt: Date.now(),
+        revision: 1,
+        passwordHash: await passwordHash(body.password),
+        hostTokenHash: digest(hostToken),
+        hostTokenExpiresAt: Date.now() + 30 * 60000,
+        participants: [],
+        bans: { ip: [], device: [] },
+        breakouts: [],
+        messages: [],
+        recordings: [],
+      };
+      // Host display name is bound to the one-use invitation without making it an authority token.
+      m.participants.push({
+        id: randomUUID(),
+        name: body.hostName,
+        role: "host",
+        status: "waiting",
+        audioAllowed: true,
+        videoAllowed: true,
+        mediaVersion: 1,
+        tokenHash: "",
+        expiresAt: Date.now() + 43200000,
+        ipHash: "",
+        deviceHash: "",
+        breakoutId: null,
+      });
+      await store.create(m);
+      await store.audit(code, "creator", "meeting.create");
+      return { code, hostToken, guestUrl: `${config.origin}/join/${code}` };
+    },
+  );
+  app.post("/api/meetings/:code/host", async (req, reply) => {
+    const { token } = z.object({ token: z.string().max(256) }).parse(req.body);
+    const session = randomToken();
+    const id = await store.change(codeOf(req), (m) => {
+      active(m);
+      if (
+        !m.hostTokenHash ||
+        !safeEqual(m.hostTokenHash, digest(token)) ||
+        m.hostTokenExpiresAt < Date.now()
+      )
+        throw new HttpError(403, "Host link is invalid or already used");
+      delete m.hostTokenHash;
+      const p = m.participants.find((x) => x.role === "host")!;
+      p.status = "admitted";
+      p.tokenHash = digest(session);
+      Object.assign(p, identity(req, reply, m.code));
+      return p.id;
+    });
+    reply.setCookie(authCookie(codeOf(req)), session, cookieOpts);
+    return { participantId: id };
+  });
+  app.post(
+    "/api/meetings/:code/join",
+    { config: { rateLimit: { max: 120, timeWindow: "1 minute" } } },
+    async (req, reply) => {
+      const body = z
+        .object({ name, password: z.string().max(256) })
+        .parse(req.body);
+      const session = randomToken();
+      const code = codeOf(req);
+      const id = await store.change(code, async (m) => {
+        active(m);
+        if (m.locked) throw new HttpError(403, "Meeting is locked");
+        if (!(await checkPassword(m.passwordHash, body.password)))
+          throw new HttpError(403, "Meeting credentials are invalid");
+        const ids = identity(req, reply, code);
+        if (
+          m.bans.device.includes(ids.deviceHash) ||
+          m.bans.ip.includes(ids.ipHash)
+        )
+          throw new HttpError(403, "Entry is blocked for this meeting");
+        if (
+          m.participants.filter(
+            (x) => x.status === "admitted" || x.status === "waiting",
+          ).length >= (m.mode === "webinar" ? 1010 : 100)
+        )
+          throw new HttpError(409, "Meeting is full");
+        const p: Participant = {
+          id: randomUUID(),
+          name: body.name,
+          role: m.mode === "webinar" ? "viewer" : "participant",
+          status: "waiting",
+          audioAllowed: m.mode === "meeting",
+          videoAllowed: m.mode === "meeting",
+          mediaVersion: 1,
+          tokenHash: digest(session),
+          expiresAt: Date.now() + 43200000,
+          ...ids,
+          breakoutId: null,
+        };
+        m.participants.push(p);
+        return p.id;
+      });
+      reply.setCookie(authCookie(code), session, cookieOpts);
+      return { participantId: id };
+    },
+  );
+  app.get(
+    "/api/meetings/:code/state",
+    {
+      config: {
+        rateLimit: {
+          max: 90,
+          timeWindow: "1 minute",
+          keyGenerator: (req: FastifyRequest) =>
+            digest(req.cookies[authCookie(codeOf(req))] ?? req.ip),
+        },
+      },
+    },
+    async (req) => {
+      const m = await find(req),
+        p = actor(req, m);
+      const pub = (x: Participant) => ({
+        id: x.id,
+        name: x.name,
+        role: x.role,
+        status: x.status,
+        audioAllowed: x.audioAllowed,
+        videoAllowed: x.videoAllowed,
+        mediaVersion: x.mediaVersion,
+        breakoutId: x.breakoutId,
+        enforcementPending: !!x.enforcementPending,
+      });
+      const canSee = p.status === "admitted";
+      return {
+        meeting: {
+          code: m.code,
+          title: m.title,
+          mode: m.mode,
+          locked: m.locked,
+          ended: m.ended,
+          recordingAllowed: m.recordingAllowed,
+          createdAt: m.createdAt,
+          hostEmailVerified:
+            p.role === "host" ? !!m.hostEmailVerified : undefined,
+          breakouts: m.breakouts.map(({ id, name }) => ({ id, name })),
+          recordingActive: m.recordings.some((r) =>
+            ["starting", "recording", "stopping"].includes(r.status),
+          ),
+        },
+        me: pub(p),
+        participants: m.participants
+          .filter(
+            (x) =>
+              x.id === p.id ||
+              p.role === "host" ||
+              (canSee &&
+                x.status === "admitted" &&
+                x.breakoutId === p.breakoutId),
+          )
+          .map(pub),
+        messages: canSee
+          ? m.messages
+              .filter((x) => x.broadcast || x.breakoutId === p.breakoutId)
+              .slice(-100)
+          : [],
+        recordings:
+          p.role === "host"
+            ? m.recordings.map(
+                ({ id, status, createdAt, expiresAt, error }) => ({
+                  id,
+                  status,
+                  createdAt,
+                  expiresAt,
+                  error,
+                }),
+              )
+            : [],
+        revision: m.revision,
+      };
+    },
+  );
+  app.post("/api/meetings/:code/participants/:id/action", async (req) => {
+    const body = z
+      .object({
+        action: z.enum([
+          "admit",
+          "kick",
+          "ban",
+          "allow-audio",
+          "block-audio",
+          "allow-video",
+          "block-video",
+          "promote",
+          "demote",
+        ]),
+        banIp: z.boolean().optional(),
+        banDevice: z.boolean().optional(),
+      })
+      .strict()
+      .parse(req.body);
+    const target = (req.params as any).id;
+    let changed!: Participant;
+    const m = await store.change(codeOf(req), (m) => {
+      active(m);
+      actor(req, m, true);
+      const p = m.participants.find((x) => x.id === target);
+      if (!p || p.role === "host")
+        throw new HttpError(400, "Select a guest participant");
+      if (body.action === "admit") {
+        if (p.status !== "waiting")
+          throw new HttpError(409, "Participant is not waiting");
+        if (m.locked)
+          throw new HttpError(403, "Unlock the meeting before admitting");
+        p.status = "admitted";
+      } else {
+        if (p.status !== "admitted" && p.status !== "waiting")
+          throw new HttpError(409, "Participant session is inactive");
+        p.previousRoom ??= participantRoom(m, p);
+        p.mediaVersion++;
+        p.enforcementPending = true;
+        if (body.action === "kick" || body.action === "ban") {
+          p.status = body.action === "ban" ? "banned" : "kicked";
+          if (body.action === "ban") {
+            if (body.banIp) m.bans.ip.push(p.ipHash);
+            if (body.banDevice) m.bans.device.push(p.deviceHash);
+          }
+        }
+        if (body.action === "allow-audio") p.audioAllowed = true;
+        if (body.action === "block-audio") p.audioAllowed = false;
+        if (body.action === "allow-video") p.videoAllowed = true;
+        if (body.action === "block-video") p.videoAllowed = false;
+        if (body.action === "promote") {
+          p.role = "participant";
+          p.audioAllowed = true;
+          p.videoAllowed = true;
+        }
+        if (body.action === "demote") {
+          p.role = "viewer";
+          p.audioAllowed = false;
+          p.videoAllowed = false;
+        }
+      }
+      changed = structuredClone(p);
+      return structuredClone(m);
+    });
+    await store.audit(m.code, actor(req, m, true).id, body.action, target);
+    if (changed.enforcementPending) await enforce(m, [changed]);
+    return { ok: true };
+  });
+  app.patch("/api/meetings/:code", async (req) => {
+    const body = z
+      .object({
+        locked: z.boolean().optional(),
+        recordingAllowed: z.boolean().optional(),
+      })
+      .strict()
+      .parse(req.body);
+    const m = await store.change(codeOf(req), (m) => {
+      active(m);
+      actor(req, m, true);
+      Object.assign(m, body);
+      return structuredClone(m);
+    });
+    if (body.recordingAllowed === false) await recordings.stopAll(m);
+    await store.audit(m.code, actor(req, m, true).id, "meeting.policy");
+    return { ok: true };
+  });
+  app.post("/api/meetings/:code/end", async (req) => {
+    const m = await store.change(codeOf(req), (m) => {
+      actor(req, m, true);
+      m.ended = true;
+      m.locked = true;
+      for (const p of m.participants) {
+        p.mediaVersion++;
+        p.enforcementPending = true;
+      }
+      return structuredClone(m);
+    });
+    await recordings.stopAll(m);
+    await media.end(m);
+    await store.audit(m.code, "host", "meeting.end");
+    return { ok: true };
+  });
+  app.post("/api/meetings/:code/leave", async (req) => {
+    let who!: Participant;
+    const m = await store.change(codeOf(req), (m) => {
+      const p = actor(req, m);
+      p.status = "left";
+      p.previousRoom ??= participantRoom(m, p);
+      p.mediaVersion++;
+      p.enforcementPending = true;
+      who = structuredClone(p);
+      return structuredClone(m);
+    });
+    await enforce(m, [who]);
+    return { ok: true };
+  });
+  app.post("/api/meetings/:code/media", async (req) => {
+    const m = await find(req);
+    active(m);
+    const p = actor(req, m);
+    if (p.status !== "admitted" || p.enforcementPending)
+      throw new HttpError(403, "Admission required");
+    return {
+      token: await media.token(m, p),
+      url: config.origin.replace(/^http/, "ws"),
+    };
+  });
+  for (const broadcast of [false, true])
+    app.post(
+      `/api/meetings/:code/${broadcast ? "broadcast" : "messages"}`,
+      async (req) => {
+        const { text } = z
+          .object({ text: z.string().trim().min(1).max(2000) })
+          .parse(req.body);
+        await store.change(codeOf(req), (m) => {
+          active(m);
+          const p = actor(req, m, broadcast);
+          if (p.status !== "admitted")
+            throw new HttpError(403, "Admission required");
+          m.messages.push({
+            id: randomUUID(),
+            name: p.name,
+            text,
+            createdAt: Date.now(),
+            breakoutId: p.breakoutId,
+            broadcast,
+          });
+          m.messages = m.messages.slice(-500);
+        });
+        return { ok: true };
+      },
+    );
+  app.post("/api/meetings/:code/breakouts", async (req) => {
+    const { name: roomName } = z.object({ name }).parse(req.body);
+    await store.change(codeOf(req), (m) => {
+      active(m);
+      actor(req, m, true);
+      if (m.breakouts.length >= 20)
+        throw new HttpError(409, "Maximum 20 breakout rooms");
+      m.breakouts.push({
+        id: randomUUID(),
+        name: roomName,
+        room: `b_${randomUUID()}`,
+      });
+    });
+    return { ok: true };
+  });
+  for (const route of ["move", "return-main", "close-breakouts"])
+    app.post(`/api/meetings/:code/${route}`, async (req) => {
+      const body =
+        route === "move"
+          ? z
+              .object({
+                participantId: z.string(),
+                breakoutId: z.string().nullable(),
+              })
+              .parse(req.body)
+          : null;
+      const moved: Participant[] = [];
+      const m = await store.change(codeOf(req), (m) => {
+        active(m);
+        const self = actor(req, m, route !== "return-main");
+        if (
+          body?.breakoutId &&
+          !m.breakouts.some((b) => b.id === body.breakoutId)
+        )
+          throw new HttpError(404, "Breakout room unavailable");
+        const targets =
+          route === "close-breakouts"
+            ? m.participants.filter(
+                (p) => p.breakoutId && p.status === "admitted",
+              )
+            : [
+                m.participants.find(
+                  (p) => p.id === (body?.participantId ?? self.id),
+                ),
+              ];
+        for (const p of targets) {
+          if (!p || p.status !== "admitted")
+            throw new HttpError(400, "Participant is not admitted");
+          if (p.enforcementPending)
+            throw new HttpError(
+              409,
+              "Wait for the previous room transfer to complete",
+            );
+          p.previousRoom ??= participantRoom(m, p);
+          p.breakoutId = body?.breakoutId ?? null;
+          p.mediaVersion++;
+          p.enforcementPending = true;
+          moved.push(structuredClone(p));
+        }
+        if (route === "close-breakouts") m.breakouts = [];
+        return structuredClone(m);
+      });
+      await enforce(m, moved);
+      await store.audit(m.code, "host", `breakout.${route}`);
+      return { ok: true };
+    });
+  app.post(
+    "/api/meetings/:code/host-email",
+    { config: { rateLimit: { max: 3, timeWindow: "10 minutes" } } },
+    async (req) => {
+      if (!config.smtpHost) throw new HttpError(503, "Email is not configured");
+      const { email } = z.object({ email: z.email().max(254) }).parse(req.body);
+      const m = await find(req);
+      actor(req, m, true);
+      const otp = String(randomInt(100000, 1000000));
+      await store.change(m.code, (m) => {
+        m.hostEmail = email;
+        m.hostEmailVerified = false;
+        m.emailOtpHash = keyedDigest(config.secret, `${m.code}:${otp}`);
+        m.emailOtpExpiresAt = Date.now() + 600000;
+        m.emailOtpAttempts = 0;
+      });
+      await mail.sendMail({
+        from: config.smtpFrom,
+        to: email,
+        subject: "Verify recording email",
+        text: `Verification code: ${otp}\nExpires in 10 minutes.`,
+      });
+      return { ok: true };
+    },
+  );
+  app.post(
+    "/api/meetings/:code/verify-email",
+    { config: { rateLimit: { max: 5, timeWindow: "10 minutes" } } },
+    async (req) => {
+      const { otp } = z
+        .object({ otp: z.string().regex(/^\d{6}$/) })
+        .parse(req.body);
+      const ok = await store.change(codeOf(req), (m) => {
+        actor(req, m, true);
+        m.emailOtpAttempts = (m.emailOtpAttempts ?? 0) + 1;
+        if (
+          m.emailOtpAttempts > 5 ||
+          !m.emailOtpHash ||
+          (m.emailOtpExpiresAt ?? 0) < Date.now() ||
+          !safeEqual(
+            m.emailOtpHash,
+            keyedDigest(config.secret, `${m.code}:${otp}`),
+          )
+        )
+          return false;
+        m.hostEmailVerified = true;
+        delete m.emailOtpHash;
+        return true;
+      });
+      if (!ok) throw new HttpError(403, "Code is invalid or expired");
+      return { ok: true };
+    },
+  );
+  app.post("/api/meetings/:code/recordings", async (req) => {
+    const m = await find(req);
+    active(m);
+    actor(req, m, true);
+    await recordings.start(m);
+    return { ok: true };
+  });
+  app.post("/api/meetings/:code/recordings/:id/stop", async (req) => {
+    const m = await find(req);
+    actor(req, m, true);
+    await recordings.stop(m, (req.params as any).id);
+    return { ok: true };
+  });
+  app.post("/api/meetings/:code/recordings/:id/link", async (req, reply) => {
+    const m = await find(req);
+    const p = actor(req, m, true);
+    const link = await recordings.link(m, (req.params as any).id);
+    await store.change(m.code, (state) => {
+      const host = state.participants.find((x) => x.id === p.id)!;
+      host.expiresAt = Math.max(host.expiresAt, link.expiresAt);
+    });
+    reply.setCookie(authCookie(m.code), req.cookies[authCookie(m.code)]!, {
+      ...cookieOpts,
+      maxAge: 86400,
+    });
+    return link;
+  });
+  app.post("/api/meetings/:code/recordings/:id/revoke", async (req) => {
+    const m = await find(req);
+    actor(req, m, true);
+    await recordings.revoke(m, (req.params as any).id);
+    return { ok: true };
+  });
+  app.post(
+    "/api/meetings/:code/download",
+    { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } },
+    async (req, reply) => {
+      const { password, token } = z
+        .object({ password: z.string().max(256), token: z.string().max(128) })
+        .parse(req.body);
+      const meeting = await find(req);
+      actor(req, meeting, true);
+      const found = await recordings.findToken(token, meeting.code);
+      if (!found) throw new HttpError(403, "Download unavailable");
+      const stream = await recordings.download(
+        found.m,
+        found.r,
+        token,
+        password,
+      );
+      reply
+        .type("video/mp4")
+        .header(
+          "Content-Disposition",
+          `attachment; filename="recording-${found.r.id}.mp4"`,
+        );
+      return reply.send(stream);
+    },
+  );
+  if (media instanceof LiveMedia) media.attach(app);
+  if (existsSync(config.staticDir)) {
+    await app.register(staticFiles, { root: config.staticDir });
+    app.setNotFoundHandler((req, reply) =>
+      req.url.startsWith("/api/")
+        ? reply.code(404).send({ error: "Not found" })
+        : reply.sendFile("index.html"),
+    );
+  }
+  let ticking = false;
+  const timer = setInterval(async () => {
+    if (ticking) return;
+    ticking = true;
+    try {
+      for (let m of await store.all()) {
+        if (
+          m.participants.some(
+            (p) =>
+              ["admitted", "waiting"].includes(p.status) &&
+              p.expiresAt <= Date.now(),
+          )
+        )
+          m = await store.change(m.code, (state) => {
+            for (const p of state.participants)
+              if (
+                ["admitted", "waiting"].includes(p.status) &&
+                p.expiresAt <= Date.now()
+              ) {
+                p.status = "left";
+                p.mediaVersion++;
+                p.enforcementPending = true;
+                p.previousRoom ??= participantRoom(state, p);
+              }
+            return structuredClone(state);
+          });
+        for (const p of m.participants.filter((p) => p.enforcementPending))
+          await enforce(m, [p]).catch(() => {});
+        await recordings.reconcile(m);
+      }
+    } catch {
+    } finally {
+      ticking = false;
+    }
+  }, 5000);
+  timer.unref();
+  app.addHook("onClose", async () => {
+    clearInterval(timer);
+    media.close();
+    await store.close();
+  });
+  return app;
+}

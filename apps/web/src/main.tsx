@@ -1,0 +1,2110 @@
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+  type ButtonHTMLAttributes,
+  type FormEvent,
+  type ReactNode,
+} from "react";
+import { createRoot } from "react-dom/client";
+import {
+  LiveKitRoom,
+  RoomAudioRenderer,
+  StartAudio,
+  TrackToggle,
+  VideoTrack,
+  isTrackReference,
+  useConnectionState,
+  useLocalParticipant,
+  useTracks,
+} from "@livekit/components-react";
+import { Track } from "livekit-client";
+import {
+  api,
+  ApiError,
+  meetingPath,
+  messageOf,
+  type Config,
+  type MeetingState,
+  type Participant,
+  type Branding,
+} from "./api";
+import { Icon } from "./icons";
+import "./styles.css";
+import { BrandingEditor } from "./branding";
+
+// A host capability is exchanged once, held only in memory, and removed before rendering.
+let initialHostToken = location.pathname.startsWith("/host/")
+  ? location.hash.slice(1)
+  : "";
+let initialDownloadToken = location.pathname.startsWith("/download/")
+  ? location.hash.slice(1)
+  : "";
+if (initialHostToken || initialDownloadToken)
+  history.replaceState(null, "", location.pathname + location.search);
+
+const roomOptions = { adaptiveStream: true, dynacast: true };
+const connectionOptions = { autoSubscribe: true };
+const BrandingContext = createContext<Branding | undefined>(undefined);
+let controlPanelOrigin = location.origin;
+
+function navigate(path: string) {
+  if (path === "/" && controlPanelOrigin !== location.origin) {
+    location.assign(new URL("/", controlPanelOrigin).href);
+    return;
+  }
+  const target = new URL(path, location.origin);
+  if (target.origin !== location.origin) {
+    location.assign(target.href);
+    return;
+  }
+  history.pushState(null, "", target.pathname + target.search + target.hash);
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+function initials(name: string) {
+  return (
+    name
+      .trim()
+      .split(/\s+/)
+      .slice(0, 2)
+      .map((word) => word[0]?.toUpperCase())
+      .join("") || "?"
+  );
+}
+function Button({
+  children,
+  className = "",
+  ...props
+}: ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button className={`button ${className}`} {...props}>
+      {children}
+    </button>
+  );
+}
+function Notice({
+  children,
+  kind = "error",
+}: {
+  children: ReactNode;
+  kind?: "error" | "info" | "success";
+}) {
+  return (
+    <div
+      className={`notice ${kind}`}
+      role={kind === "error" ? "alert" : "status"}
+    >
+      {children}
+    </div>
+  );
+}
+function Field({
+  label,
+  children,
+  hint,
+}: {
+  label: string;
+  children: ReactNode;
+  hint?: string;
+}) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      {children}
+      {hint && <small>{hint}</small>}
+    </label>
+  );
+}
+function Logo({ name, small = false }: { name: string; small?: boolean }) {
+  const branding = useContext(BrandingContext);
+  return (
+    <a
+      href="/"
+      onClick={(e) => {
+        e.preventDefault();
+        navigate("/");
+      }}
+      className={`brand ${small ? "small" : ""}`}
+    >
+      {branding?.logoUrl ? (
+        <img className="brand-image" src={branding.logoUrl} alt="" />
+      ) : (
+        <span className="brand-icon">
+          <Icon name="video" size={21} />
+        </span>
+      )}
+      <span>{branding?.brandName || name}</span>
+    </a>
+  );
+}
+
+function App() {
+  const [path, setPath] = useState(location.pathname);
+  const [config, setConfig] = useState<Config>();
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!config?.branding) return;
+    const b = config.branding;
+    const style = document.documentElement.style;
+    style.setProperty("--teal", b.accentColor);
+    style.setProperty("--page-background", b.backgroundColor);
+    style.setProperty(
+      "--radius",
+      b.borderRadius === "square"
+        ? "2px"
+        : b.borderRadius === "pill"
+          ? "24px"
+          : "14px",
+    );
+    style.setProperty(
+      "--button-radius",
+      b.borderRadius === "square"
+        ? "2px"
+        : b.borderRadius === "pill"
+          ? "24px"
+          : "8px",
+    );
+    style.setProperty(
+      "--font",
+      b.font === "serif"
+        ? "Georgia, serif"
+        : b.font === "system"
+          ? "system-ui, sans-serif"
+          : "Inter, system-ui, sans-serif",
+    );
+    document.title = b.brandName;
+  }, [config]);
+  useEffect(() => {
+    const changed = () => setPath(location.pathname);
+    window.addEventListener("popstate", changed);
+    return () => window.removeEventListener("popstate", changed);
+  }, []);
+  useEffect(() => {
+    api<Config>("/config")
+      .then((value) => {
+        controlPanelOrigin = value.portalOrigin || location.origin;
+        setConfig(value);
+        document.title = value.brandName;
+      })
+      .catch((e) => setError(messageOf(e)));
+  }, []);
+  if (error)
+    return (
+      <Center>
+        <Icon name="video" size={40} />
+        <h1>Service unavailable</h1>
+        <Notice>{error}</Notice>
+        <Button onClick={() => location.reload()}>Try again</Button>
+      </Center>
+    );
+  if (!config)
+    return (
+      <Center>
+        <div className="spinner" />
+        <p>Loading control panel…</p>
+      </Center>
+    );
+  const room = path.match(/^\/(meet|join|host)\/([^/]+)\/?$/);
+  const download = path.match(/^\/download\/([^/]+)\/?$/);
+  let view: ReactNode;
+  if (download)
+    view = <Download code={decodeURIComponent(download[1])} config={config} />;
+  else if (room)
+    view = (
+      <Meeting
+        key={room[2]}
+        code={decodeURIComponent(room[2])}
+        hostEntry={room[1] === "host"}
+        config={config}
+      />
+    );
+  else if (path === "/branding" && config.edition === "self-hosted")
+    view = (
+      <BrandingEditor
+        config={config}
+        onSaved={setConfig}
+        onBack={() => navigate("/")}
+      />
+    );
+  else if (path !== "/")
+    view = (
+      <Center>
+        <h1>Page not found</h1>
+        <Button onClick={() => navigate("/")}>Control panel</Button>
+      </Center>
+    );
+  else view = <Home config={config} />;
+  return (
+    <BrandingContext.Provider value={config.branding}>
+      {view}
+    </BrandingContext.Provider>
+  );
+}
+
+function Center({ children }: { children: ReactNode }) {
+  return (
+    <main className="center-page">
+      <div className="center-card">{children}</div>
+    </main>
+  );
+}
+
+function Home({ config }: { config: Config }) {
+  const showCreationForm =
+    config.edition === "self-hosted" &&
+    config.branding?.showHostButton !== false;
+  const [mode, setMode] = useState<"meeting" | "webinar">("meeting");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  async function create(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    const data = new FormData(event.currentTarget);
+    try {
+      const result = await api<{ code: string; hostToken: string }>(
+        "/meetings",
+        {
+          title: data.get("title"),
+          hostName: data.get("hostName"),
+          password: data.get("password"),
+          mode,
+          ...(config.edition === "self-hosted" && data.get("customCode")
+            ? { customCode: data.get("customCode") }
+            : {}),
+          ...(config.creationRequiresKey
+            ? { creationKey: data.get("creationKey") }
+            : {}),
+        },
+      );
+      if (
+        config.meetingOrigin &&
+        new URL(config.meetingOrigin).origin !== location.origin
+      ) {
+        location.assign(
+          new URL(
+            `/host/${encodeURIComponent(result.code)}#${encodeURIComponent(result.hostToken)}`,
+            config.meetingOrigin,
+          ).href,
+        );
+        return;
+      }
+      // Exchange directly after creation: no bearer secret is put into history or storage.
+      await api(meetingPath(result.code, "/host"), { token: result.hostToken });
+      navigate(`/meet/${encodeURIComponent(result.code)}`);
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  function join(event: FormEvent) {
+    event.preventDefault();
+    let code = joinCode.trim();
+    const meetingOrigin = config.meetingOrigin || location.origin;
+    try {
+      const url = new URL(code);
+      if (url.origin !== new URL(meetingOrigin).origin) throw new Error();
+      code = url.pathname.split("/").filter(Boolean).at(-1) ?? "";
+    } catch {
+      /* A direct code is expected unless this is an installation meeting link. */
+    }
+    if (/^[A-Za-z0-9_-]{3,100}$/.test(code))
+      navigate(
+        new URL(`/join/${encodeURIComponent(code)}`, meetingOrigin).href,
+      );
+    else
+      setError(
+        "Enter a valid meeting code or a meeting link from this installation.",
+      );
+  }
+  return (
+    <div
+      className="dashboard"
+      style={
+        config.branding?.backgroundUrl
+          ? {
+              backgroundImage: `linear-gradient(var(--page-background), transparent), url(${JSON.stringify(config.branding.backgroundUrl)})`,
+              backgroundSize: "cover",
+              backgroundAttachment: "fixed",
+            }
+          : undefined
+      }
+    >
+      <aside className="sidebar">
+        <Logo name={config.brandName} />
+        <div className="nav-label">WORKSPACE</div>
+        <div className="nav-item active">
+          <Icon name="grid" />
+          Control panel
+        </div>
+        {config.edition === "self-hosted" && (
+          <button
+            className="nav-item nav-button"
+            onClick={() => navigate("/branding")}
+          >
+            <Icon name="settings" />
+            Branding
+          </button>
+        )}
+        <div className="sidebar-bottom">
+          <span className="edition-dot" />
+          {config.edition === "self-hosted"
+            ? "Self-hosted installation"
+            : "Hosted installation"}
+        </div>
+      </aside>
+      <div className="dashboard-body">
+        <header className="dashboard-header">
+          <span>Control panel</span>
+          <span className="header-tag">Browser meetings</span>
+        </header>
+        <main className="dashboard-main">
+          <div className="page-heading">
+            <div>
+              <p className="eyebrow">MEETINGS</p>
+              <h1>{config.branding?.headline || "Start or join a meeting"}</h1>
+              {config.branding?.description && (
+                <p className="landing-description">
+                  {config.branding.description}
+                </p>
+              )}
+            </div>
+            <div className="heading-icon">
+              <Icon name="video" size={26} />
+            </div>
+          </div>
+          {!config.mediaAvailable && (
+            <Notice kind="info">
+              Audio and video are not configured on this installation. Room
+              access, chat, and host controls are available.
+            </Notice>
+          )}
+          {error && <Notice>{error}</Notice>}
+          <div className={`home-grid ${!showCreationForm ? "join-only" : ""}`}>
+            {showCreationForm && (
+              <section className="card create-card">
+                <div className="card-title">
+                  <div className="feature-icon">
+                    <Icon name="plus" />
+                  </div>
+                  <div>
+                    <h2>Create a room</h2>
+                    <p>Set access and meeting type.</p>
+                  </div>
+                </div>
+                <form onSubmit={create} className="form-stack">
+                  <div className="mode-picker" aria-label="Meeting type">
+                    <button
+                      type="button"
+                      aria-pressed={mode === "meeting"}
+                      className={mode === "meeting" ? "selected" : ""}
+                      onClick={() => setMode("meeting")}
+                    >
+                      <Icon name="users" />
+                      <span>
+                        Meeting<small>Everyone can participate</small>
+                      </span>
+                      {mode === "meeting" && <Icon name="check" size={16} />}
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={mode === "webinar"}
+                      className={mode === "webinar" ? "selected" : ""}
+                      onClick={() => setMode("webinar")}
+                    >
+                      <Icon name="screen" />
+                      <span>
+                        Webinar<small>Host-controlled stage</small>
+                      </span>
+                      {mode === "webinar" && <Icon name="check" size={16} />}
+                    </button>
+                  </div>
+                  <Field label="Meeting title">
+                    <input
+                      name="title"
+                      placeholder="e.g. Product review"
+                      required
+                      maxLength={120}
+                    />
+                  </Field>
+                  <div className="form-row">
+                    <Field label="Host name">
+                      <input
+                        name="hostName"
+                        placeholder="Display name"
+                        required
+                        maxLength={80}
+                        autoComplete="name"
+                      />
+                    </Field>
+                    <Field label="Meeting password">
+                      <input
+                        name="password"
+                        type="password"
+                        placeholder="At least 12 characters"
+                        required
+                        minLength={12}
+                        maxLength={128}
+                        autoComplete="new-password"
+                      />
+                    </Field>
+                  </div>
+                  {config.edition === "self-hosted" && (
+                    <Field label="Custom meeting code (optional)">
+                      <input
+                        name="customCode"
+                        placeholder="Leave blank to generate a code"
+                        maxLength={64}
+                        autoComplete="off"
+                      />
+                    </Field>
+                  )}
+                  {config.creationRequiresKey && (
+                    <Field label="Creation key">
+                      <input
+                        name="creationKey"
+                        type="password"
+                        required
+                        autoComplete="off"
+                      />
+                    </Field>
+                  )}
+                  <div className="form-footer">
+                    <span>
+                      <Icon name="lock" size={15} />
+                      Guests wait for admission
+                    </span>
+                    <Button className="primary" disabled={busy} type="submit">
+                      {busy ? "Creating…" : "Create meeting"}
+                      <Icon name="arrow" size={17} />
+                    </Button>
+                  </div>
+                </form>
+              </section>
+            )}
+            <div className="right-column">
+              <section className="card join-card">
+                <div className="card-title">
+                  <div className="feature-icon secondary">
+                    <Icon name="link" />
+                  </div>
+                  <div>
+                    <h2>Join a room</h2>
+                    <p>Use a meeting code or direct link.</p>
+                  </div>
+                </div>
+                <form onSubmit={join} className="form-stack">
+                  <Field label="Meeting code or link">
+                    <input
+                      value={joinCode}
+                      onChange={(e) => setJoinCode(e.target.value)}
+                      placeholder="Paste a meeting code or link"
+                      required
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </Field>
+                  <Button type="submit" className="full-width">
+                    Continue
+                    <Icon name="arrow" size={17} />
+                  </Button>
+                </form>
+              </section>
+              <section className="access-card">
+                <div className="access-graphic">
+                  <Icon name="settings" size={27} />
+                  <span className="graphic-line" />
+                  <Icon name="users" size={27} />
+                  <span className="graphic-line" />
+                  <Icon name="lock" size={27} />
+                </div>
+                <h3>Room controls</h3>
+                <div className="access-row">
+                  <Icon name="check" size={15} />
+                  Admit guests from the waiting room
+                </div>
+                <div className="access-row">
+                  <Icon name="check" size={15} />
+                  Manage microphone and camera access
+                </div>
+                <div className="access-row">
+                  <Icon name="check" size={15} />
+                  Lock the room and remove participants
+                </div>
+                <div className="access-divider" />
+                <span className="muted">
+                  Recording starts only when enabled by the host.
+                </span>
+              </section>
+            </div>
+          </div>
+          <footer className="dashboard-footer">
+            <span>{config.branding?.footerText || config.brandName}</span>
+            {config.branding?.supportUrl ? (
+              <a
+                href={config.branding.supportUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                {config.branding.supportLabel || "Support"}
+              </a>
+            ) : (
+              <span>Guests join without an account</span>
+            )}
+          </footer>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function Meeting({
+  code,
+  hostEntry,
+  config,
+}: {
+  code: string;
+  hostEntry: boolean;
+  config: Config;
+}) {
+  const [state, setState] = useState<MeetingState>();
+  const [needsJoin, setNeedsJoin] = useState(false);
+  const [error, setError] = useState("");
+  const [refresh, setRefresh] = useState(0);
+  const [bootstrapping, setBootstrapping] = useState(
+    hostEntry && Boolean(initialHostToken),
+  );
+  const exchange = useRef<Promise<unknown> | null>(null);
+  useEffect(() => {
+    if (!bootstrapping) return;
+    exchange.current ??= api(meetingPath(code, "/host"), {
+      token: initialHostToken,
+    });
+    exchange.current
+      .catch((e) => setError(messageOf(e)))
+      .finally(() => {
+        initialHostToken = "";
+        setBootstrapping(false);
+      });
+  }, [code, bootstrapping]);
+  useEffect(() => {
+    if (bootstrapping) return;
+    const controller = new AbortController();
+    let timeout: ReturnType<typeof setTimeout>;
+    async function poll() {
+      try {
+        const data = await api<MeetingState>(
+          meetingPath(code, "/state"),
+          undefined,
+          undefined,
+          controller.signal,
+        );
+        setState(data);
+        setNeedsJoin(false);
+        setError("");
+      } catch (e) {
+        if (controller.signal.aborted) return;
+        if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          setNeedsJoin(true);
+          setState(undefined);
+        } else setError(messageOf(e));
+      }
+      if (!controller.signal.aborted) timeout = setTimeout(poll, 2000);
+    }
+    void poll();
+    return () => {
+      controller.abort();
+      clearTimeout(timeout);
+    };
+  }, [code, refresh, bootstrapping]);
+  if (needsJoin)
+    return (
+      <Prejoin
+        config={config}
+        code={code}
+        onJoin={() => {
+          setNeedsJoin(false);
+          setRefresh((value) => value + 1);
+        }}
+      />
+    );
+  if (!state)
+    return (
+      <Center>
+        <Logo name={config.brandName} />
+        {error ? (
+          <>
+            <Notice>{error}</Notice>
+            <Button onClick={() => setRefresh((v) => v + 1)}>Try again</Button>
+            <Button onClick={() => navigate("/")}>Control panel</Button>
+          </>
+        ) : (
+          <>
+            <div className="spinner" />
+            <p>
+              {bootstrapping ? "Opening host session…" : "Opening meeting…"}
+            </p>
+          </>
+        )}
+      </Center>
+    );
+  if (
+    state.me.status === "kicked" ||
+    state.me.status === "banned" ||
+    state.me.status === "left" ||
+    state.meeting.ended
+  )
+    return (
+      <Center>
+        <Logo name={config.brandName} />
+        <div className="status-icon">
+          <Icon name="exit" size={30} />
+        </div>
+        <h1>
+          {state.meeting.ended
+            ? "Meeting ended"
+            : state.me.status === "banned"
+              ? "Meeting access removed"
+              : state.me.status === "kicked"
+                ? "Removed from meeting"
+                : "You left the meeting"}
+        </h1>
+        <p className="muted">
+          {state.me.status === "banned"
+            ? "The host has blocked access to this meeting."
+            : state.me.status === "kicked"
+              ? "The host removed this session. You can request admission again."
+              : state.meeting.title}
+        </p>
+        {state.me.status === "kicked" && !state.meeting.ended && (
+          <Button onClick={() => setNeedsJoin(true)}>Request admission</Button>
+        )}
+        <Button className="primary" onClick={() => navigate("/")}>
+          Control panel
+        </Button>
+      </Center>
+    );
+  if (state.me.status === "waiting")
+    return (
+      <Center>
+        <Logo name={config.brandName} />
+        <div className="waiting-visual">
+          <span className="avatar">{initials(state.me.name)}</span>
+          <span className="waiting-dot" />
+        </div>
+        <p className="eyebrow">WAITING ROOM</p>
+        <h1>{state.meeting.title}</h1>
+        <p className="muted">
+          The host will admit you when the meeting is ready.
+        </p>
+        <div className="joining-as">
+          Joining as <strong>{state.me.name}</strong>
+        </div>
+        {error && <Notice>{error}</Notice>}
+        <Button
+          onClick={async () => {
+            try {
+              await api(meetingPath(code, "/leave"), {});
+              navigate("/");
+            } catch (e) {
+              setError(messageOf(e));
+            }
+          }}
+        >
+          Leave waiting room
+        </Button>
+      </Center>
+    );
+  return (
+    <Conference
+      config={config}
+      state={state}
+      networkError={error}
+      refresh={() => setRefresh((v) => v + 1)}
+    />
+  );
+}
+
+function Prejoin({
+  config,
+  code,
+  onJoin,
+}: {
+  config: Config;
+  code: string;
+  onJoin: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    const data = new FormData(event.currentTarget);
+    try {
+      await api(meetingPath(code, "/join"), {
+        name: data.get("name"),
+        password: data.get("password"),
+      });
+      onJoin();
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <main className="prejoin-page">
+      <header>
+        <Logo name={config.brandName} />
+        <a
+          href="/"
+          onClick={(e) => {
+            e.preventDefault();
+            navigate("/");
+          }}
+        >
+          Control panel
+        </a>
+      </header>
+      <div className="prejoin-grid">
+        <section className="camera-preview">
+          <div className="camera-ring">
+            <Icon name="camera-off" size={42} />
+          </div>
+          <h2>Camera and microphone are off</h2>
+          <p>Turn them on after you join.</p>
+          <span className="preview-label">
+            <Icon name="video" size={16} />
+            Devices off
+          </span>
+        </section>
+        <section className="prejoin-form">
+          <p className="eyebrow">JOIN MEETING</p>
+          <h1>Enter the waiting room</h1>
+          <p className="code-text">{code}</p>
+          <form onSubmit={submit} className="form-stack">
+            <Field label="Display name">
+              <input
+                name="name"
+                autoComplete="name"
+                maxLength={80}
+                required
+                autoFocus
+              />
+            </Field>
+            <Field label="Meeting password">
+              <input
+                name="password"
+                type="password"
+                autoComplete="current-password"
+                required
+                maxLength={128}
+              />
+            </Field>
+            {error && <Notice>{error}</Notice>}
+            <Button
+              type="submit"
+              className="primary full-width"
+              disabled={busy}
+            >
+              {busy ? "Joining…" : "Request to join"}
+              <Icon name="arrow" size={17} />
+            </Button>
+          </form>
+        </section>
+      </div>
+    </main>
+  );
+}
+
+function Conference({
+  config,
+  state,
+  networkError,
+  refresh,
+}: {
+  config: Config;
+  state: MeetingState;
+  networkError: string;
+  refresh: () => void;
+}) {
+  const [panel, setPanel] = useState<
+    "participants" | "chat" | "recordings" | "breakouts" | null
+  >(() => (window.innerWidth < 760 ? null : "participants"));
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [issuedCredentials, setCredentials] = useState<{
+    token: string;
+    url: string;
+    version: number;
+  }>();
+  const credentials =
+    issuedCredentials?.version === state.me.mediaVersion &&
+    !state.me.enforcementPending
+      ? issuedCredentials
+      : undefined;
+  const [mediaError, setMediaError] = useState("");
+  const [attempt, setAttempt] = useState(0);
+  const host = state.me.role === "host";
+  const code = state.meeting.code;
+  const admitted = state.participants.filter((p) => p.status === "admitted");
+  const waiting = state.participants.filter((p) => p.status === "waiting");
+  useEffect(() => {
+    if (!config.mediaAvailable || state.me.enforcementPending) return;
+    const controller = new AbortController();
+    setMediaError("");
+    setCredentials(undefined);
+    api<{ token: string; url: string }>(
+      meetingPath(code, "/media"),
+      {},
+      undefined,
+      controller.signal,
+    )
+      .then((value) => {
+        const url = new URL(value.url, location.href);
+        if (url.protocol === "http:") url.protocol = "ws:";
+        if (url.protocol === "https:") url.protocol = "wss:";
+        const expectedOrigin = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
+        if (url.origin !== expectedOrigin || !["/", ""].includes(url.pathname))
+          throw new Error(
+            "Media endpoint must use the same-origin signaling gateway.",
+          );
+        setCredentials({
+          ...value,
+          url: url.href,
+          version: state.me.mediaVersion,
+        });
+      })
+      .catch((e) => {
+        if (!controller.signal.aborted) setMediaError(messageOf(e));
+      });
+    return () => controller.abort();
+  }, [
+    code,
+    config.mediaAvailable,
+    attempt,
+    state.me.mediaVersion,
+    state.me.breakoutId,
+    state.me.enforcementPending,
+  ]);
+  async function mutate(path: string, body: unknown = {}, method?: string) {
+    setError("");
+    setBusy(true);
+    try {
+      await api(meetingPath(code, path), body, method);
+      refresh();
+      return true;
+    } catch (e) {
+      setError(messageOf(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function copyInvite() {
+    try {
+      await navigator.clipboard.writeText(
+        `${config.meetingOrigin || location.origin}/join/${encodeURIComponent(code)}`,
+      );
+      setNotice(
+        `Meeting link copied. Code: ${code}. Share the password separately.`,
+      );
+      setTimeout(() => setNotice(""), 6000);
+    } catch {
+      setNotice(
+        `Meeting link: ${config.meetingOrigin || location.origin}/join/${encodeURIComponent(code)}`,
+      );
+    }
+  }
+  const stage = (
+    <>
+      <div className="stage-content">
+        {credentials ? (
+          <MediaStage me={state.me} />
+        ) : (
+          <div className="offline-stage">
+            <span className="stage-avatar">{initials(state.me.name)}</span>
+            <h2>{state.me.name}</h2>
+            <span>
+              {!config.mediaAvailable
+                ? "Audio and video are not configured"
+                : mediaError
+                  ? "Audio and video unavailable"
+                  : state.me.enforcementPending
+                    ? "Applying host controls…"
+                    : "Connecting audio and video…"}
+            </span>
+            {mediaError && (
+              <>
+                <p>{mediaError}</p>
+                <Button onClick={() => setAttempt((v) => v + 1)}>
+                  Retry connection
+                </Button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+      <div className="stage-footer">
+        <div className="meeting-caption">
+          <Icon name="lock" size={14} />
+          {state.meeting.breakouts?.find((r) => r.id === state.me.breakoutId)
+            ?.name || "Main room"}{" "}
+          · {state.meeting.locked ? "Meeting locked" : "Waiting room enabled"}
+          {state.me.breakoutId && (
+            <button
+              className="return-main"
+              onClick={() => void mutate("/return-main")}
+            >
+              Return to main
+            </button>
+          )}
+        </div>
+        <div className="stage-controls">
+          {credentials ? (
+            <MediaControls me={state.me} />
+          ) : (
+            <>
+              <Button disabled>
+                <Icon name="mic" />
+                Microphone
+              </Button>
+              <Button disabled>
+                <Icon name="video" />
+                Camera
+              </Button>
+              <Button disabled>
+                <Icon name="screen" />
+                Share
+              </Button>
+            </>
+          )}
+          <Button
+            className="leave-button"
+            disabled={busy}
+            onClick={() => void mutate("/leave")}
+          >
+            <Icon name="exit" />
+            Leave
+          </Button>
+        </div>
+      </div>
+    </>
+  );
+  return (
+    <div className="conference">
+      <header className="meeting-header">
+        <Logo name={config.brandName} small />
+        <div className="meeting-title">
+          <h1>{state.meeting.title}</h1>
+          <span>
+            {state.meeting.mode === "webinar" ? "Webinar" : "Meeting"}
+            <i /> {admitted.length}{" "}
+            {admitted.length === 1 ? "participant" : "participants"}
+          </span>
+        </div>
+        <div className="meeting-header-actions">
+          {state.meeting.recordingActive && (
+            <span className="recording-status">
+              <span />
+              Recording
+            </span>
+          )}
+          <Button onClick={() => void copyInvite()}>
+            <Icon name="link" size={17} />
+            <span>Invite</span>
+          </Button>
+          {host && (
+            <Button
+              className={state.meeting.locked ? "lock-active" : ""}
+              disabled={busy}
+              onClick={() =>
+                void mutate("", { locked: !state.meeting.locked }, "PATCH")
+              }
+            >
+              <Icon name={state.meeting.locked ? "lock" : "unlock"} size={17} />
+              <span>{state.meeting.locked ? "Unlock" : "Lock"}</span>
+            </Button>
+          )}
+        </div>
+      </header>
+      {(error || networkError || notice) && (
+        <div className="room-notices">
+          {(error || networkError) && <Notice>{error || networkError}</Notice>}
+          {notice && <Notice kind="info">{notice}</Notice>}
+        </div>
+      )}
+      <div className="meeting-workspace">
+        <main className="meeting-stage">
+          {credentials ? (
+            <LiveKitRoom
+              key={`${attempt}-${state.me.mediaVersion}`}
+              token={credentials.token}
+              serverUrl={credentials.url}
+              connect
+              audio={false}
+              video={false}
+              options={roomOptions}
+              connectOptions={connectionOptions}
+              onConnected={() => setMediaError("")}
+              onError={(e) => setMediaError(e.message)}
+              onDisconnected={() =>
+                setMediaError(
+                  "Media disconnected. Reconnect to request fresh access.",
+                )
+              }
+            >
+              <RoomAudioRenderer />
+              <StartAudio label="Enable meeting audio" />
+              {mediaError && (
+                <div className="media-error">
+                  <span>{mediaError}</span>
+                  <Button onClick={() => setAttempt((v) => v + 1)}>
+                    Reconnect
+                  </Button>
+                </div>
+              )}
+              {stage}
+            </LiveKitRoom>
+          ) : (
+            stage
+          )}
+        </main>
+        {panel && (
+          <aside className="meeting-panel">
+            <div className="panel-header">
+              <h2>
+                {panel === "participants"
+                  ? "Participants"
+                  : panel === "chat"
+                    ? "Meeting chat"
+                    : panel === "breakouts"
+                      ? "Breakout rooms"
+                      : "Recordings"}
+                {panel === "participants" && (
+                  <span className="count">{admitted.length}</span>
+                )}
+              </h2>
+              <button
+                className="icon-button"
+                onClick={() => setPanel(null)}
+                aria-label="Close panel"
+              >
+                <Icon name="close" size={18} />
+              </button>
+            </div>
+            {panel === "participants" ? (
+              <Participants
+                state={state}
+                busy={busy}
+                action={(id, data) =>
+                  mutate(`/participants/${encodeURIComponent(id)}/action`, data)
+                }
+              />
+            ) : panel === "chat" ? (
+              <Chat
+                state={state}
+                send={(text) => mutate("/messages", { text })}
+                busy={busy}
+              />
+            ) : panel === "breakouts" ? (
+              <Breakouts state={state} busy={busy} mutate={mutate} />
+            ) : (
+              <Recordings state={state} config={config} refresh={refresh} />
+            )}
+          </aside>
+        )}
+      </div>
+      <footer className="meeting-bottom">
+        <span className="session-role">
+          {host
+            ? "Host"
+            : state.me.role === "viewer"
+              ? "Viewer"
+              : "Participant"}
+          <span> · {state.me.name}</span>
+        </span>
+        <div className="panel-tabs">
+          <button
+            className={panel === "participants" ? "selected" : ""}
+            onClick={() =>
+              setPanel(panel === "participants" ? null : "participants")
+            }
+          >
+            <Icon name="users" />
+            <span>Participants</span>
+            {host && waiting.length > 0 && <b>{waiting.length}</b>}
+          </button>
+          <button
+            className={panel === "chat" ? "selected" : ""}
+            onClick={() => setPanel(panel === "chat" ? null : "chat")}
+          >
+            <Icon name="chat" />
+            <span>Chat</span>
+          </button>
+          {host && (
+            <button
+              className={panel === "breakouts" ? "selected" : ""}
+              onClick={() =>
+                setPanel(panel === "breakouts" ? null : "breakouts")
+              }
+            >
+              <Icon name="grid" />
+              <span>Breakouts</span>
+            </button>
+          )}
+          {host && (
+            <button
+              className={panel === "recordings" ? "selected" : ""}
+              onClick={() =>
+                setPanel(panel === "recordings" ? null : "recordings")
+              }
+            >
+              <Icon name="record" />
+              <span>Recordings</span>
+            </button>
+          )}
+        </div>
+        {host && (
+          <Button
+            className="end-button"
+            disabled={busy}
+            onClick={() => {
+              if (window.confirm("End this meeting for everyone?"))
+                void mutate("/end");
+            }}
+          >
+            End meeting
+          </Button>
+        )}
+      </footer>
+    </div>
+  );
+}
+
+function MediaStage({ me }: { me: Participant }) {
+  const tracks = useTracks(
+    [
+      { source: Track.Source.Camera, withPlaceholder: true },
+      { source: Track.Source.ScreenShare, withPlaceholder: false },
+    ],
+    { onlySubscribed: true },
+  );
+  const connection = useConnectionState();
+  return (
+    <>
+      <div className="connection-label">
+        <span className={connection === "connected" ? "connected" : ""} />
+        {connection}
+      </div>
+      <div
+        className={`video-grid ${tracks.some((track) => track.source === Track.Source.ScreenShare) ? "has-screen" : ""}`}
+      >
+        {tracks.map((track) => (
+          <div
+            className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""}`}
+            key={`${track.participant.identity}-${track.source}`}
+          >
+            {isTrackReference(track) && !track.publication.isMuted ? (
+              <VideoTrack trackRef={track} />
+            ) : (
+              <div className="tile-placeholder">
+                <span className="stage-avatar">
+                  {initials(
+                    track.participant.name ||
+                      (track.participant.isLocal
+                        ? me.name
+                        : track.participant.identity),
+                  )}
+                </span>
+              </div>
+            )}
+            <span className="tile-name">
+              {track.participant.name ||
+                (track.participant.isLocal ? me.name : "Participant")}
+              {track.participant.isLocal ? " (you)" : ""}
+              {track.source === Track.Source.ScreenShare ? " · Screen" : ""}
+            </span>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function MediaControls({ me }: { me: Participant }) {
+  const { localParticipant } = useLocalParticipant();
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!me.audioAllowed)
+      void localParticipant
+        .setMicrophoneEnabled(false)
+        .catch((e) => setError(messageOf(e)));
+  }, [localParticipant, me.audioAllowed]);
+  useEffect(() => {
+    if (!me.videoAllowed) {
+      void localParticipant
+        .setCameraEnabled(false)
+        .catch((e) => setError(messageOf(e)));
+      void localParticipant
+        .setScreenShareEnabled(false)
+        .catch((e) => setError(messageOf(e)));
+    }
+  }, [localParticipant, me.videoAllowed]);
+  return (
+    <>
+      {error && (
+        <span className="device-error" role="alert">
+          {error}
+        </span>
+      )}
+      <TrackToggle
+        className="button media-toggle"
+        source={Track.Source.Microphone}
+        disabled={!me.audioAllowed}
+        showIcon={false}
+        onDeviceError={(e) => setError(e.message)}
+        title={
+          me.audioAllowed ? "Toggle microphone" : "Microphone blocked by host"
+        }
+      >
+        <Icon name="mic" />
+        <span>{me.audioAllowed ? "Microphone" : "Mic blocked"}</span>
+      </TrackToggle>
+      <TrackToggle
+        className="button media-toggle"
+        source={Track.Source.Camera}
+        disabled={!me.videoAllowed}
+        showIcon={false}
+        onDeviceError={(e) => setError(e.message)}
+        title={me.videoAllowed ? "Toggle camera" : "Camera blocked by host"}
+      >
+        <Icon name="video" />
+        <span>{me.videoAllowed ? "Camera" : "Camera blocked"}</span>
+      </TrackToggle>
+      <TrackToggle
+        className="button media-toggle"
+        source={Track.Source.ScreenShare}
+        disabled={!me.videoAllowed || me.role === "viewer"}
+        showIcon={false}
+        onDeviceError={(e) => setError(e.message)}
+      >
+        <Icon name="screen" />
+        <span>Share</span>
+      </TrackToggle>
+    </>
+  );
+}
+
+function Participants({
+  state,
+  busy,
+  action,
+}: {
+  state: MeetingState;
+  busy: boolean;
+  action: (id: string, data: object) => Promise<boolean>;
+}) {
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [ban, setBan] = useState<Participant | null>(null);
+  const [banIp, setBanIp] = useState(false);
+  const [banDevice, setBanDevice] = useState(true);
+  const host = state.me.role === "host";
+  const waiting = state.participants.filter((p) => p.status === "waiting");
+  const admitted = state.participants.filter((p) => p.status === "admitted");
+  return (
+    <div className="panel-scroll">
+      {host && waiting.length > 0 && (
+        <section className="waiting-list">
+          <div className="section-label">
+            WAITING ROOM <span>{waiting.length}</span>
+          </div>
+          {waiting.map((p) => (
+            <div className="participant-row" key={p.id}>
+              <span className="avatar small-avatar">{initials(p.name)}</span>
+              <div className="participant-name">
+                <strong>{p.name}</strong>
+                <small>Waiting for admission</small>
+              </div>
+              <Button
+                className="small primary"
+                disabled={busy || state.meeting.locked}
+                title={
+                  state.meeting.locked
+                    ? "Unlock the meeting to admit guests"
+                    : "Admit guest"
+                }
+                onClick={() => void action(p.id, { action: "admit" })}
+              >
+                Admit
+              </Button>
+              <button
+                className="icon-button"
+                aria-label={`Remove ${p.name} from waiting room`}
+                disabled={busy}
+                onClick={() => void action(p.id, { action: "kick" })}
+              >
+                <Icon name="close" size={16} />
+              </button>
+            </div>
+          ))}
+        </section>
+      )}
+      <div className="section-label">IN MEETING</div>
+      {admitted.map((p) => (
+        <div className="participant-entry" key={p.id}>
+          <div className="participant-row">
+            <span
+              className={`avatar small-avatar ${p.role === "host" ? "host-avatar" : ""}`}
+            >
+              {initials(p.name)}
+            </span>
+            <div className="participant-name">
+              <strong>
+                {p.name}
+                {p.id === state.me.id ? " (you)" : ""}
+              </strong>
+              <small>
+                {p.role === "host"
+                  ? "Host"
+                  : p.role === "viewer"
+                    ? "Viewer"
+                    : "Participant"}
+              </small>
+            </div>
+            <span
+              className={`permission-icon ${p.audioAllowed ? "" : "blocked"}`}
+              title={
+                p.audioAllowed ? "Microphone permitted" : "Microphone blocked"
+              }
+            >
+              <Icon name="mic" size={14} />
+            </span>
+            <span
+              className={`permission-icon ${p.videoAllowed ? "" : "blocked"}`}
+              title={p.videoAllowed ? "Camera permitted" : "Camera blocked"}
+            >
+              <Icon name="video" size={14} />
+            </span>
+            {host && p.id !== state.me.id && (
+              <button
+                className="icon-button"
+                aria-expanded={expanded === p.id}
+                aria-label={`Controls for ${p.name}`}
+                onClick={() => setExpanded(expanded === p.id ? null : p.id)}
+              >
+                <Icon name="more" size={18} />
+              </button>
+            )}
+          </div>
+          {expanded === p.id && (
+            <div className="participant-actions">
+              <button
+                disabled={busy}
+                onClick={() =>
+                  void action(p.id, {
+                    action: p.audioAllowed ? "block-audio" : "allow-audio",
+                  })
+                }
+              >
+                {p.audioAllowed
+                  ? "Mute and block microphone"
+                  : "Allow microphone"}
+              </button>
+              <button
+                disabled={busy}
+                onClick={() =>
+                  void action(p.id, {
+                    action: p.videoAllowed ? "block-video" : "allow-video",
+                  })
+                }
+              >
+                {p.videoAllowed ? "Turn off and block camera" : "Allow camera"}
+              </button>
+              {state.meeting.mode === "webinar" && (
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    void action(p.id, {
+                      action: p.role === "viewer" ? "promote" : "demote",
+                    })
+                  }
+                >
+                  {p.role === "viewer" ? "Invite to stage" : "Move to audience"}
+                </button>
+              )}
+              <button
+                className="danger-text"
+                disabled={busy}
+                onClick={() => void action(p.id, { action: "kick" })}
+              >
+                Kick from meeting
+              </button>
+              <button
+                className="danger-text"
+                disabled={busy}
+                onClick={() => {
+                  setBan(p);
+                  setBanIp(false);
+                  setBanDevice(true);
+                }}
+              >
+                Ban from meeting…
+              </button>
+            </div>
+          )}
+        </div>
+      ))}
+      {host && (
+        <p className="panel-note">
+          Permission changes reconnect media. Participants choose when to turn
+          allowed devices back on.
+        </p>
+      )}
+      {ban && (
+        <div className="ban-form">
+          <h3>Ban {ban.name}</h3>
+          <p>
+            This participant cannot rejoin this meeting with the current
+            session.
+          </p>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={banDevice}
+              onChange={(e) => setBanDevice(e.target.checked)}
+            />
+            Also block this browser
+          </label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={banIp}
+              onChange={(e) => setBanIp(e.target.checked)}
+            />
+            Also block this IP address
+          </label>
+          <small>
+            Browser data can be cleared. IP blocking can affect others on the
+            same network.
+          </small>
+          <div className="button-row">
+            <Button className="small" onClick={() => setBan(null)}>
+              Cancel
+            </Button>
+            <Button
+              className="small danger"
+              disabled={busy}
+              onClick={async () => {
+                if (await action(ban.id, { action: "ban", banIp, banDevice }))
+                  setBan(null);
+              }}
+            >
+              Ban participant
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Breakouts({
+  state,
+  busy,
+  mutate,
+}: {
+  state: MeetingState;
+  busy: boolean;
+  mutate: (path: string, body?: unknown, method?: string) => Promise<boolean>;
+}) {
+  const [name, setName] = useState("");
+  const [broadcast, setBroadcast] = useState("");
+  const [sent, setSent] = useState(false);
+  const rooms = [
+    { id: "", name: "Main room" },
+    ...(state.meeting.breakouts || []),
+  ];
+  const admitted = state.participants.filter((p) => p.status === "admitted");
+  return (
+    <div className="panel-scroll breakout-panel">
+      <form
+        className="breakout-create"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (await mutate("/breakouts", { name: name.trim() })) setName("");
+        }}
+      >
+        <Field label="New room name">
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+            maxLength={60}
+            placeholder="Room name"
+          />
+        </Field>
+        <Button
+          className="small primary"
+          type="submit"
+          disabled={busy || !name.trim()}
+        >
+          Create
+        </Button>
+      </form>
+      {rooms.map((room) => (
+        <section className="breakout-room" key={room.id}>
+          <header>
+            <h3>{room.name}</h3>
+            <Button
+              className="small"
+              disabled={busy || (state.me.breakoutId || "") === room.id}
+              onClick={() =>
+                void mutate("/move", {
+                  participantId: state.me.id,
+                  breakoutId: room.id || null,
+                })
+              }
+            >
+              {(state.me.breakoutId || "") === room.id
+                ? "Current room"
+                : "Visit room"}
+            </Button>
+          </header>
+          {admitted
+            .filter((p) => (p.breakoutId || "") === room.id)
+            .map((p) => (
+              <div className="breakout-assign" key={p.id}>
+                <span>
+                  {p.name}
+                  {p.id === state.me.id ? " (you)" : ""}
+                </span>
+                <label>
+                  <span className="sr-only">Room for {p.name}</span>
+                  <select
+                    disabled={busy}
+                    value={p.breakoutId || ""}
+                    onChange={(e) =>
+                      void mutate("/move", {
+                        participantId: p.id,
+                        breakoutId: e.target.value || null,
+                      })
+                    }
+                  >
+                    {rooms.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            ))}
+          {!admitted.some((p) => (p.breakoutId || "") === room.id) && (
+            <p className="breakout-empty">No participants</p>
+          )}
+        </section>
+      ))}
+      {(state.meeting.breakouts?.length || 0) > 0 && (
+        <Button
+          className="small full-width"
+          disabled={busy}
+          onClick={() => {
+            if (
+              window.confirm(
+                "Close all breakout rooms and return everyone to the main room?",
+              )
+            )
+              void mutate("/close-breakouts");
+          }}
+        >
+          Close all breakout rooms
+        </Button>
+      )}
+      <form
+        className="breakout-broadcast"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (await mutate("/broadcast", { text: broadcast.trim() })) {
+            setBroadcast("");
+            setSent(true);
+          }
+        }}
+      >
+        <Field label="Message all rooms">
+          <textarea
+            value={broadcast}
+            onChange={(e) => {
+              setBroadcast(e.target.value);
+              setSent(false);
+            }}
+            maxLength={2000}
+            rows={3}
+            placeholder="Message to all participants"
+            required
+          />
+        </Field>
+        <Button
+          className="small"
+          type="submit"
+          disabled={busy || !broadcast.trim()}
+        >
+          Send to all rooms
+        </Button>
+        {sent && <Notice kind="success">Message sent to all rooms.</Notice>}
+      </form>
+      <p className="panel-note">
+        Moving rooms reconnects audio and video. Participants choose when to
+        turn their devices back on.
+      </p>
+    </div>
+  );
+}
+
+function Chat({
+  state,
+  send,
+  busy,
+}: {
+  state: MeetingState;
+  send: (text: string) => Promise<boolean>;
+  busy: boolean;
+}) {
+  const [text, setText] = useState("");
+  const bottom = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    bottom.current?.scrollIntoView({ behavior: "smooth" });
+  }, [state.messages.length]);
+  return (
+    <div className="chat-panel">
+      <div className="chat-messages">
+        {state.messages.length === 0 && (
+          <div className="empty-panel">
+            <Icon name="chat" size={30} />
+            <h3>No messages</h3>
+            <p>Messages are visible to participants in this room.</p>
+          </div>
+        )}
+        {state.messages.map((m) => (
+          <article className="chat-message" key={m.id}>
+            <header>
+              <strong>{m.name}</strong>
+              <time>
+                {new Date(m.createdAt).toLocaleTimeString([], {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                })}
+              </time>
+            </header>
+            <p>{m.text}</p>
+          </article>
+        ))}
+        <div ref={bottom} />
+      </div>
+      <form
+        className="chat-compose"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (text.trim()) {
+            if (await send(text.trim())) setText("");
+          }
+        }}
+      >
+        <label className="sr-only" htmlFor="chat-text">
+          Message
+        </label>
+        <textarea
+          id="chat-text"
+          placeholder="Message this room"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          maxLength={2000}
+          rows={2}
+        />
+        <Button
+          className="primary small"
+          type="submit"
+          disabled={busy || !text.trim()}
+        >
+          Send
+          <Icon name="arrow" size={16} />
+        </Button>
+      </form>
+    </div>
+  );
+}
+
+function Recordings({
+  state,
+  config,
+  refresh,
+}: {
+  state: MeetingState;
+  config: Config;
+  refresh: () => void;
+}) {
+  const [email, setEmail] = useState("");
+  const [otp, setOtp] = useState("");
+  const [sent, setSent] = useState(false);
+  const [verified, setVerified] = useState(
+    Boolean(state.meeting.hostEmailVerified),
+  );
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [link, setLink] = useState<{ url: string; expiresAt: string }>();
+  const code = state.meeting.code;
+  const active = state.recordings.some((r) =>
+    ["starting", "recording", "active", "stopping"].includes(r.status),
+  );
+  async function request(suffix: string, body: object = {}, method?: string) {
+    setError("");
+    setNotice("");
+    setBusy(true);
+    try {
+      const result = await api<{ url?: string; expiresAt?: string }>(
+        meetingPath(code, suffix),
+        body,
+        method,
+      );
+      refresh();
+      return result;
+    } catch (e) {
+      setError(messageOf(e));
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="panel-scroll recordings-panel">
+      <label className="switch-row">
+        <span>
+          <strong>Allow recording</strong>
+          <small>Recording is off until started.</small>
+        </span>
+        <input
+          aria-label="Allow recording"
+          type="checkbox"
+          role="switch"
+          checked={state.meeting.recordingAllowed}
+          disabled={busy}
+          onChange={(e) =>
+            void request("", { recordingAllowed: e.target.checked }, "PATCH")
+          }
+        />
+      </label>
+      {!config.recordingAvailable ? (
+        <Notice kind="info">
+          Recording is not configured. An administrator must configure encrypted
+          storage and email delivery before recordings can start.
+        </Notice>
+      ) : (
+        <>
+          <div className="section-label">HOST EMAIL</div>
+          {verified || state.meeting.hostEmailVerified ? (
+            <div className="verified">
+              <Icon name="check" size={17} />
+              Email verified
+            </div>
+          ) : (
+            <form
+              className="form-stack"
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const result = await request(
+                  sent ? "/verify-email" : "/host-email",
+                  sent ? { otp } : { email },
+                );
+                if (result) {
+                  if (sent) setVerified(true);
+                  else {
+                    setSent(true);
+                    setNotice("Verification code sent.");
+                  }
+                }
+              }}
+            >
+              {!sent ? (
+                <Field label="Email address">
+                  <input
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    autoComplete="email"
+                  />
+                </Field>
+              ) : (
+                <Field label="Verification code">
+                  <input
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    required
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value)}
+                    maxLength={12}
+                  />
+                </Field>
+              )}
+              <Button className="small" disabled={busy} type="submit">
+                {sent ? "Verify email" : "Send verification code"}
+              </Button>
+              {sent && (
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => setSent(false)}
+                >
+                  Change email address
+                </button>
+              )}
+            </form>
+          )}
+          <p className="panel-note">
+            Download links expire after 24 hours. A separate password is emailed
+            to the verified host.
+          </p>
+          <Button
+            className="primary full-width"
+            disabled={
+              busy ||
+              !state.meeting.recordingAllowed ||
+              !(verified || state.meeting.hostEmailVerified) ||
+              active
+            }
+            onClick={() => void request("/recordings")}
+          >
+            <Icon name="record" size={17} />
+            Start recording
+          </Button>
+        </>
+      )}
+      {error && <Notice>{error}</Notice>}
+      {notice && <Notice kind="success">{notice}</Notice>}
+      {link && (
+        <div className="recording-link">
+          <strong>Download link</strong>
+          <a href={link.url} target="_blank" rel="noopener noreferrer">
+            Open download
+          </a>
+          <small>
+            Expires {new Date(link.expiresAt).toLocaleString()}. The password
+            was sent by email.
+          </small>
+          <Button
+            className="small"
+            onClick={async () => {
+              try {
+                await navigator.clipboard.writeText(
+                  new URL(link.url, location.origin).href,
+                );
+                setNotice("Download link copied.");
+              } catch {
+                setNotice("Select the download link to copy it.");
+              }
+            }}
+          >
+            Copy link
+          </Button>
+        </div>
+      )}
+      <div className="section-label">MEETING RECORDINGS</div>
+      {state.recordings.length === 0 && (
+        <div className="empty-panel">
+          <Icon name="record" size={28} />
+          <p>No recordings</p>
+        </div>
+      )}
+      {state.recordings.map((recording) => (
+        <div className="recording-item" key={recording.id}>
+          <div>
+            <strong>
+              {new Date(recording.createdAt).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+            </strong>
+            <span className="status-pill">{recording.status}</span>
+          </div>
+          {recording.error && <Notice>{recording.error}</Notice>}
+          {["starting", "recording", "active"].includes(recording.status) ? (
+            <Button
+              className="small"
+              disabled={busy}
+              onClick={() =>
+                void request(
+                  `/recordings/${encodeURIComponent(recording.id)}/stop`,
+                )
+              }
+            >
+              Stop recording
+            </Button>
+          ) : ["ready", "completed"].includes(recording.status) ? (
+            <div className="button-row">
+              <Button
+                className="small"
+                disabled={busy}
+                onClick={async () => {
+                  const result = await request(
+                    `/recordings/${encodeURIComponent(recording.id)}/link`,
+                  );
+                  if (result?.url && result.expiresAt)
+                    setLink({ url: result.url, expiresAt: result.expiresAt });
+                }}
+              >
+                Create 24-hour link
+              </Button>
+              <button
+                className="text-button danger-text"
+                disabled={busy}
+                onClick={async () => {
+                  if (
+                    await request(
+                      `/recordings/${encodeURIComponent(recording.id)}/revoke`,
+                    )
+                  ) {
+                    setLink(undefined);
+                    setNotice("Download links revoked.");
+                  }
+                }}
+              >
+                Revoke links
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Download({ code, config }: { code: string; config: Config }) {
+  const [token] = useState(initialDownloadToken);
+  useEffect(() => {
+    initialDownloadToken = "";
+  }, []);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [complete, setComplete] = useState(false);
+  async function download(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setComplete(false);
+    try {
+      const response = await fetch(
+        `/api/meetings/${encodeURIComponent(code)}/download`,
+        {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Requested-With": "MeetingPlatform",
+          },
+          body: JSON.stringify({ token, password }),
+        },
+      );
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "Download failed.");
+      }
+      const size = Number(response.headers.get("Content-Length") || 0);
+      if (size > 512 * 1024 * 1024) {
+        await response.body?.cancel();
+        throw new Error(
+          "This recording exceeds the browser download limit of 512 MB. Contact the installation administrator for an export.",
+        );
+      }
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No download data received.");
+      const parts: BlobPart[] = [];
+      let received = 0;
+      while (true) {
+        const result = await reader.read();
+        if (result.done) break;
+        received += result.value.byteLength;
+        if (received > 512 * 1024 * 1024) {
+          await reader.cancel();
+          throw new Error(
+            "This recording exceeds the browser download limit of 512 MB.",
+          );
+        }
+        parts.push(result.value.slice().buffer);
+      }
+      const url = URL.createObjectURL(
+        new Blob(parts, {
+          type: response.headers.get("Content-Type") || "video/mp4",
+        }),
+      );
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "meeting-recording.mp4";
+      anchor.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      setPassword("");
+      setComplete(true);
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  if (!token)
+    return (
+      <Center>
+        <Logo name={config.brandName} />
+        <Icon name="link" size={30} />
+        <h1>Reopen the download link</h1>
+        <p className="muted">
+          This tab no longer contains the download key. Reopen the original
+          24-hour link from the meeting.
+        </p>
+        <Button onClick={() => navigate("/")}>Control panel</Button>
+      </Center>
+    );
+  return (
+    <Center>
+      <Logo name={config.brandName} />
+      <div className="status-icon">
+        <Icon name="download" size={30} />
+      </div>
+      <h1>Download recording</h1>
+      <p className="muted">
+        Enter the password emailed to the host. Use the browser with the active
+        host session.
+      </p>
+      <form onSubmit={download} className="form-stack full-width">
+        <Field label="Recording password">
+          <input
+            type="password"
+            autoComplete="off"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+          />
+        </Field>
+        {error && <Notice>{error}</Notice>}
+        {complete && <Notice kind="success">Download prepared.</Notice>}
+        <Button className="primary full-width" type="submit" disabled={busy}>
+          <Icon name="download" size={17} />
+          {busy ? "Preparing download…" : "Download recording"}
+        </Button>
+      </form>
+      <small className="muted">
+        Links expire 24 hours after creation. The downloaded video is decrypted
+        on this device.
+      </small>
+    </Center>
+  );
+}
+
+createRoot(document.getElementById("root")!).render(<App />);

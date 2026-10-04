@@ -1,6 +1,6 @@
 # Initial API contract
 
-Same-origin `/api`, JSON. Mutation calls send `Content-Type: application/json` and `X-Requested-With: MeetingPlatform`. Cookie-backed HTTP-only sessions. Errors `{error: string}`. All GETs no-store. No client-supplied tenant. Single installation/tenant for this first implementation.
+Same-origin `/api`, JSON. Mutation calls send `Content-Type: application/json` and `X-Requested-With: Covemeet`. Cookie-backed HTTP-only sessions. Errors `{error: string}`. All GETs no-store. No client-supplied tenant. Single installation/tenant for this first implementation.
 
 - `GET /api/config` → `{edition:'hosted'|'self-hosted',brandName,recordingAvailable,mediaAvailable,creationRequiresKey}`.
 - `POST /api/meetings` body `{title,hostName,password,mode:'meeting'|'webinar',customCode?,creationKey?}` → `{code,hostToken,guestUrl}`. Never persist plaintext hostToken in local storage. Navigate `/host/CODE#TOKEN` and immediately exchange/clear fragment.
@@ -16,6 +16,6 @@ Same-origin `/api`, JSON. Mutation calls send `Content-Type: application/json` a
 - `POST /api/meetings/:code/media` `{}` → `{token,url}`; only admitted sessions. URL is gateway signaling endpoint, not raw LiveKit. Client must use `autoSubscribe:true`, no initial auto camera/mic.
 - `POST /api/meetings/:code/host-email` `{email}` → `{ok:true}` sends OTP. `POST /api/meetings/:code/verify-email` `{otp}` → `{ok:true}`.
 - `POST /api/meetings/:code/recordings` `{}` starts optional recording if available, allowed and host email verified. `POST /api/meetings/:code/recordings/:id/stop` `{}` stops. `POST /api/meetings/:code/recordings/:id/link` `{}` → `{url,expiresAt}` emails separate password. No plaintext password in response. `POST /api/meetings/:code/recordings/:id/revoke` `{}` revokes.
-- `/download/:token` UI accepts password; `POST /api/download/:token` `{password}` returns decrypted media as attachment, requires host session. UI can submit fetch and blob only with bounded file expectations; form POST with hidden CSRF header alternative must be reviewed.
+- `/download/:code#token` UI accepts password; `POST /api/meetings/:code/download` `{token,password}` returns decrypted media as attachment, requires host session. UI can submit fetch and blob only with bounded file expectations; form POST with hidden CSRF header alternative must be reviewed.
 
 This contract is for locally runnable milestone one. Phone integration and 100/1000 capacity remain validation gates, not UI promises.
