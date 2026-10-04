@@ -2,6 +2,8 @@
 
 This package provides authenticated encryption for stored recordings and password verifiers for download access. It does not implement meeting media E2EE, recording consent, link expiry, host sessions, email delivery, or authorization. The application must enforce those controls. No FIPS validation or compliance certification is claimed.
 
+`LocalKeyringProvider`, `AwsKmsKeyProvider`, and `S3RecordingStorage` add staged key rotation and private ciphertext storage. `decryptRecordingFromStream` accepts a Node byte stream and authenticates the same container without a decrypted intermediate file; `verifyEncryptedRecording` consumes and erases verified plaintext without storing it. See [deployment and recovery procedures](../../docs/recording-storage.md) for configuration, the operator rotation endpoint, and provider-validation limits.
+
 ## API
 
 ```ts
@@ -13,11 +15,13 @@ const stream = await decryptRecordingToStream(encryptedPath, metadata, context, 
 await pipeline(stream, authorizedHttpResponse);
 ```
 
-`encryptRecording` reads a file in chunks (default 1 MiB, configurable 64 KiB–4 MiB) and writes only encrypted bytes to a new exclusive file with permission mode `0600`. It refuses input/output leaf symlinks, relative paths, traversal components and existing outputs. The configured directories must be owned and writable only by trusted operators/processes: these checks are not a sandbox against a malicious local filesystem administrator. The recorder's source spool must already be on an encrypted ephemeral volume, or memory-backed storage, and must be deleted by the caller on success and failure. This library does not make an existing plaintext source file encrypted at rest.
+`encryptRecording` reads a file in chunks (default 1 MiB, configurable 64 KiB–4 MiB) and writes only encrypted bytes to a new exclusive file with permission mode `0600`. It refuses input/output leaf symlinks, relative paths, traversal components and existing outputs. The configured directories must be owned and writable only by trusted operators/processes: these checks are not a sandbox against a malicious local filesystem administrator. The recorder's source spool must already be on an encrypted ephemeral volume, or memory-backed storage. The caller must remove it after the ciphertext and envelope are durably committed, or when recovery is deliberately cancelled; failed jobs may retain a bounded protected spool for retry. This library does not make an existing plaintext source file encrypted at rest.
 
 Every recording uses a new random 256-bit data key. A `KeyProvider` wraps it with authenticated context consisting of tenant, meeting, recording, and a random recording key ID. `LocalKeyProvider` uses an operator-supplied 256-bit key; keep it outside the media/database store and supply it through a secret manager. A KMS adapter can implement the interface with its service's authenticated encryption context. Adapters must authenticate **all** binding fields and must return a new buffer from `unwrapKey`, because the package erases it after use. Never reuse a provider's internal KEK as a returned data key.
 
 The returned envelope metadata is stored separately in the database. The encrypted file includes its recording key ID and context hash, both authenticated with every chunk. The caller must pass context from its already authorized database query when decrypting. Do not derive the expected context from a client-supplied envelope.
+
+Encryption synchronizes both file contents and the parent directory before returning metadata. Use a filesystem that supports those durability operations; an error leaves the source recovery spool under the caller's control. This does not make database, filesystem, and object storage one atomic transaction: the application still needs the documented retry and backup procedures.
 
 `rotateRecordingKey(metadata, expectedContext, oldProvider, newProvider)` produces a new wrapped envelope without rewriting the file. Atomically save the new metadata and verify recovery before retiring old keys; old backups may still require old keys. Rewrapping does not revoke someone who previously copied the old key and envelope. Key material is cleared in owned JavaScript buffers on a best-effort basis; Node/OpenSSL and garbage-collected runtimes cannot promise complete process-memory zeroization.
 

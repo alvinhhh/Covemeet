@@ -281,6 +281,19 @@ export async function createApp(config: Config, store: Store, media: Media) {
     await store.audit("installation", "operator", "branding.update");
     return { ok: true, branding };
   });
+  app.post(
+    "/api/admin/meetings/:code/recordings/:id/rotate-key",
+    async (req) => {
+      admin(req);
+      z.object({}).strict().parse(req.body);
+      const id = z
+        .string()
+        .uuid()
+        .parse((req.params as { id: string }).id);
+      await recordings.rotateKey(await find(req), id);
+      return { ok: true };
+    },
+  );
   app.post("/api/admin/assets", async (req) => {
     admin(req);
     const body = z

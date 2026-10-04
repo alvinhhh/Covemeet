@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import {
   access,
   mkdir,
@@ -16,6 +17,12 @@ import nodemailer, { type Transporter } from "nodemailer";
 import {
   LocalKeyProvider,
   encryptRecording,
+  verifyEncryptedRecording,
+  type RecordingObjectStorage,
+  type RecordingObjectReference,
+  type EncryptedRecordingMetadata,
+  type RecordingContext,
+  type KeyProvider,
 } from "@meeting-platform/recording";
 import { loadConfig } from "../src/config.js";
 import { createApp } from "../src/server.js";
@@ -435,4 +442,270 @@ test("recording off and unverified host email fail closed", async (t) => {
   });
   await assert.rejects(f.link(), forbidden);
   assert.equal(f.emails.length, 0);
+});
+
+/** Service-boundary fake; actual S3 command and ciphertext tests live in the recording package. */
+class TestObjectStorage implements RecordingObjectStorage {
+  objects = new Map<string, Buffer>();
+  failPut = false;
+  failDelete = false;
+  putCount = 0;
+  afterPut?: () => void;
+  async put(
+    file: string,
+    metadata: EncryptedRecordingMetadata,
+    context: RecordingContext,
+    provider: KeyProvider,
+  ) {
+    this.putCount++;
+    if (this.failPut) throw new Error("object storage unavailable");
+    await verifyEncryptedRecording(file, metadata, context, provider);
+    const bytes = await readFile(file);
+    const key = `${context.tenantId}/${context.meetingId}/${context.recordingId}/${metadata.recordingKeyId}`;
+    if (this.objects.has(key)) assert.deepEqual(this.objects.get(key), bytes);
+    this.objects.set(key, bytes);
+    const reference: RecordingObjectReference = {
+      provider: "s3",
+      key,
+      etag: '"test-version"',
+      bytes: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      versionId: "version-1",
+    };
+    this.afterPut?.();
+    return reference;
+  }
+  async read(
+    reference: RecordingObjectReference,
+    metadata: EncryptedRecordingMetadata,
+    context: RecordingContext,
+  ) {
+    assert.equal(
+      reference.key,
+      `${context.tenantId}/${context.meetingId}/${context.recordingId}/${metadata.recordingKeyId}`,
+    );
+    const bytes = this.objects.get(reference.key);
+    if (!bytes) throw new Error("object missing");
+    return Readable.from([bytes]);
+  }
+  async delete(reference: RecordingObjectReference) {
+    if (this.failDelete) throw new Error("deletion unavailable");
+    this.objects.delete(reference.key);
+  }
+}
+
+async function collectFromService(
+  service: RecordingService,
+  f: Awaited<ReturnType<typeof fixture>>,
+) {
+  const link = await service.link(f.meeting, f.recording.id);
+  const token = new URL(link.url).hash.slice(1);
+  const password = /^Password: (.+)$/m.exec(f.emails.at(-1)!.text)![1]!;
+  const stream = await service.download(
+    f.meeting,
+    f.recording,
+    token,
+    password,
+  );
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+test("failed object upload preserves private recovery files and retries before recording becomes ready", async (t) => {
+  const f = await fixture(t, "encrypting");
+  const storage = new TestObjectStorage();
+  storage.failPut = true;
+  const service = new RecordingService(
+    { ...f.config, recordingStorage: "s3" },
+    f.store,
+    f.mail,
+    undefined,
+    { objectStorage: storage },
+  );
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.status,
+    "encrypting",
+  );
+  await access(f.raw);
+  await access(f.encrypted);
+  await assert.rejects(
+    service.link(f.meeting, f.recording.id),
+    (error: any) => error.status === 409,
+  );
+  storage.failPut = false;
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  const row = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(row.status, "ready");
+  assert.ok(row.metadata.storage);
+  await assert.rejects(access(f.raw));
+  await assert.rejects(access(f.encrypted));
+  assert.deepEqual(await collectFromService(service, f), f.plaintext);
+});
+
+test("lost database acknowledgement after object upload is retryable without losing ciphertext or plaintext cleanup", async (t) => {
+  const f = await fixture(t, "encrypting");
+  const storage = new TestObjectStorage();
+  const service = new RecordingService(
+    { ...f.config, recordingStorage: "s3" },
+    f.store,
+    f.mail,
+    undefined,
+    { objectStorage: storage },
+  );
+  let failNextCommit = false;
+  const change = f.store.change.bind(f.store);
+  f.store.change = (async (...args: Parameters<typeof f.store.change>) => {
+    if (failNextCommit) {
+      failNextCommit = false;
+      throw new Error("database unavailable");
+    }
+    return change(...args);
+  }) as typeof f.store.change;
+  storage.afterPut = () => {
+    failNextCommit = true;
+    storage.afterPut = undefined;
+  };
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  assert.equal(storage.objects.size, 1);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.metadata.storage,
+    undefined,
+  );
+  await access(f.raw);
+  await access(f.encrypted);
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  assert.equal(storage.objects.size, 1);
+  assert.equal(storage.putCount, 2);
+  assert.deepEqual(await collectFromService(service, f), f.plaintext);
+});
+
+test("operator rotation preserves S3 identity and recovery works after old key is removed", async (t) => {
+  const f = await fixture(t, "encrypting");
+  const storage = new TestObjectStorage();
+  const newKey = randomBytes(32).toString("base64");
+  const config = {
+    ...f.config,
+    recordingStorage: "s3",
+    recordingActiveKeyId: "operator-kek-v2",
+    recordingLocalKeys: {
+      ...f.config.recordingLocalKeys,
+      "operator-kek-v2": newKey,
+    },
+  };
+  const service = new RecordingService(config, f.store, f.mail, undefined, {
+    objectStorage: storage,
+  });
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  const before = structuredClone(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.metadata,
+  );
+  assert.equal(before.wrappedKey.keyId, "operator-kek-v1");
+  await service.rotateKey(f.meeting, f.recording.id);
+  const after = (await f.store.get(f.meeting.code))!.recordings[0]!.metadata;
+  assert.equal(after.wrappedKey.keyId, "operator-kek-v2");
+  assert.deepEqual(after.storage, before.storage);
+  assert.equal(after.recordingKeyId, before.recordingKeyId);
+  const recovered = new RecordingService(
+    { ...config, recordingLocalKeys: { "operator-kek-v2": newKey } },
+    f.store,
+    f.mail,
+    undefined,
+    { objectStorage: storage },
+  );
+  assert.deepEqual(await collectFromService(recovered, f), f.plaintext);
+});
+
+test("failed rotation recovery does not replace the known-good envelope", async (t) => {
+  const f = await fixture(t);
+  const before = structuredClone(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.metadata,
+  );
+  const old = new LocalKeyProvider({
+    keyId: "operator-kek-v1",
+    key: Buffer.from(f.config.recordingKek, "base64"),
+  });
+  const wrong = new LocalKeyProvider({
+    keyId: "new-unrecoverable",
+    key: randomBytes(32),
+  });
+  t.after(() => {
+    old.destroy();
+    wrong.destroy();
+  });
+  const service = new RecordingService(f.config, f.store, f.mail, undefined, {
+    keyProvider: {
+      wrapKey: (key, binding) => wrong.wrapKey(key, binding),
+      unwrapKey: (wrapped, binding) => old.unwrapKey(wrapped, binding),
+    },
+  });
+  await assert.rejects(service.rotateKey(f.meeting, f.recording.id));
+  assert.deepEqual(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.metadata,
+    before,
+  );
+  assert.deepEqual(await collectFromService(f.service, f), f.plaintext);
+});
+
+test("object retention revokes access even during storage failure and retries deletion", async (t) => {
+  const f = await fixture(t, "encrypting");
+  const storage = new TestObjectStorage();
+  const service = new RecordingService(
+    { ...f.config, recordingStorage: "s3" },
+    f.store,
+    f.mail,
+    undefined,
+    { objectStorage: storage },
+  );
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  const link = await service.link(f.meeting, f.recording.id);
+  const token = new URL(link.url).hash.slice(1);
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.createdAt = Date.now() - 8 * day;
+  });
+  storage.failDelete = true;
+  await assert.rejects(service.reconcile((await f.store.get(f.meeting.code))!));
+  assert.equal(await service.findToken(token, f.meeting.code), null);
+  assert.equal(storage.objects.size, 1);
+  storage.failDelete = false;
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  assert.equal(storage.objects.size, 0);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.status,
+    "deleted",
+  );
+});
+
+test("recording configuration rejects invalid keyrings and production HTTP object endpoints", async () => {
+  const base = {
+    SESSION_SECRET: "recording-config-test-more-than-32-characters",
+    RECORDING_ENABLED: "true",
+    RECORDING_KEK: randomBytes(32).toString("base64"),
+    LIVEKIT_API_KEY: "key",
+    LIVEKIT_API_SECRET: "secret",
+    SMTP_HOST: "mail.test",
+  };
+  for (const value of [
+    "not-json",
+    "[]",
+    '{"bad/key":"abc"}',
+    '{"key":"short"}',
+  ]) {
+    assert.throws(() => loadConfig({ ...base, RECORDING_LOCAL_KEYS: value }));
+  }
+  assert.throws(() => loadConfig({ ...base, RECORDING_STORAGE: "public-web" }));
+  const config = loadConfig({
+    ...base,
+    NODE_ENV: "production",
+    SITE_ORIGIN: "https://meet.example.test",
+    RECORDING_STORAGE: "s3",
+    RECORDING_S3_BUCKET: "private-recordings",
+    RECORDING_S3_ENDPOINT: "http://127.0.0.1:9000",
+    RECORDING_S3_ALLOW_LOCAL_HTTP: "true",
+  });
+  assert.throws(
+    () => new RecordingService(config, new MemoryStore(), {} as Transporter),
+    /HTTPS/,
+  );
 });

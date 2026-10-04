@@ -67,34 +67,56 @@ const MAX_FRAME_INDEX = 0xffff_ffff;
 const LOCAL_PROVIDER = "local-aes-256-gcm-v1";
 
 function contextBytes(context: RecordingContext): Buffer {
-  for (const value of [context?.tenantId, context?.meetingId, context?.recordingId]) {
-    if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value) > 1024) {
-      throw new TypeError("Recording context requires nonempty tenant, meeting and recording IDs");
+  for (const value of [
+    context?.tenantId,
+    context?.meetingId,
+    context?.recordingId,
+  ]) {
+    if (
+      typeof value !== "string" ||
+      value.length === 0 ||
+      Buffer.byteLength(value) > 1024
+    ) {
+      throw new TypeError(
+        "Recording context requires nonempty tenant, meeting and recording IDs",
+      );
     }
   }
-  return Buffer.from(JSON.stringify([context.tenantId, context.meetingId, context.recordingId]));
+  return Buffer.from(
+    JSON.stringify([context.tenantId, context.meetingId, context.recordingId]),
+  );
 }
 
 function bindingBytes(binding: KeyBinding): Buffer {
   contextBytes(binding.context);
-  if (!/^[a-f0-9]{32}$/.test(binding.recordingKeyId)) throw new RecordingIntegrityError();
-  return Buffer.from(JSON.stringify([
-    "meeting-platform-recording-key-v1",
-    binding.context.tenantId,
-    binding.context.meetingId,
-    binding.context.recordingId,
-    binding.recordingKeyId,
-  ]));
+  if (!/^[a-f0-9]{32}$/.test(binding.recordingKeyId))
+    throw new RecordingIntegrityError();
+  return Buffer.from(
+    JSON.stringify([
+      "meeting-platform-recording-key-v1",
+      binding.context.tenantId,
+      binding.context.meetingId,
+      binding.context.recordingId,
+      binding.recordingKeyId,
+    ]),
+  );
 }
 
 function hashContext(context: RecordingContext): Buffer {
   return createHash("sha256").update(contextBytes(context)).digest();
 }
 
-function decodeBase64(value: string | undefined, expectedBytes: number): Buffer {
-  if (typeof value !== "string" || value.length > 256) throw new RecordingIntegrityError();
+function decodeBase64(
+  value: string | undefined,
+  expectedBytes: number,
+): Buffer {
+  if (typeof value !== "string" || value.length > 256)
+    throw new RecordingIntegrityError();
   const decoded = Buffer.from(value, "base64");
-  if (decoded.length !== expectedBytes || decoded.toString("base64") !== value) {
+  if (
+    decoded.length !== expectedBytes ||
+    decoded.toString("base64") !== value
+  ) {
     throw new RecordingIntegrityError();
   }
   return decoded;
@@ -108,7 +130,9 @@ export class LocalKeyProvider implements KeyProvider {
 
   constructor({ keyId, key }: { keyId: string; key: Uint8Array }) {
     if (!keyId || keyId.length > 256 || key.byteLength !== 32) {
-      throw new TypeError("A key ID and exactly 32 bytes of key material are required");
+      throw new TypeError(
+        "A key ID and exactly 32 bytes of key material are required",
+      );
     }
     this.keyId = keyId;
     this.#key = Buffer.from(key);
@@ -116,28 +140,44 @@ export class LocalKeyProvider implements KeyProvider {
 
   async wrapKey(key: Uint8Array, binding: KeyBinding): Promise<WrappedKey> {
     this.#assertAvailable();
-    if (key.byteLength !== 32) throw new TypeError("Recording data keys must be 32 bytes");
+    if (key.byteLength !== 32)
+      throw new TypeError("Recording data keys must be 32 bytes");
     const iv = randomBytes(12);
-    const cipher = createCipheriv("aes-256-gcm", this.#key, iv, { authTagLength: TAG_SIZE });
+    const cipher = createCipheriv("aes-256-gcm", this.#key, iv, {
+      authTagLength: TAG_SIZE,
+    });
     cipher.setAAD(bindingBytes(binding));
     const ciphertext = Buffer.concat([cipher.update(key), cipher.final()]);
     return {
       provider: LOCAL_PROVIDER,
       keyId: this.keyId,
       ciphertext: ciphertext.toString("base64"),
-      metadata: { iv: iv.toString("base64"), tag: cipher.getAuthTag().toString("base64") },
+      metadata: {
+        iv: iv.toString("base64"),
+        tag: cipher.getAuthTag().toString("base64"),
+      },
     };
   }
 
-  async unwrapKey(wrappedKey: WrappedKey, binding: KeyBinding): Promise<Uint8Array> {
+  async unwrapKey(
+    wrappedKey: WrappedKey,
+    binding: KeyBinding,
+  ): Promise<Uint8Array> {
     this.#assertAvailable();
-    if (wrappedKey?.provider !== LOCAL_PROVIDER || wrappedKey.keyId !== this.keyId) {
+    if (
+      wrappedKey?.provider !== LOCAL_PROVIDER ||
+      wrappedKey.keyId !== this.keyId
+    ) {
       throw new RecordingIntegrityError();
     }
     let unverified: Buffer | undefined;
     try {
-      const decipher = createDecipheriv("aes-256-gcm", this.#key,
-        decodeBase64(wrappedKey.metadata?.iv, 12), { authTagLength: TAG_SIZE });
+      const decipher = createDecipheriv(
+        "aes-256-gcm",
+        this.#key,
+        decodeBase64(wrappedKey.metadata?.iv, 12),
+        { authTagLength: TAG_SIZE },
+      );
       decipher.setAAD(bindingBytes(binding));
       decipher.setAuthTag(decodeBase64(wrappedKey.metadata?.tag, TAG_SIZE));
       unverified = decipher.update(decodeBase64(wrappedKey.ciphertext, 32));
@@ -169,7 +209,9 @@ async function safePath(path: string): Promise<string> {
     throw new TypeError("Recording paths must be normalized absolute paths");
   }
   if (constants.O_NOFOLLOW === undefined) {
-    throw new Error("Recording storage requires a platform with O_NOFOLLOW support");
+    throw new Error(
+      "Recording storage requires a platform with O_NOFOLLOW support",
+    );
   }
   const parent = await realpath(dirname(path));
   return join(parent, basename(path));
@@ -177,9 +219,13 @@ async function safePath(path: string): Promise<string> {
 
 async function openInput(path: string): Promise<FileHandle> {
   // Nonblocking open prevents a misconfigured FIFO from hanging before fstat.
-  const file = await open(await safePath(path), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  const file = await open(
+    await safePath(path),
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
   try {
-    if (!(await file.stat()).isFile()) throw new TypeError("Recording input must be a regular file");
+    if (!(await file.stat()).isFile())
+      throw new TypeError("Recording input must be a regular file");
     return file;
   } catch (error) {
     await file.close();
@@ -205,29 +251,82 @@ function frameHeader(kind: 0 | 1, index: number, length: number): Buffer {
 async function writeAll(file: FileHandle, buffer: Buffer): Promise<void> {
   let offset = 0;
   while (offset < buffer.length) {
-    const { bytesWritten } = await file.write(buffer, offset, buffer.length - offset, null);
-    if (bytesWritten === 0) throw new Error("Recording storage stopped accepting writes");
+    const { bytesWritten } = await file.write(
+      buffer,
+      offset,
+      buffer.length - offset,
+      null,
+    );
+    if (bytesWritten === 0)
+      throw new Error("Recording storage stopped accepting writes");
     offset += bytesWritten;
   }
 }
 
-async function readExactly(file: FileHandle, length: number): Promise<Buffer> {
-  const result = Buffer.allocUnsafe(length);
-  let offset = 0;
-  while (offset < length) {
-    const { bytesRead } = await file.read(result, offset, length - offset, null);
-    if (bytesRead === 0) throw new RecordingIntegrityError();
-    offset += bytesRead;
+/** Pulls only the bytes needed for a frame, independent of network chunk boundaries. */
+class BoundedStreamReader {
+  private readonly iterator: AsyncIterator<unknown>;
+  private chunk: Buffer = Buffer.alloc(0);
+  private offset = 0;
+  consumed = 0;
+  constructor(
+    private readonly source: Readable,
+    private readonly maximum: number,
+  ) {
+    this.iterator = source[Symbol.asyncIterator]();
   }
-  return result;
+  private async next(): Promise<boolean> {
+    while (this.offset === this.chunk.length) {
+      const next = await this.iterator.next();
+      if (next.done) return false;
+      if (!(next.value instanceof Uint8Array))
+        throw new RecordingIntegrityError();
+      this.chunk = Buffer.isBuffer(next.value)
+        ? next.value
+        : Buffer.from(next.value);
+      this.offset = 0;
+    }
+    return true;
+  }
+  async read(length: number): Promise<Buffer> {
+    if (this.consumed + length > this.maximum)
+      throw new RecordingIntegrityError();
+    const result = Buffer.allocUnsafe(length);
+    let written = 0;
+    while (written < length) {
+      if (!(await this.next())) throw new RecordingIntegrityError();
+      const amount = Math.min(
+        length - written,
+        this.chunk.length - this.offset,
+      );
+      this.chunk.copy(result, written, this.offset, this.offset + amount);
+      this.offset += amount;
+      written += amount;
+      this.consumed += amount;
+    }
+    return result;
+  }
+  async end(): Promise<boolean> {
+    return this.consumed === this.maximum && !(await this.next());
+  }
+  close(): void {
+    this.source.destroy();
+  }
 }
 
 async function writeFrame(
-  file: FileHandle, key: Buffer, header: Buffer, prefix: Buffer,
-  index: number, plaintext: Buffer, kind: 0 | 1,
+  file: FileHandle,
+  key: Buffer,
+  header: Buffer,
+  prefix: Buffer,
+  index: number,
+  plaintext: Buffer,
+  kind: 0 | 1,
 ): Promise<number> {
   const frame = frameHeader(kind, index, plaintext.length);
-  const cipher = createCipheriv("aes-256-gcm", key, nonce(prefix, index), { authTagLength: TAG_SIZE });
+  const cipher = createCipheriv("aes-256-gcm", key, nonce(prefix, index), {
+    authTagLength: TAG_SIZE,
+  });
   cipher.setAAD(Buffer.concat([header, frame]));
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   await writeAll(file, frame);
@@ -249,12 +348,22 @@ export async function encryptRecording(
   options: EncryptRecordingOptions = {},
 ): Promise<EncryptedRecordingMetadata> {
   const chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
-  if (!Number.isInteger(chunkSize) || chunkSize < MIN_CHUNK_SIZE || chunkSize > MAX_CHUNK_SIZE) {
-    throw new TypeError("Recording chunk size must be between 64 KiB and 4 MiB");
+  if (
+    !Number.isInteger(chunkSize) ||
+    chunkSize < MIN_CHUNK_SIZE ||
+    chunkSize > MAX_CHUNK_SIZE
+  ) {
+    throw new TypeError(
+      "Recording chunk size must be between 64 KiB and 4 MiB",
+    );
   }
   // Copy caller-owned context before any await so it cannot change during encryption.
   contextBytes(context);
-  const stableContext = { tenantId: context.tenantId, meetingId: context.meetingId, recordingId: context.recordingId };
+  const stableContext = {
+    tenantId: context.tenantId,
+    meetingId: context.meetingId,
+    recordingId: context.recordingId,
+  };
   const key = randomBytes(32);
   const recordingKeyId = randomBytes(16).toString("hex");
   const binding: KeyBinding = { context: stableContext, recordingKeyId };
@@ -267,8 +376,14 @@ export async function encryptRecording(
     const wrappedKey = await keyProvider.wrapKey(key, binding);
     input = await openInput(inputPath);
     resolvedOutput = await safePath(outputPath);
-    output = await open(resolvedOutput,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    output = await open(
+      resolvedOutput,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_NOFOLLOW,
+      0o600,
+    );
     const prefix = randomBytes(8);
     const header = Buffer.alloc(HEADER_SIZE);
     MAGIC.copy(header, 0);
@@ -283,52 +398,104 @@ export async function encryptRecording(
     while (true) {
       const { bytesRead } = await input.read(readBuffer, 0, chunkSize, null);
       if (bytesRead === 0) break;
-      if (index === MAX_FRAME_INDEX) throw new Error("Recording exceeds maximum format size");
-      encryptedBytes += await writeFrame(output, key, header, prefix, index++, readBuffer.subarray(0, bytesRead), 0);
+      if (index === MAX_FRAME_INDEX)
+        throw new Error("Recording exceeds maximum format size");
+      encryptedBytes += await writeFrame(
+        output,
+        key,
+        header,
+        prefix,
+        index++,
+        readBuffer.subarray(0, bytesRead),
+        0,
+      );
       plaintextBytes += bytesRead;
       readBuffer.fill(0, 0, bytesRead);
     }
-    encryptedBytes += await writeFrame(output, key, header, prefix, index, Buffer.alloc(0), 1);
+    encryptedBytes += await writeFrame(
+      output,
+      key,
+      header,
+      prefix,
+      index,
+      Buffer.alloc(0),
+      1,
+    );
     await output.sync();
+    // A durable file is insufficient if its new directory entry is lost after
+    // the caller commits metadata and removes the source recovery spool.
+    const directory = await open(
+      dirname(resolvedOutput),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
     completed = true;
-    return { version: 1, ...binding, wrappedKey, plaintextBytes, encryptedBytes };
+    return {
+      version: 1,
+      ...binding,
+      wrappedKey,
+      plaintextBytes,
+      encryptedBytes,
+    };
   } finally {
     key.fill(0);
     readBuffer.fill(0);
     await input?.close().catch(() => undefined);
     await output?.close().catch(() => undefined);
     // Only remove a file this invocation actually created, never an existing target.
-    if (!completed && output && resolvedOutput) await unlink(resolvedOutput).catch(() => undefined);
+    if (!completed && output && resolvedOutput)
+      await unlink(resolvedOutput).catch(() => undefined);
   }
 }
 
-function validateMetadata(metadata: EncryptedRecordingMetadata, expectedContext: RecordingContext): void {
-  if (metadata?.version !== 1 || !Number.isSafeInteger(metadata.plaintextBytes) || metadata.plaintextBytes < 0 ||
-      !Number.isSafeInteger(metadata.encryptedBytes) || metadata.encryptedBytes < HEADER_SIZE + FRAME_HEADER_SIZE + TAG_SIZE) {
+function validateMetadata(
+  metadata: EncryptedRecordingMetadata,
+  expectedContext: RecordingContext,
+): void {
+  if (
+    metadata?.version !== 1 ||
+    !Number.isSafeInteger(metadata.plaintextBytes) ||
+    metadata.plaintextBytes < 0 ||
+    !Number.isSafeInteger(metadata.encryptedBytes) ||
+    metadata.encryptedBytes < HEADER_SIZE + FRAME_HEADER_SIZE + TAG_SIZE
+  ) {
     throw new RecordingIntegrityError();
   }
   bindingBytes(metadata);
-  if (!timingSafeEqual(hashContext(metadata.context), hashContext(expectedContext))) {
+  if (
+    !timingSafeEqual(
+      hashContext(metadata.context),
+      hashContext(expectedContext),
+    )
+  ) {
     throw new RecordingIntegrityError();
   }
 }
 
-async function* decryptedChunks(
-  path: string, metadata: EncryptedRecordingMetadata, expectedContext: RecordingContext, provider: KeyProvider,
+async function* decryptedStreamChunks(
+  source: Readable,
+  metadata: EncryptedRecordingMetadata,
+  expectedContext: RecordingContext,
+  provider: KeyProvider,
 ): AsyncGenerator<Buffer> {
   validateMetadata(metadata, expectedContext);
-  let file: FileHandle | undefined;
+  const reader = new BoundedStreamReader(source, metadata.encryptedBytes);
   let providerKey: Uint8Array | undefined;
   let key: Buffer | undefined;
   try {
-    file = await openInput(path);
-    if ((await file.stat()).size !== metadata.encryptedBytes) throw new RecordingIntegrityError();
-    const header = await readExactly(file, HEADER_SIZE);
+    const header = await reader.read(HEADER_SIZE);
     const chunkSize = header.readUInt32BE(8);
-    if (!timingSafeEqual(header.subarray(0, 8), MAGIC) ||
-        chunkSize < MIN_CHUNK_SIZE || chunkSize > MAX_CHUNK_SIZE ||
-        header.subarray(20, 36).toString("hex") !== metadata.recordingKeyId ||
-        !timingSafeEqual(header.subarray(36, 68), hashContext(expectedContext))) {
+    if (
+      !timingSafeEqual(header.subarray(0, 8), MAGIC) ||
+      chunkSize < MIN_CHUNK_SIZE ||
+      chunkSize > MAX_CHUNK_SIZE ||
+      header.subarray(20, 36).toString("hex") !== metadata.recordingKeyId ||
+      !timingSafeEqual(header.subarray(36, 68), hashContext(expectedContext))
+    ) {
       throw new RecordingIntegrityError();
     }
     providerKey = await provider.unwrapKey(metadata.wrappedKey, metadata);
@@ -339,19 +506,29 @@ async function* decryptedChunks(
     let expectedIndex = 0;
     let plaintextBytes = 0;
     while (true) {
-      const frame = await readExactly(file, FRAME_HEADER_SIZE);
+      const frame = await reader.read(FRAME_HEADER_SIZE);
       const kind = frame[0];
       const index = frame.readUInt32BE(1);
       const length = frame.readUInt32BE(5);
-      if (index !== expectedIndex || length > chunkSize ||
-          (kind !== 0 && kind !== 1) || (kind === 0 && length === 0) || (kind === 1 && length !== 0)) {
+      if (
+        index !== expectedIndex ||
+        length > chunkSize ||
+        (kind !== 0 && kind !== 1) ||
+        (kind === 0 && length === 0) ||
+        (kind === 1 && length !== 0)
+      ) {
         throw new RecordingIntegrityError();
       }
-      const ciphertext = await readExactly(file, length);
-      const tag = await readExactly(file, TAG_SIZE);
+      const ciphertext = await reader.read(length);
+      const tag = await reader.read(TAG_SIZE);
       let plaintext: Buffer | undefined;
       try {
-        const decipher = createDecipheriv("aes-256-gcm", key, nonce(prefix, index), { authTagLength: TAG_SIZE });
+        const decipher = createDecipheriv(
+          "aes-256-gcm",
+          key,
+          nonce(prefix, index),
+          { authTagLength: TAG_SIZE },
+        );
         decipher.setAAD(Buffer.concat([header, frame]));
         decipher.setAuthTag(tag);
         plaintext = decipher.update(ciphertext);
@@ -361,14 +538,19 @@ async function* decryptedChunks(
         throw new RecordingIntegrityError();
       }
       if (kind === 1) {
-        const extra = Buffer.alloc(1);
-        if ((await file.read(extra, 0, 1, null)).bytesRead !== 0 || plaintextBytes !== metadata.plaintextBytes) {
+        if (
+          !(await reader.end()) ||
+          plaintextBytes !== metadata.plaintextBytes
+        ) {
           throw new RecordingIntegrityError();
         }
         return;
       }
       plaintextBytes += length;
-      if (plaintextBytes > metadata.plaintextBytes || expectedIndex === MAX_FRAME_INDEX) {
+      if (
+        plaintextBytes > metadata.plaintextBytes ||
+        expectedIndex === MAX_FRAME_INDEX
+      ) {
         plaintext.fill(0);
         throw new RecordingIntegrityError();
       }
@@ -379,15 +561,46 @@ async function* decryptedChunks(
   } finally {
     providerKey?.fill(0);
     key?.fill(0);
-    await file?.close().catch(() => undefined);
+    reader.close();
   }
 }
 
 /**
- * Each emitted chunk is authenticated. Whole-file completeness is only established
- * by a clean EOF after the authenticated final marker. Always use pipeline and
- * abort the HTTP response on errors; never mark a partial recording successful.
+ * Authenticates every chunk before emitting it. Only clean EOF proves completeness.
+ * Aborting the returned stream closes the input, including an S3 HTTP response.
  */
+export async function decryptRecordingFromStream(
+  input: Readable,
+  metadata: EncryptedRecordingMetadata,
+  expectedContext: RecordingContext,
+  keyProvider: KeyProvider,
+): Promise<Readable> {
+  try {
+    validateMetadata(metadata, expectedContext);
+    const snapshot: EncryptedRecordingMetadata = structuredClone(metadata);
+    const output = Readable.from(
+      decryptedStreamChunks(
+        input,
+        snapshot,
+        { ...expectedContext },
+        keyProvider,
+      ),
+      { objectMode: false },
+    );
+    // Async-generator finally blocks do not run when cancelled before the first read.
+    const failed = (error: Error) => output.destroy(error);
+    input.on("error", failed);
+    output.once("close", () => {
+      input.off("error", failed);
+      input.destroy();
+    });
+    return output;
+  } catch (error) {
+    input.destroy();
+    throw error;
+  }
+}
+
 export async function decryptRecordingToStream(
   inputPath: string,
   metadata: EncryptedRecordingMetadata,
@@ -397,7 +610,39 @@ export async function decryptRecordingToStream(
   validateMetadata(metadata, expectedContext);
   const snapshot: EncryptedRecordingMetadata = structuredClone(metadata);
   const contextSnapshot = { ...expectedContext };
-  return Readable.from(decryptedChunks(inputPath, snapshot, contextSnapshot, keyProvider), { objectMode: false });
+  async function* fromFile() {
+    const file = await openInput(inputPath);
+    try {
+      if ((await file.stat()).size !== snapshot.encryptedBytes)
+        throw new RecordingIntegrityError();
+      yield* decryptedStreamChunks(
+        file.createReadStream({ autoClose: false }),
+        snapshot,
+        contextSnapshot,
+        keyProvider,
+      );
+    } finally {
+      await file.close().catch(() => undefined);
+    }
+  }
+  return Readable.from(fromFile(), { objectMode: false });
+}
+
+/** Full integrity verification without writing or retaining decrypted output. */
+export async function verifyEncryptedRecording(
+  inputPath: string,
+  metadata: EncryptedRecordingMetadata,
+  expectedContext: RecordingContext,
+  keyProvider: KeyProvider,
+): Promise<void> {
+  for await (const chunk of await decryptRecordingToStream(
+    inputPath,
+    metadata,
+    expectedContext,
+    keyProvider,
+  )) {
+    (chunk as Buffer).fill(0);
+  }
 }
 
 /** Rewrap the DEK under a new KEK, then atomically persist the returned metadata. */
@@ -412,7 +657,10 @@ export async function rotateRecordingKey(
   const key = await oldProvider.unwrapKey(snapshot.wrappedKey, snapshot);
   try {
     if (key.byteLength !== 32) throw new RecordingIntegrityError();
-    return { ...snapshot, wrappedKey: await newProvider.wrapKey(key, snapshot) };
+    return {
+      ...snapshot,
+      wrappedKey: await newProvider.wrapKey(key, snapshot),
+    };
   } finally {
     key.fill(0);
   }
@@ -427,8 +675,12 @@ export interface DownloadCredentials {
 
 /** Token digest may be indexed in storage; never persist or log the raw token. */
 export function digestDownloadToken(token: string): string {
-  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) throw new TypeError("Invalid download token");
-  return createHash("sha256").update("recording-download-v1\0").update(token).digest("hex");
+  if (!/^[A-Za-z0-9_-]{43}$/.test(token))
+    throw new TypeError("Invalid download token");
+  return createHash("sha256")
+    .update("recording-download-v1\0")
+    .update(token)
+    .digest("hex");
 }
 
 /** Raw values are transient: deliver the password separately from the link. */
@@ -436,19 +688,42 @@ export async function createDownloadCredentials(): Promise<DownloadCredentials> 
   const token = randomBytes(32).toString("base64url");
   const password = randomBytes(18).toString("base64url");
   const passwordHash = await argon2.hash(password, {
-    type: argon2.argon2id, memoryCost: 65_536, timeCost: 3, parallelism: 1, hashLength: 32,
+    type: argon2.argon2id,
+    memoryCost: 65_536,
+    timeCost: 3,
+    parallelism: 1,
+    hashLength: 32,
     salt: randomBytes(16),
   });
-  return { token, tokenDigest: digestDownloadToken(token), password, passwordHash };
+  return {
+    token,
+    tokenDigest: digestDownloadToken(token),
+    password,
+    passwordHash,
+  };
 }
 
 /** Apply rate/concurrency limits before invoking this deliberately expensive check. */
-export async function verifyRecordingPassword(passwordHash: string, password: string): Promise<boolean> {
-  const hashParts = /^\$argon2id\$v=19\$([^$]{1,40})\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$/.exec(passwordHash);
+export async function verifyRecordingPassword(
+  passwordHash: string,
+  password: string,
+): Promise<boolean> {
+  const hashParts =
+    /^\$argon2id\$v=19\$([^$]{1,40})\$[A-Za-z0-9+/]{22}\$[A-Za-z0-9+/]{43}$/.exec(
+      passwordHash,
+    );
   const parameters = new Set(hashParts?.[1]?.split(",") ?? []);
-  if (typeof password !== "string" || password.length === 0 || password.length > 256 ||
-      !hashParts || hashParts[1]?.split(",").length !== 3 || parameters.size !== 3 ||
-      !parameters.has("m=65536") || !parameters.has("t=3") || !parameters.has("p=1")) {
+  if (
+    typeof password !== "string" ||
+    password.length === 0 ||
+    password.length > 256 ||
+    !hashParts ||
+    hashParts[1]?.split(",").length !== 3 ||
+    parameters.size !== 3 ||
+    !parameters.has("m=65536") ||
+    !parameters.has("t=3") ||
+    !parameters.has("p=1")
+  ) {
     return false;
   }
   try {
@@ -457,3 +732,11 @@ export async function verifyRecordingPassword(passwordHash: string, password: st
     return false;
   }
 }
+
+export { LocalKeyringProvider } from "./keyring.js";
+export { AwsKmsKeyProvider } from "./kms.js";
+export {
+  S3RecordingStorage,
+  type RecordingObjectReference,
+  type RecordingObjectStorage,
+} from "./storage.js";

@@ -5,6 +5,7 @@ import { loadConfig } from "../src/config.js";
 import { createApp } from "../src/server.js";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import type { Media } from "../src/media.js";
+import { RecordingService } from "../src/recordings.js";
 
 const origin = "http://localhost:5173";
 const creationKey = "test-creation-key-that-is-longer-than-32-characters";
@@ -767,6 +768,41 @@ test("branding administration requires operator authority and rejects executable
     updated.body,
     /SESSION_SECRET|CREATION_KEY|LIVEKIT_API_SECRET|RECORDING_KEK/,
   );
+});
+
+test("recording key rotation requires operator authority and rejects caller-selected keys", async (t) => {
+  const f = await fixture(t);
+  const meeting = await f.meeting();
+  const guest = await f.join(meeting.code);
+  const id = "0e0b6375-ff2a-4df7-9e64-6d4bacf2e8a4";
+  const endpoint = `/api/admin/meetings/${meeting.code}/recordings/${id}/rotate-key`;
+  const invoked: string[] = [];
+  t.mock.method(
+    RecordingService.prototype,
+    "rotateKey",
+    async (m: Meeting, recordingId: string) => {
+      invoked.push(`${m.code}/${recordingId}`);
+    },
+  );
+  assert.equal((await f.host.request("POST", endpoint, {})).statusCode, 401);
+  assert.equal(
+    (await guest.client.request("POST", endpoint, {})).statusCode,
+    401,
+  );
+  const operator = new Client(f.app, "198.51.100.85");
+  ok(await operator.request("POST", "/api/admin/session", { creationKey }));
+  rejected(await operator.request("POST", endpoint, { keyId: "attacker-key" }));
+  rejected(
+    await operator.request(
+      "POST",
+      endpoint,
+      {},
+      { origin: "https://untrusted.example" },
+    ),
+  );
+  assert.deepEqual(invoked, []);
+  ok(await operator.request("POST", endpoint, {}));
+  assert.deepEqual(invoked, [`${meeting.code}/${id}`]);
 });
 
 test("a separate self-hosted portal origin is allowed only on portal administration and creation", async (t) => {

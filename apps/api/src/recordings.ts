@@ -10,7 +10,14 @@ import {
   type EgressInfo,
 } from "livekit-server-sdk";
 import {
-  LocalKeyProvider,
+  LocalKeyringProvider,
+  AwsKmsKeyProvider,
+  S3RecordingStorage,
+  decryptRecordingFromStream,
+  rotateRecordingKey,
+  type KeyProvider,
+  type RecordingObjectStorage,
+  type EncryptedRecordingMetadata,
   encryptRecording,
   decryptRecordingToStream,
   createDownloadCredentials,
@@ -28,7 +35,8 @@ export type RecorderClient = Pick<
 
 export class RecordingService {
   readonly available: boolean;
-  private provider?: LocalKeyProvider;
+  private provider?: KeyProvider;
+  private objectStorage?: RecordingObjectStorage;
   private client: RecorderClient;
   private working = new Set<string>();
   constructor(
@@ -36,17 +44,86 @@ export class RecordingService {
     private store: Store,
     private mail: Transporter,
     client?: RecorderClient,
+    adapters?: {
+      keyProvider?: KeyProvider;
+      objectStorage?: RecordingObjectStorage;
+    },
   ) {
-    const key = Buffer.from(config.recordingKek, "base64");
+    const keyConfigured =
+      config.recordingKeyProvider === "aws-kms"
+        ? !!config.recordingKmsKeyArn
+        : !!config.recordingLocalKeys[config.recordingActiveKeyId];
     this.available =
       config.recordingEnabled &&
-      key.length === 32 &&
+      keyConfigured &&
       !!config.smtpHost &&
       !!config.livekitKey &&
       !!config.livekitSecret;
-    if (this.available)
-      this.provider = new LocalKeyProvider({ keyId: "operator-kek-v1", key });
-    key.fill(0);
+    if (this.available) {
+      if (adapters?.keyProvider) this.provider = adapters.keyProvider;
+      else {
+        const keys: Record<string, Buffer> = Object.create(null);
+        let local: LocalKeyringProvider | undefined;
+        try {
+          for (const [id, encoded] of Object.entries(
+            config.recordingLocalKeys,
+          )) {
+            const key = Buffer.from(encoded, "base64");
+            if (key.length !== 32 || key.toString("base64") !== encoded)
+              throw new Error("Invalid recording key material");
+            keys[id] = key;
+          }
+          if (Object.keys(keys).length)
+            local = new LocalKeyringProvider({
+              activeKeyId:
+                config.recordingKeyProvider === "local"
+                  ? config.recordingActiveKeyId
+                  : Object.keys(keys)[0]!,
+              keys,
+            });
+        } finally {
+          for (const key of Object.values(keys)) key.fill(0);
+        }
+        const kms = config.recordingKmsKeyArn
+          ? new AwsKmsKeyProvider({
+              region: config.recordingKmsRegion,
+              activeKeyId: config.recordingKmsKeyArn,
+              decryptKeyIds: config.recordingKmsDecryptKeyArns,
+            })
+          : undefined;
+        const active = config.recordingKeyProvider === "aws-kms" ? kms : local;
+        if (!active)
+          throw new Error("Active recording key provider is not configured");
+        this.provider = {
+          wrapKey: (key, binding) => active.wrapKey(key, binding),
+          unwrapKey: (wrapped, binding) => {
+            const selected =
+              wrapped.provider === "local-aes-256-gcm-v1"
+                ? local
+                : wrapped.provider === "aws-kms-symmetric-v1"
+                  ? kms
+                  : undefined;
+            if (!selected)
+              throw new Error(
+                "Recording recovery key provider is not configured",
+              );
+            return selected.unwrapKey(wrapped, binding);
+          },
+        };
+      }
+      if (config.recordingStorage === "s3")
+        this.objectStorage =
+          adapters?.objectStorage ??
+          new S3RecordingStorage({
+            bucket: config.recordingS3Bucket,
+            region: config.recordingS3Region,
+            endpoint: config.recordingS3Endpoint,
+            prefix: config.recordingS3Prefix,
+            forcePathStyle: config.recordingS3PathStyle,
+            allowInsecureLocalEndpoint: config.recordingS3AllowLocalHttp,
+            maxBytes: config.recordingMaxBytes,
+          });
+    }
     this.client =
       client ??
       new EgressClient(
@@ -84,13 +161,106 @@ export class RecordingService {
     }
   }
   private async finishEncryption(m: Meeting, r: Recording) {
-    // Metadata is already committed. Retrying after a crash needs no plaintext re-read.
+    // Reload committed metadata; the caller may still hold the pre-encryption snapshot.
+    let row = (await this.store.get(m.code))?.recordings.find(
+      (entry) => entry.id === r.id,
+    );
+    if (!row?.metadata || row.status !== "encrypting")
+      throw new Error("Recording encryption state changed");
+    if (this.objectStorage && !row.metadata.storage) {
+      const expectedKey = row.metadata.recordingKeyId;
+      const reference = await this.objectStorage.put(
+        this.file(row),
+        row.metadata,
+        this.context(m, row),
+        this.provider!,
+      );
+      await this.store.change(m.code, (state) => {
+        const current = state.recordings.find((entry) => entry.id === r.id)!;
+        if (
+          current.status !== "encrypting" ||
+          current.metadata?.recordingKeyId !== expectedKey
+        ) {
+          throw new Error("Recording encryption state changed");
+        }
+        current.metadata.storage = reference;
+      });
+      row = (await this.store.get(m.code))!.recordings.find(
+        (entry) => entry.id === r.id,
+      )!;
+    }
+    // Do not remove either recovery file until object upload and its reference are committed.
     await this.removeFile(this.file(r, true));
+    if (row.metadata.storage) await this.removeFile(this.file(r));
     await this.store.change(m.code, (state) => {
-      const row = state.recordings.find((x) => x.id === r.id)!;
-      if (row.status === "encrypting" && row.metadata) row.status = "ready";
+      const current = state.recordings.find((entry) => entry.id === r.id)!;
+      if (current.status === "encrypting" && current.metadata)
+        current.status = "ready";
     });
     await this.store.audit(m.code, "recorder", "recording.encrypted", r.id);
+  }
+  private async openEncrypted(m: Meeting, r: Recording, metadata = r.metadata) {
+    if (!this.provider)
+      throw new HttpError(503, "Recording keys are not configured");
+    if (metadata?.storage) {
+      if (!this.objectStorage)
+        throw new HttpError(503, "Recording object storage is not configured");
+      const ciphertext = await this.objectStorage.read(
+        metadata.storage,
+        metadata,
+        this.context(m, r),
+      );
+      return decryptRecordingFromStream(
+        ciphertext,
+        metadata,
+        this.context(m, r),
+        this.provider,
+      );
+    }
+    return decryptRecordingToStream(
+      this.file(r),
+      metadata,
+      this.context(m, r),
+      this.provider,
+    );
+  }
+  /** Operator action: verify recovery under the active KEK before atomically replacing its envelope. */
+  async rotateKey(m: Meeting, id: string): Promise<void> {
+    if (!this.provider)
+      throw new HttpError(503, "Recording keys are not configured");
+    const snapshot = (await this.store.get(m.code))?.recordings.find(
+      (entry) => entry.id === id,
+    );
+    if (!snapshot || snapshot.status !== "ready" || !snapshot.metadata)
+      throw new HttpError(409, "Recording is not ready");
+    const previous = structuredClone(snapshot.metadata);
+    const rotated = await rotateRecordingKey(
+      previous as EncryptedRecordingMetadata,
+      this.context(m, snapshot),
+      this.provider,
+      this.provider,
+    );
+    for await (const plaintext of await this.openEncrypted(
+      m,
+      snapshot,
+      rotated,
+    ))
+      (plaintext as Buffer).fill(0);
+    await this.store.change(m.code, (state) => {
+      const row = state.recordings.find((entry) => entry.id === id);
+      if (
+        !row ||
+        row.status !== "ready" ||
+        JSON.stringify(row.metadata) !== JSON.stringify(previous)
+      ) {
+        throw new HttpError(
+          409,
+          "Recording changed during key rotation; retry",
+        );
+      }
+      row.metadata = rotated;
+    });
+    await this.store.audit(m.code, "operator", "recording.key.rotate", id);
   }
   private belongsToRecording(info: EgressInfo, m: Meeting, r: Recording) {
     if (info.roomName !== m.room) return false;
@@ -243,6 +413,17 @@ export class RecordingService {
       if (this.working.has(r.id)) continue;
       if (r.status === "ready" && r.createdAt < Date.now() - 7 * 86400000) {
         await this.revoke(m, r.id);
+        if (r.metadata?.storage) {
+          if (!this.objectStorage)
+            throw new Error(
+              "Recording object storage is required for deletion",
+            );
+          await this.objectStorage.delete(
+            r.metadata.storage,
+            r.metadata,
+            this.context(m, r),
+          );
+        }
         await this.removeFile(this.file(r));
         await this.removeFile(this.file(r, true));
         await this.store.change(m.code, (state) => {
@@ -401,11 +582,6 @@ export class RecordingService {
     if (!(await this.findToken(token, m.code)))
       throw new HttpError(403, "Download unavailable");
     await this.store.audit(m.code, "host", "recording.download", r.id);
-    return decryptRecordingToStream(
-      this.file(r),
-      current.r.metadata,
-      this.context(m, r),
-      this.provider,
-    );
+    return this.openEncrypted(current.m, current.r);
   }
 }
