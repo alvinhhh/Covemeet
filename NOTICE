@@ -1,0 +1,8 @@
+MeetingPlatform
+Copyright 2026 MeetingPlatform contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+The runtime uses separately licensed third-party packages and LiveKit services.
+Their licenses remain applicable; review the dependency lockfile and upstream
+notices when redistributing a release. No affiliation with Google or Zoom is implied.

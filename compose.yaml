@@ -1,0 +1,83 @@
+name: meeting-platform-dev
+services:
+  postgres:
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_USER: meeting
+      POSTGRES_DB: meeting
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run node scripts/bootstrap.mjs first}
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meeting -d meeting"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+  redis:
+    image: redis:8.2.10-alpine3.22
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?Run bootstrap first}", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    restart: unless-stopped
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./runtime/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      # Signaling is loopback-only for the API running on this development host.
+      # Never copy this mapping to a public deployment.
+      - "127.0.0.1:7880:7880"
+      - "127.0.0.1:7881:7881/tcp"
+      - "127.0.0.1:7882:7882/udp"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  mailpit:
+    image: axllent/mailpit:v1.31.4
+    profiles: [mail]
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    environment:
+      MP_MAX_MESSAGES: 100
+    restart: unless-stopped
+  egress:
+    image: meeting-platform-egress:development
+    build:
+      context: .
+      dockerfile: infra/egress.Dockerfile
+      args:
+        EGRESS_UID: ${LOCAL_UID:-1000}
+        EGRESS_GID: ${LOCAL_GID:-1000}
+    profiles: [egress]
+    # Required by this pinned worker's Chrome sandbox; isolate this optional worker.
+    cap_add: [SYS_ADMIN]
+    shm_size: 1gb
+    environment:
+      EGRESS_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY}
+        api_secret: ${LIVEKIT_API_SECRET}
+        ws_url: ws://livekit:7880
+        insecure: true
+        enable_chrome_sandbox: true
+        redis:
+          address: redis:6379
+          password: ${REDIS_PASSWORD}
+        log_level: warn
+    volumes:
+      - ./runtime/recordings:/recordings
+    depends_on:
+      - livekit
+    restart: unless-stopped
+volumes:
+  postgres-data:

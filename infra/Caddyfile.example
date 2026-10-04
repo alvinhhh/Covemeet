@@ -1,0 +1,9 @@
+# Supply the real domain. Requires reviewed trusted-proxy IP handling in the app.
+meet.example.com {
+  tls {
+    protocols tls1.3
+  }
+  reverse_proxy 127.0.0.1:4100
+  # Do not enable URL access logging: paths/query strings may contain capabilities.
+  header Strict-Transport-Security "max-age=31536000"
+}

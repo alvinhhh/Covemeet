@@ -1,0 +1,28 @@
+{
+  "name": "meeting-platform",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"npm run dev -w apps/api\" \"npm run dev -w apps/web\"",
+    "build": "npm run build -w packages/recording && npm run build -w apps/api && npm run build -w apps/web",
+    "check": "npm run build -w packages/recording && npm run check --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "setup": "node scripts/bootstrap.mjs",
+    "predev": "npm run build -w packages/recording"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "concurrently": "^9.2.0",
+    "prettier": "3.6.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "Apache-2.0"
+}

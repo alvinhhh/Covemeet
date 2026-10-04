@@ -1,0 +1,113 @@
+# Single-host staging template. Complete release gates before external use.
+# Run from repository root with --env-file .env -f infra/compose.production.yaml.
+name: meeting-platform
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    env_file: ../.env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4100
+      STATIC_DIR: /app/apps/web/dist
+      SITE_ORIGIN: ${SITE_ORIGIN:?Set HTTPS public origin}
+      LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:?Set WSS gateway URL}
+      DATABASE_URL: postgresql://meeting:${POSTGRES_PASSWORD}@postgres:5432/meeting
+      LIVEKIT_URL: http://livekit:7880
+      RECORDING_DIR: /recordings
+      EGRESS_FILE_ROOT: /recordings
+      RECORDING_ENABLED: "false"
+    ports:
+      - "127.0.0.1:4100:4100"
+    volumes:
+      - encrypted-recordings:/recordings/encrypted
+      - raw-recordings:/recordings/raw
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    restart: unless-stopped
+  postgres:
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_USER: meeting
+      POSTGRES_DB: meeting
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set database secret}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meeting -d meeting"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+  redis:
+    image: redis:8.2.10-alpine3.22
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?Set Redis secret}", "--save", "", "--appendonly", "no"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ../runtime/livekit.production.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7881:7881/tcp"
+      - "7882:7882/udp"
+    # 7880 has no host mapping. The app is the sole public signaling gateway.
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  egress:
+    image: meeting-platform-egress:1.14.1-uid1000
+    build:
+      context: ..
+      dockerfile: infra/egress.Dockerfile
+      args:
+        EGRESS_UID: 1000
+        EGRESS_GID: 1000
+    profiles: [egress]
+    cap_add: [SYS_ADMIN]
+    shm_size: 1gb
+    environment:
+      EGRESS_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY}
+        api_secret: ${LIVEKIT_API_SECRET}
+        ws_url: ws://livekit:7880
+        insecure: true
+        enable_chrome_sandbox: true
+        redis:
+          address: redis:6379
+          password: ${REDIS_PASSWORD}
+        log_level: warn
+    volumes:
+      - raw-recordings:/recordings/raw
+    depends_on:
+      - livekit
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  encrypted-recordings:
+  raw-recordings:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4g,uid=1000,gid=1000,mode=0700
