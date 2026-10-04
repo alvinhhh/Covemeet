@@ -18,9 +18,10 @@ import {
   isTrackReference,
   useConnectionState,
   useLocalParticipant,
+  useRoomContext,
   useTracks,
 } from "@livekit/components-react";
-import { Track } from "livekit-client";
+import { RoomEvent, Track } from "livekit-client";
 import {
   api,
   ApiError,
@@ -35,6 +36,7 @@ import { Icon } from "./icons";
 import "./styles.css";
 import { brandLogo } from "./brand";
 import { BrandingEditor } from "./branding";
+import { selectStage } from "./stage-policy";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
 let initialHostToken = location.pathname.startsWith("/host/")
@@ -47,7 +49,7 @@ if (initialHostToken || initialDownloadToken)
   history.replaceState(null, "", location.pathname + location.search);
 
 const roomOptions = { adaptiveStream: true, dynacast: true };
-const connectionOptions = { autoSubscribe: true };
+const connectionOptions = { autoSubscribe: false };
 const BrandingContext = createContext<Branding | undefined>(undefined);
 let controlPanelOrigin = location.origin;
 
@@ -952,7 +954,11 @@ function Conference({
     <>
       <div className="stage-content">
         {credentials ? (
-          <MediaStage me={state.me} />
+          <MediaStage
+            me={state.me}
+            participants={state.participants}
+            mode={state.meeting.mode}
+          />
         ) : (
           <div className="offline-stage">
             <span className="stage-avatar">{initials(state.me.name)}</span>
@@ -1214,31 +1220,123 @@ function Conference({
   );
 }
 
-function MediaStage({ me }: { me: Participant }) {
+function MediaStage({
+  me,
+  participants,
+  mode,
+}: {
+  me: Participant;
+  participants: Participant[];
+  mode: "meeting" | "webinar";
+}) {
+  const room = useRoomContext();
+  const [page, setPage] = useState(0);
   const tracks = useTracks(
     [
       { source: Track.Source.Camera, withPlaceholder: true },
       { source: Track.Source.ScreenShare, withPlaceholder: false },
     ],
-    { onlySubscribed: true },
+    { onlySubscribed: false },
   );
   const connection = useConnectionState();
+  const selection = selectStage(
+    tracks.map((track) => ({
+      key: `${track.participant.identity}:${track.source}:${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`,
+      participantId: track.participant.identity,
+      source:
+        track.source === Track.Source.ScreenShare
+          ? ("screen_share" as const)
+          : ("camera" as const),
+      track,
+    })),
+    participants,
+    { localId: me.id, mode, breakoutId: me.breakoutId },
+    page,
+  );
+  const visible = selection.visible.map(({ track }) => track);
+  const selectedVideoIds = visible
+    .filter(isTrackReference)
+    .map((track) => track.publication.trackSid)
+    .sort()
+    .join(",");
+  const eligibleIds = [...selection.eligibleIds].sort().join(",");
+  useEffect(() => {
+    const selected = new Set(selectedVideoIds.split(","));
+    const eligible = new Set(eligibleIds.split(","));
+    const apply = () => {
+      const publications = [...room.remoteParticipants.values()].flatMap(
+        (participant) =>
+          [...participant.trackPublications.values()].map((publication) => ({
+            publication,
+            participant,
+          })),
+      );
+      const wanted = ({
+        publication,
+        participant,
+      }: (typeof publications)[number]) =>
+        eligible.has(participant.identity) &&
+        (publication.kind === Track.Kind.Audio ||
+          selected.has(publication.trackSid));
+      // Drop the previous page first, then request only the visible video page.
+      for (const entry of publications)
+        if (!wanted(entry) && entry.publication.isDesired)
+          entry.publication.setSubscribed(false);
+      for (const entry of publications)
+        if (wanted(entry) && !entry.publication.isDesired)
+          entry.publication.setSubscribed(true);
+    };
+    apply();
+    const events = [
+      RoomEvent.Connected,
+      RoomEvent.Reconnected,
+      RoomEvent.TrackPublished,
+      RoomEvent.TrackUnpublished,
+      RoomEvent.ParticipantConnected,
+      RoomEvent.ParticipantDisconnected,
+    ];
+    for (const event of events) room.on(event, apply);
+    return () => {
+      for (const event of events) room.off(event, apply);
+    };
+  }, [room, selectedVideoIds, eligibleIds]);
   return (
     <>
       <div className="connection-label">
         <span className={connection === "connected" ? "connected" : ""} />
         {connection}
+        {selection.pageCount > 1 && (
+          <nav className="video-pagination" aria-label="Video pages">
+            <button
+              disabled={selection.page === 0}
+              onClick={() => setPage(selection.page - 1)}
+              aria-label="Previous video page"
+            >
+              Previous
+            </button>
+            <span>
+              Page {selection.page + 1} of {selection.pageCount}
+            </span>
+            <button
+              disabled={selection.page + 1 >= selection.pageCount}
+              onClick={() => setPage(selection.page + 1)}
+              aria-label="Next video page"
+            >
+              Next
+            </button>
+          </nav>
+        )}
       </div>
       <div
-        className={`video-grid ${tracks.some((track) => track.source === Track.Source.ScreenShare) ? "has-screen" : ""}`}
+        className={`video-grid ${visible.some((track) => track.source === Track.Source.ScreenShare) ? "has-screen" : ""}`}
       >
-        {tracks.map((track) => (
+        {visible.map((track) => (
           <div
             className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""}`}
-            key={`${track.participant.identity}-${track.source}`}
+            key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
           >
             {isTrackReference(track) && !track.publication.isMuted ? (
-              <VideoTrack trackRef={track} />
+              <VideoTrack trackRef={track} manageSubscription={false} />
             ) : (
               <div className="tile-placeholder">
                 <span className="stage-avatar">
@@ -1260,6 +1358,13 @@ function MediaStage({ me }: { me: Participant }) {
           </div>
         ))}
       </div>
+      {visible.length === 0 && (
+        <div className="empty-stage">
+          {mode === "webinar"
+            ? "Waiting for a presenter"
+            : "Waiting for participants"}
+        </div>
+      )}
     </>
   );
 }

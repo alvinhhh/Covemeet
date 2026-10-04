@@ -1,0 +1,17 @@
+{
+  "name": "covemeet-media-validation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "validate": "node media-controls.mjs",
+    "check": "node --check media-controls.mjs"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "dependencies": {
+    "@livekit/rtc-node": "1.1.0",
+    "livekit-server-sdk": "2.19.1",
+    "ws": "8.22.0"
+  }
+}

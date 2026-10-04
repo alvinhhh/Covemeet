@@ -31,7 +31,7 @@ Transport encryption does not make meetings end-to-end encrypted from the operat
 | Phone/SIP                          | Planned.                                                                                                               | Trunk authentication, separate keypad credentials, toll-abuse limits, caller moderation, and honest PSTN encryption disclosure.                                     |
 | Retention and privacy              | Design requirements only beyond local application state.                                                               | Deletion workflow, backup expiry, audit retention, data inventory, subprocessors, incident response, rights handling, and operator procedures.                      |
 
-Local TLS and a 41-check silent real-media harness have passed against the isolated Docker installation. The [requirements ledger](requirements-ledger.md) records their scope; audio packet behavior, browser device controls, failure injection, restricted networks and load remain distinct evidence requirements. Recording provider configuration and remaining cloud/storage gates are in [recording storage](recording-storage.md).
+Local TLS and a 44-check silent real-media and recording harness have passed against the isolated Docker installation. The [requirements ledger](requirements-ledger.md) records their scope; audio packet behavior, browser device controls, failure injection, restricted networks and load remain distinct evidence requirements. Recording provider configuration and remaining cloud/storage gates are in [recording storage](recording-storage.md).
 
 ## Media gate: mandatory before external use
 

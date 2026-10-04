@@ -990,8 +990,10 @@ textarea:focus {
 }
 .connection-label {
   position: absolute;
-  top: 13px;
+  top: 8px;
   left: 25px;
+  right: 22px;
+  min-height: 24px;
   color: #80967f;
   font-size: 9px;
   text-transform: capitalize;
@@ -1007,6 +1009,41 @@ textarea:focus {
 }
 .connection-label .connected {
   background: #6d9a69;
+}
+.video-pagination {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #c3d9bb;
+  font-size: 10px;
+}
+.video-pagination button {
+  padding: 4px 8px;
+  border: 1px solid #47624d;
+  border-radius: 5px;
+  background: #24382c;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.video-pagination button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.video-pagination button:focus-visible {
+  outline: 2px solid #b6d1b1;
+  outline-offset: 2px;
+}
+.video-grid:empty {
+  display: none;
+}
+.empty-stage {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  min-height: 200px;
+  color: #adbaa9;
 }
 .meeting-panel {
   width: 336px;
