@@ -2384,3 +2384,32 @@ input[type="checkbox"] {
     grid-template-columns: 1fr 1fr;
   }
 }
+
+.brand-image.covemeet-mark {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+}
+.brand.small .covemeet-mark {
+  width: 34px;
+  height: 34px;
+}
+.meeting-header .covemeet-mark {
+  background: #f4faf7;
+  border-radius: 8px;
+  padding: 3px;
+}
+.mobile-brand {
+  display: none;
+}
+@media (max-width: 480px) {
+  .mobile-brand {
+    display: flex;
+  }
+  .mobile-brand .brand {
+    font-size: 15px;
+  }
+  .dashboard-location {
+    display: none;
+  }
+}

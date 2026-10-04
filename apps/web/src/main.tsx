@@ -33,6 +33,7 @@ import {
 } from "./api";
 import { Icon } from "./icons";
 import "./styles.css";
+import { brandLogo } from "./brand";
 import { BrandingEditor } from "./branding";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
@@ -119,6 +120,7 @@ function Field({
 }
 function Logo({ name, small = false }: { name: string; small?: boolean }) {
   const branding = useContext(BrandingContext);
+  const logo = brandLogo(branding?.brandName || name, branding?.logoUrl);
   return (
     <a
       href="/"
@@ -128,8 +130,12 @@ function Logo({ name, small = false }: { name: string; small?: boolean }) {
       }}
       className={`brand ${small ? "small" : ""}`}
     >
-      {branding?.logoUrl ? (
-        <img className="brand-image" src={branding.logoUrl} alt="" />
+      {logo ? (
+        <img
+          className={`brand-image ${!branding?.logoUrl ? "covemeet-mark" : ""}`}
+          src={logo}
+          alt=""
+        />
       ) : (
         <span className="brand-icon">
           <Icon name="video" size={21} />
@@ -144,6 +150,23 @@ function App() {
   const [path, setPath] = useState(location.pathname);
   const [config, setConfig] = useState<Config>();
   const [error, setError] = useState("");
+  useEffect(() => {
+    if (!config) return;
+    const logo = brandLogo(
+      config.branding?.brandName || config.brandName,
+      config.branding?.logoUrl,
+    );
+    const existing = document.querySelector<HTMLLinkElement>("#brand-favicon");
+    if (!logo) {
+      existing?.remove();
+      return;
+    }
+    const icon = existing || document.createElement("link");
+    icon.id = "brand-favicon";
+    icon.rel = "icon";
+    icon.href = logo;
+    if (!existing) document.head.append(icon);
+  }, [config]);
   useEffect(() => {
     if (!config?.branding) return;
     const b = config.branding;
@@ -359,7 +382,10 @@ function Home({ config }: { config: Config }) {
       </aside>
       <div className="dashboard-body">
         <header className="dashboard-header">
-          <span>Control panel</span>
+          <span className="dashboard-location">Control panel</span>
+          <div className="mobile-brand">
+            <Logo name={config.brandName} />
+          </div>
           <span className="header-tag">Browser meetings</span>
         </header>
         <main className="dashboard-main">

@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { api, messageOf, type Branding, type Config } from "./api";
 import { Icon } from "./icons";
+import { brandLogo } from "./brand";
 
 const defaultBranding: Branding = {
   brandName: "Covemeet",
@@ -384,8 +385,8 @@ export function BrandingEditor({
             }}
           >
             <div className="preview-brand">
-              {draft.logoUrl ? (
-                <img src={draft.logoUrl} alt="" />
+              {brandLogo(draft.brandName, draft.logoUrl) ? (
+                <img src={brandLogo(draft.brandName, draft.logoUrl)} alt="" />
               ) : (
                 <span style={{ color: draft.accentColor }}>
                   <Icon name="video" size={24} />
