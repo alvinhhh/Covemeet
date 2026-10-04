@@ -1,0 +1,177 @@
+# Isolated local installation. Use scripts/local.mjs; never expose these bindings to a LAN.
+name: covemeet-local-tls
+services:
+  edge:
+    image: covemeet-caddy:2.11.7-local
+    build:
+      context: ..
+      dockerfile: infra/caddy-local.Dockerfile
+    environment:
+      PORTAL_UPSTREAM: ${PORTAL_UPSTREAM:-core:4100}
+    volumes:
+      - ./Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - local-caddy-data:/data
+      - local-caddy-config:/config
+    ports:
+      - "127.0.0.1:8443:8443/tcp"
+    networks:
+      default:
+        aliases: [meet.localhost, portal.localhost]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+  core:
+    image: covemeet-core:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: development
+      EDITION: ${LOCAL_EDITION:-self-hosted}
+      HOST: 0.0.0.0
+      PORT: 4100
+      STATIC_DIR: /app/apps/web/dist
+      SITE_ORIGIN: https://meet.localhost:8443
+      PORTAL_ORIGIN: https://portal.localhost:8443
+      TRUST_PROXY: ${CADDY_TRUSTED_IP:-}
+      DATABASE_URL: postgresql://meeting:${POSTGRES_PASSWORD}@postgres:5432/meeting
+      SESSION_SECRET: ${SESSION_SECRET:?Run local setup}
+      CREATION_KEY: ${CREATION_KEY:?Run local setup}
+      LIVEKIT_URL: http://livekit:7880
+      LIVEKIT_PUBLIC_URL: wss://meet.localhost:8443
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Run local setup}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Run local setup}
+      RECORDING_ENABLED: ${LOCAL_RECORDING_ENABLED:-false}
+      RECORDING_KEK: ${RECORDING_KEK:?Run local setup}
+      RECORDING_DIR: /recordings
+      EGRESS_FILE_ROOT: /recordings
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_FROM: meetings@covemeet.localhost
+      SMTP_SECURE: "false"
+      BRAND_NAME: Covemeet
+    volumes:
+      - local-encrypted-recordings:/recordings/encrypted
+      - local-raw-recordings:/recordings/raw
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:4100/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  postgres:
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_USER: meeting
+      POSTGRES_DB: meeting
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run local setup}
+    volumes:
+      - local-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U meeting -d meeting]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  redis:
+    image: redis:8.2.10-alpine3.22
+    command:
+      [
+        redis-server,
+        --requirepass,
+        "${REDIS_PASSWORD:?Run local setup}",
+        --save,
+        "",
+        --appendonly,
+        "no",
+      ]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    healthcheck:
+      test:
+        [
+          CMD-SHELL,
+          "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    command: [--config, /etc/livekit.yaml]
+    volumes:
+      - ../runtime/local-tls/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "127.0.0.1:17881:17881/tcp"
+      - "127.0.0.1:17882:17882/udp"
+    # Raw signaling/API 7880 is never published, including on localhost.
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+  mailpit:
+    image: axllent/mailpit:v1.31.4
+    environment:
+      MP_MAX_MESSAGES: 100
+    ports:
+      - "127.0.0.1:18025:8025/tcp"
+    restart: unless-stopped
+  egress:
+    image: covemeet-egress:local
+    build:
+      context: ..
+      dockerfile: infra/egress.Dockerfile
+      args:
+        EGRESS_UID: 1000
+        EGRESS_GID: 1000
+    profiles: [recording]
+    cap_add: [SYS_ADMIN]
+    shm_size: 1gb
+    environment:
+      EGRESS_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY}
+        api_secret: ${LIVEKIT_API_SECRET}
+        ws_url: ws://livekit:7880
+        insecure: true
+        enable_chrome_sandbox: true
+        redis:
+          address: redis:6379
+          password: ${REDIS_PASSWORD}
+        log_level: warn
+    volumes:
+      - local-raw-recordings:/recordings/raw
+    depends_on: [livekit]
+    restart: unless-stopped
+networks:
+  default:
+    name: covemeet-local-tls
+volumes:
+  local-caddy-data:
+  local-caddy-config:
+  local-postgres-data:
+  local-encrypted-recordings:
+  local-raw-recordings:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=4g,uid=1000,gid=1000,mode=0700

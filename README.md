@@ -4,7 +4,11 @@ Browser meeting software with guest access, host moderation, and an independentl
 
 This is milestone one. It is for local evaluation and controlled development. The 100-participant meeting and 1,000-viewer webinar numbers are design targets, not demonstrated capacity. Phone/SIP, end-to-end encrypted rooms, billing, and audited operational controls are not part of this release.
 
-## Local setup
+## Local HTTPS installation
+
+Run `node scripts/local.mjs start` for separate `https://portal.localhost:8443` and `https://meet.localhost:8443` origins, private raw signaling, and isolated local data. The [HTTPS workflow](docs/local-https.md) explains explicit browser certificate trust, optional hosted portal and recording, health checks, and stopping without deleting data. No command silently installs certificate trust.
+
+## Development setup
 
 Requirements: Node.js 22.12 or later, npm, and Docker Compose. Node 24 is used in the container build.
 
@@ -28,7 +32,7 @@ Create a meeting, keep the host page open, and use a separate browser profile to
 - Breakout rooms with room-scoped chat, return-to-main controls, and host announcements.
 - Hosted random meeting codes; custom codes only in the self-hosted edition.
 - LiveKit media behind the application signaling gateway; raw media-server access is private outside development.
-- Optional recording integration with encrypted files, operator-supplied recording key, verified host email, revocable 24-hour download links, and separate email passwords.
+- Optional encrypted recordings, operator keyring/KMS adapters, private ciphertext object-storage adapter, verified host email, revocable 24-hour download links, and separate email passwords. Real provider configuration remains a deployment gate.
 - Operator-controlled branding, uploaded logo/background images, and configurable landing-page settings.
 
 Recordings are disabled by default. Start the optional Egress profile and complete the recording checks in [deployment.md](docs/deployment.md) before enabling them. An IP/device ban cannot identify the same person after they change networks or clear browser data. Downloaded MP4 files are plaintext on the receiving device.
@@ -42,7 +46,7 @@ npm run build
 docker compose config --quiet
 ```
 
-Unit and API tests do not establish WebRTC interoperability, resilience, or capacity. The evidence and remaining gates are tracked in [security-controls.md](docs/security-controls.md).
+Unit and API tests do not establish WebRTC interoperability, resilience, or capacity. The silent real-media harness in `scripts/validation` tests selected deployed controls. The evidence and remaining gates are tracked in [security-controls.md](docs/security-controls.md) and the [requirements ledger](docs/requirements-ledger.md).
 
 ## Deployment and scope
 

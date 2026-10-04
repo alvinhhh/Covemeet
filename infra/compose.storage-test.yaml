@@ -1,0 +1,24 @@
+# Disposable synthetic-byte storage compatibility test. No real meeting data.
+name: covemeet-storage-test
+services:
+  storage:
+    image: covemeet-storage-test:2025-10-15
+    build:
+      context: ..
+      dockerfile: infra/minio-test.Dockerfile
+    environment:
+      MINIO_ROOT_USER: ${TEST_S3_ACCESS_KEY:?Generate private test credentials}
+      MINIO_ROOT_PASSWORD: ${TEST_S3_SECRET_KEY:?Generate private test credentials}
+      MINIO_REGION_NAME: us-east-1
+      MINIO_BROWSER: "off"
+      MINIO_UPDATE: "off"
+    ports:
+      - "127.0.0.1:19000:9000"
+    read_only: true
+    tmpfs:
+      - /data:rw,nosuid,noexec,size=256m,uid=65532,gid=65532,mode=0700
+      - /tmp:rw,nosuid,noexec,size=16m,uid=65532,gid=65532,mode=0700
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+networks:
+  default: {}

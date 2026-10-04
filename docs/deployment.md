@@ -1,5 +1,7 @@
 # Deployment
 
+For an isolated local installation with separate HTTPS portal/meeting origins and private raw signaling, use [the local HTTPS workflow](local-https.md). Its own Compose project can run beside the development setup below. Track outstanding production work in [the requirements ledger](requirements-ledger.md).
+
 ## Local development
 
 The default Compose file runs PostgreSQL, Redis, and LiveKit. The API and browser application run on the development host. All published ports bind to `127.0.0.1`. Redis has no published port. LiveKit port 7880 is exposed only to the local host because the API needs to reach it.
@@ -30,7 +32,7 @@ Do not change the dev bindings to `0.0.0.0` to invite remote users. The local ra
 | `EGRESS_FILE_ROOT`                       | Same directory as Egress sees it; `/recordings` in Compose.                                                        |
 | `SMTP_*`                                 | Test capture or real SMTP provider configuration.                                                                  |
 
-The script uses atomic exclusive creation for `.env`, generates secrets with the operating system random generator, and gives runtime directories mode `0700` and secret files mode `0600`. It never prints credentials. Existing `.env` values are preserved. Keep an encrypted backup of the recording key separately from database and recording backups; losing it makes existing recordings unrecoverable. The current local key provider does not implement automated key rotation or a managed KMS integration.
+The script uses atomic exclusive creation for `.env`, generates secrets with the operating system random generator, and gives runtime directories mode `0700` and secret files mode `0600`. It never prints credentials. Existing `.env` values are preserved. Keep an encrypted backup of the recording key separately from database and recording backups; losing it makes existing recordings unrecoverable. The recording package now includes a local keyring, AWS KMS adapter, operator-driven metadata rewrap and private S3-compatible ciphertext storage. See [recording storage configuration and limitations](recording-storage.md); real cloud IAM/KMS behavior and key-loss/restore drills remain separate deployment gates.
 
 ## Recording development
 

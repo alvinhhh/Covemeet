@@ -1,0 +1,48 @@
+# Optional private portal overlay. The core remains independently runnable without it.
+services:
+  edge:
+    environment:
+      PORTAL_UPSTREAM: portal:4200
+  core:
+    environment:
+      EDITION: hosted
+  portal:
+    image: covemeet-hosted:local
+    build:
+      context: ${HOSTED_SOURCE_DIR:?Set the private hosted repository path}
+      dockerfile: Dockerfile
+      target: hosted-runtime
+    environment:
+      NODE_ENV: development
+      HOST: 0.0.0.0
+      PORT: 4200
+      STATIC_DIR: /app/apps/web/dist
+      SITE_ORIGIN: https://portal.localhost:8443
+      CORE_PUBLIC_URL: https://meet.localhost:8443
+      CORE_BASE_URL: https://meet.localhost:8443
+      NODE_EXTRA_CA_CERTS: /local-trust/root.crt
+      CORE_CREATION_KEY: ${CREATION_KEY:?Run local setup}
+      HOSTED_ADMIN_KEY: ${HOSTED_ADMIN_KEY:?Run local setup}
+      SESSION_SECRET: ${HOSTED_SESSION_SECRET:?Run local setup}
+    volumes:
+      - ../runtime/local-tls/trust:/local-trust:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:4200/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
