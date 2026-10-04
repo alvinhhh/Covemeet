@@ -1,0 +1,25 @@
+api_key: __LIVEKIT_API_KEY__
+api_secret: __LIVEKIT_API_SECRET__
+ws_url: ws://livekit:7880
+redis:
+  address: sip-redis:6379
+sip_port: 5060
+sip_port_listen: 5060
+sip_hostname: sip
+listen_ip: 0.0.0.0
+use_external_ip: false
+rtp_port: 13000-13100
+tls:
+  port: 5061
+  port_listen: 5061
+  min_version: tls1.2
+  certs:
+    - cert_file: /certs/sip.crt
+      key_file: /certs/sip.key
+# No in-band DTMF regeneration; initial PIN collection belongs to the IVR.
+audio_dtmf: false
+logging:
+  level: error
+max_active_calls: 20
+media_timeout: 30s
+media_timeout_initial: 30s

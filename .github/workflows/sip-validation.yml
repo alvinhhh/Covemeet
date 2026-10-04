@@ -1,0 +1,44 @@
+name: Native SIP validation
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/sip-validation.yml
+      - apps/phone/**
+      - scripts/sip-test.mjs
+      - scripts/validation/sip-*
+      - scripts/validation/rtc-fixture.mjs
+      - infra/asterisk.Dockerfile
+      - infra/asterisk/**
+      - infra/compose.sip-test.yaml
+      - infra/sip*.Dockerfile
+      - infra/sip/**
+      - package.json
+      - package-lock.json
+permissions:
+  contents: read
+jobs:
+  native-sip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: SIP controller helper tests
+        run: node --test scripts/validation/sip-client.test.mjs
+      - name: Isolated native SIP validation
+        run: npm run test:sip
+      - name: Native SIP validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-sip-validation
+          path: test-results/sip/*.json
+          if-no-files-found: ignore

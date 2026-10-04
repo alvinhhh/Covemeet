@@ -1,0 +1,173 @@
+# Disposable native-SIP validation only. No carrier, host ports, or audio devices.
+name: covemeet-sip-test
+services:
+  fixture-init:
+    image: covemeet-asterisk:local
+    user: "0:0"
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        chown -R 0:0 /asterisk-config /sip-config /certs /client-secret
+        cp /input/asterisk/* /asterisk-config/
+        cp /input/sip.yaml /sip-config/config.yaml
+        cp /input/certs/ca.crt /input/certs/bad-ca.crt /input/certs/asterisk.crt /input/certs/asterisk.key /input/certs/sip.crt /input/certs/sip.key /certs/
+        cp /input/client-password /client-secret/password
+        chmod 755 /asterisk-config /sip-config /certs /client-secret
+        chmod 600 /asterisk-config/* /sip-config/config.yaml /certs/*.key /client-secret/password
+        chmod 644 /certs/*.crt
+        chown -R 10001:10001 /asterisk-config
+        chown 10001:10001 /certs/asterisk.key
+        chown ${SIP_TEST_UID:?}:${SIP_TEST_GID:?} /client-secret/password
+    volumes:
+      - ../runtime/sip-test:/input:ro
+      - asterisk-config:/asterisk-config
+      - sip-config:/sip-config
+      - fixture-certs:/certs
+      - client-secret:/client-secret
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+
+  sip-postgres:
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_USER: sip
+      POSTGRES_DB: covemeet_sip_test
+      POSTGRES_PASSWORD: ${SIP_TEST_DB_PASSWORD:?Use scripts/sip-test.mjs}
+    tmpfs: [/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U sip -d covemeet_sip_test]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  sip-redis:
+    image: redis:8.2.10-alpine3.22
+    command:
+      [redis-server, --save, "", --appendonly, "no", --protected-mode, "no"]
+    read_only: true
+    tmpfs: [/data]
+    cap_drop: [ALL]
+    user: "999:999"
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  livekit:
+    image: livekit/livekit-server:v1.13.7
+    command: [--config, /etc/livekit.yaml]
+    volumes:
+      - ../runtime/sip-test/livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      sip-redis:
+        condition: service_healthy
+
+  asterisk:
+    image: covemeet-asterisk:local
+    build:
+      context: ..
+      dockerfile: infra/asterisk.Dockerfile
+    volumes:
+      - asterisk-config:/etc/asterisk:ro
+      - fixture-certs:/certs:ro
+    read_only: true
+    tmpfs:
+      - /var/run/asterisk:uid=10001,gid=10001,mode=0700
+      - /var/log/asterisk:uid=10001,gid=10001,mode=0700
+      - /var/spool/asterisk:uid=10001,gid=10001,mode=0700
+      - /var/lib/asterisk/db:uid=10001,gid=10001,mode=0700
+      - /tmp:uid=10001,gid=10001,mode=0700
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      fixture-init:
+        condition: service_completed_successfully
+    networks:
+      default:
+        ipv4_address: ${SIP_TEST_PBX_IP:?}
+        aliases: [asterisk-wrong-name]
+    healthcheck:
+      test: [CMD, /usr/sbin/asterisk, -rx, core waitfullybooted]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  sip:
+    image: covemeet-sip:local
+    build:
+      context: ..
+      dockerfile: infra/sip.Dockerfile
+    volumes:
+      - sip-config:/sip:ro
+      - fixture-certs:/certs:ro
+    read_only: true
+    tmpfs: [/run, /tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, SETPCAP]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      fixture-init:
+        condition: service_completed_successfully
+      sip-redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+
+  sip-runner:
+    image: covemeet-sip-validation:local
+    build:
+      context: ..
+      dockerfile: infra/sip-validation.Dockerfile
+    environment:
+      NODE_ENV: development
+      SIP_TEST_DATABASE_URL: postgresql://sip:${SIP_TEST_DB_PASSWORD}@sip-postgres:5432/covemeet_sip_test
+      LIVEKIT_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${SIP_TEST_LIVEKIT_KEY}
+      LIVEKIT_API_SECRET: ${SIP_TEST_LIVEKIT_SECRET}
+      SIP_ARI_URL: http://asterisk:8088
+      SIP_ARI_PASSWORD: ${SIP_TEST_ARI_PASSWORD}
+      SIP_TRUNK_PASSWORD: ${SIP_TEST_TRUNK_PASSWORD}
+      SIP_PBX_IP: ${SIP_TEST_PBX_IP}
+      SIP_PASSWORD_FILE: /client-secret/password
+      SIP_CA_FILE: /certs/ca.crt
+      SIP_BAD_CA_FILE: /certs/bad-ca.crt
+      SIP_VALIDATION_REPORT: /results/sip-media.json
+      RUST_LOG: error
+    volumes:
+      - fixture-certs:/certs:ro
+      - client-secret:/client-secret:ro
+      - ../test-results/sip:/results
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    user: "${SIP_TEST_UID:?}:${SIP_TEST_GID:?}"
+    depends_on:
+      fixture-init:
+        condition: service_completed_successfully
+      sip-postgres:
+        condition: service_healthy
+      asterisk:
+        condition: service_healthy
+      sip:
+        condition: service_started
+    networks:
+      default:
+        aliases: [core]
+
+volumes:
+  asterisk-config:
+  sip-config:
+  fixture-certs:
+  client-secret:
+networks:
+  default:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${SIP_TEST_SUBNET:?}

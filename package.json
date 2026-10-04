@@ -15,7 +15,8 @@
     "check": "npm run build -w packages/recording && npm run check --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "setup": "node scripts/bootstrap.mjs",
-    "predev": "npm run build -w packages/recording"
+    "predev": "npm run build -w packages/recording",
+    "test:sip": "node scripts/sip-test.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
