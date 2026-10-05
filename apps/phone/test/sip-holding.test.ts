@@ -701,6 +701,23 @@ test("native removal rejection can finish only after observing an empty room", a
   );
 });
 
+test("holding closure waits for acknowledged native removal to become visible", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  const remove = f.service.removeParticipant;
+  const list = f.service.listParticipants;
+  let removed = false;
+  let staleReads = 2;
+  f.service.removeParticipant = async (name, identity) => {
+    await remove(name, identity);
+    removed = true;
+  };
+  f.service.listParticipants = async (name) =>
+    removed && staleReads-- > 0 ? [f.native] : list(name);
+  await f.holding.close();
+  assert.equal(staleReads, -1);
+});
+
 test("native removal rejection cannot finish while the peer remains", async () => {
   const f = fixture();
   await f.holding.open(() => {});

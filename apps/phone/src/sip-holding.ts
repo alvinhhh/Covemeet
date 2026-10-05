@@ -352,6 +352,7 @@ export class SipHolding implements SupervisedMedia {
             if (absent(error)) return [];
             throw error;
           });
+        let removalAttempted = false;
         for (const peer of peers) {
           if (
             !this.outboundOwned ||
@@ -361,6 +362,7 @@ export class SipHolding implements SupervisedMedia {
             peer.attributes["sip.ruleID"] !== this.config.sipRuleId
           )
             continue;
+          removalAttempted = true;
           try {
             await this.rooms.removeParticipant(room.name, peer.identity);
           } catch {
@@ -369,13 +371,17 @@ export class SipHolding implements SupervisedMedia {
             // Uncertain allocation or failed RTC/PBX cleanup still rejects.
           }
         }
-        const remaining = await this.rooms
-          .listParticipants(room.name)
-          .catch((error) => {
-            if (absent(error)) return [];
-            throw error;
-          });
-        if (remaining.length)
+        if (
+          !(await this.absentAfterTeardown(async () => {
+            const remaining = await this.rooms
+              .listParticipants(room.name)
+              .catch((error) => {
+                if (absent(error)) return [];
+                throw error;
+              });
+            return remaining.length ? remaining : undefined;
+          }, removalAttempted))
+        )
           throw new Error("SIP holding participant remains");
       }
       if (
