@@ -4,6 +4,9 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import {
   access,
+  chmod,
+  readdir,
+  symlink,
   mkdir,
   mkdtemp,
   readFile,
@@ -24,9 +27,10 @@ import {
   type RecordingContext,
   type KeyProvider,
 } from "@meeting-platform/recording";
+import { EgressInfo, EgressStatus } from "livekit-server-sdk";
 import { loadConfig } from "../src/config.js";
 import { createApp } from "../src/server.js";
-import { RecordingService } from "../src/recordings.js";
+import { RecordingService, type RecorderClient } from "../src/recordings.js";
 import { MemoryStore, type Meeting, type Recording } from "../src/store.js";
 import { digest, HttpError } from "../src/security.js";
 import type { Media } from "../src/media.js";
@@ -411,7 +415,7 @@ test("one expired recording failure does not block the next row", async (t) => {
   };
   await f.service.reconcile((await f.store.get(f.meeting.code))!);
   const [failed, completed] = (await f.store.get(f.meeting.code))!.recordings;
-  assert.equal(failed!.status, "ready");
+  assert.equal(failed!.status, "deleting");
   assert.equal(completed!.status, "deleted");
 });
 
@@ -784,4 +788,236 @@ test("recording configuration rejects invalid keyrings and production HTTP objec
     () => new RecordingService(config, new MemoryStore(), {} as Transporter),
     /HTTPS/,
   );
+});
+
+function completedRecorder(): RecorderClient {
+  return {
+    listEgress: async () => [
+      new EgressInfo({
+        egressId: "test-egress-id",
+        status: EgressStatus.EGRESS_COMPLETE,
+      }),
+    ],
+  } as unknown as RecorderClient;
+}
+
+test("concurrent and stale reconciliations preserve the committed encryption attempt", async (t) => {
+  const f = await fixture(t, "recording");
+  await f.store.change(f.meeting.code, (m) => {
+    delete m.recordings[0]!.metadata;
+  });
+  const originalCiphertext = await readFile(f.encrypted);
+  const provider = new LocalKeyProvider({
+    keyId: "operator-kek-v1",
+    key: Buffer.from(f.config.recordingKek, "base64"),
+  });
+  t.after(() => provider.destroy());
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let wraps = 0;
+  const owner = new RecordingService(
+    f.config,
+    f.store,
+    f.mail,
+    completedRecorder(),
+    {
+      keyProvider: {
+        wrapKey: async (...args) => {
+          wraps++;
+          entered();
+          await blocked;
+          return provider.wrapKey(...args);
+        },
+        unwrapKey: (...args) => provider.unwrapKey(...args),
+      },
+    },
+  );
+  const other = new RecordingService(
+    f.config,
+    f.store,
+    f.mail,
+    completedRecorder(),
+  );
+  const stale = (await f.store.get(f.meeting.code))!;
+  const first = owner.reconcile(stale);
+  await pending;
+  await other.reconcile(stale);
+  await access(f.raw);
+  release();
+  await first;
+  const committed = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(committed.status, "ready");
+  assert.ok(committed.ciphertextId);
+  const ciphertext = path.join(
+    f.config.recordingDir,
+    "encrypted",
+    `${committed.id}.${committed.ciphertextId}.mprec`,
+  );
+  const committedBytes = await readFile(ciphertext);
+  await other.reconcile(stale);
+  assert.equal(wraps, 1);
+  assert.deepEqual(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.metadata,
+    committed.metadata,
+  );
+  assert.deepEqual(await readFile(ciphertext), committedBytes);
+  assert.deepEqual(
+    await readFile(f.encrypted),
+    originalCiphertext,
+    "An uncertain old output must never be overwritten or deleted",
+  );
+  assert.deepEqual(await collectFromService(other, f), f.plaintext);
+});
+
+test("a lost encryption commit acknowledgement preserves its committed immutable output", async (t) => {
+  const f = await fixture(t, "recording");
+  await f.store.change(f.meeting.code, (m) => {
+    delete m.recordings[0]!.metadata;
+  });
+  const change = f.store.change.bind(f.store);
+  let loseCommit = true;
+  f.store.change = async (...args) => {
+    const result = await change(...args);
+    if (loseCommit) {
+      loseCommit = false;
+      throw new Error("Commit acknowledgement lost");
+    }
+    return result;
+  };
+  const service = new RecordingService(
+    f.config,
+    f.store,
+    f.mail,
+    completedRecorder(),
+  );
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  const committed = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(committed.status, "encrypting");
+  const ciphertext = path.join(
+    f.config.recordingDir,
+    "encrypted",
+    `${committed.id}.${committed.ciphertextId}.mprec`,
+  );
+  const before = await readFile(ciphertext);
+  await access(f.raw);
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  assert.deepEqual(await readFile(ciphertext), before);
+  assert.deepEqual(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.metadata,
+    committed.metadata,
+  );
+  assert.deepEqual(await collectFromService(service, f), f.plaintext);
+});
+
+test("recovery preserves plaintext when committed ciphertext is missing or damaged", async (t) => {
+  const f = await fixture(t, "encrypting");
+  const ciphertext = await readFile(f.encrypted);
+  await unlink(f.encrypted);
+  await f.service.reconcile((await f.store.get(f.meeting.code))!);
+  await access(f.raw);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.status,
+    "encrypting",
+  );
+  ciphertext[ciphertext.length - 1] ^= 1;
+  await writeFile(f.encrypted, ciphertext);
+  await f.service.reconcile((await f.store.get(f.meeting.code))!);
+  await access(f.raw);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.status,
+    "encrypting",
+  );
+});
+
+test("retention is exclusive and denies new links before storage deletion completes", async (t) => {
+  const f = await fixture(t, "encrypting");
+  const storage = new TestObjectStorage();
+  const first = new RecordingService(
+    { ...f.config, recordingStorage: "s3" },
+    f.store,
+    f.mail,
+    undefined,
+    { objectStorage: storage },
+  );
+  const second = new RecordingService(
+    { ...f.config, recordingStorage: "s3" },
+    f.store,
+    f.mail,
+    undefined,
+    { objectStorage: storage },
+  );
+  await first.reconcile((await f.store.get(f.meeting.code))!);
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordings[0]!.createdAt = Date.now() - 8 * day;
+  });
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const remove = storage.delete.bind(storage);
+  let deletions = 0;
+  storage.delete = async (...args) => {
+    deletions++;
+    entered();
+    await blocked;
+    await remove(...args);
+  };
+  const stale = (await f.store.get(f.meeting.code))!;
+  const deleting = first.reconcile(stale);
+  await pending;
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.status,
+    "deleting",
+  );
+  await second.reconcile(stale);
+  await assert.rejects(
+    second.link(f.meeting, f.recording.id),
+    (error: any) => error.status === 409,
+  );
+  await assert.rejects(
+    second.rotateKey(f.meeting, f.recording.id),
+    (error: any) => error.status === 409,
+  );
+  release();
+  await deleting;
+  await second.reconcile(stale);
+  assert.equal(deletions, 1);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.status,
+    "deleted",
+  );
+});
+
+test("recording refuses public or redirected spool directories and over-limit sources", async (t) => {
+  const f = await fixture(t, "recording");
+  await f.store.change(f.meeting.code, (m) => {
+    delete m.recordings[0]!.metadata;
+  });
+  const service = new RecordingService(
+    { ...f.config, recordingMaxBytes: 93 },
+    f.store,
+    f.mail,
+    completedRecorder(),
+  );
+  await service.reconcile((await f.store.get(f.meeting.code))!);
+  await access(f.raw);
+  assert.equal((await readdir(path.dirname(f.encrypted))).length, 1);
+  await chmod(path.dirname(f.raw), 0o755);
+  await assert.rejects(service.start(f.meeting), /private directories/);
+  await chmod(path.dirname(f.raw), 0o700);
+  const redirected = path.join(f.config.recordingDir, "redirected");
+  await mkdir(redirected, { mode: 0o700 });
+  await rm(path.dirname(f.raw), { recursive: true });
+  await symlink(redirected, path.dirname(f.raw));
+  await assert.rejects(service.start(f.meeting), /private directories/);
 });

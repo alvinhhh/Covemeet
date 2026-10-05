@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { Transporter } from "nodemailer";
 import {
@@ -25,7 +25,7 @@ import {
   verifyRecordingPassword,
 } from "@meeting-platform/recording";
 import type { Config } from "./config.js";
-import type { Meeting, Recording, Store } from "./store.js";
+import type { Meeting, Recording, RecordingLock, Store } from "./store.js";
 import { activePhone } from "./phone.js";
 import { HttpError, safeEqual } from "./security.js";
 
@@ -39,7 +39,6 @@ export class RecordingService {
   private provider?: KeyProvider;
   private objectStorage?: RecordingObjectStorage;
   private client: RecorderClient;
-  private working = new Set<string>();
   constructor(
     private config: Config,
     private store: Store,
@@ -140,21 +139,28 @@ export class RecordingService {
   }
   private file(r: Recording, raw = false) {
     if (!/^[a-f0-9-]{36}$/.test(r.id)) throw new Error("Invalid recording ID");
+    if (!raw && r.ciphertextId && !/^[a-f0-9-]{36}$/.test(r.ciphertextId))
+      throw new Error("Invalid ciphertext ID");
     return path.join(
       this.config.recordingDir,
       raw ? "raw" : "encrypted",
-      `${r.id}.${raw ? "mp4" : "mprec"}`,
+      `${r.id}${!raw && r.ciphertextId ? `.${r.ciphertextId}` : ""}.${raw ? "mp4" : "mprec"}`,
     );
   }
   private async directories() {
-    await mkdir(path.join(this.config.recordingDir, "raw"), {
-      recursive: true,
-      mode: 0o700,
-    });
-    await mkdir(path.join(this.config.recordingDir, "encrypted"), {
-      recursive: true,
-      mode: 0o700,
-    });
+    for (const directory of [
+      this.config.recordingDir,
+      ...["raw", "encrypted"].map((name) =>
+        path.join(this.config.recordingDir, name),
+      ),
+    ]) {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const info = await lstat(directory);
+      if (!info.isDirectory() || (info.mode & 0o077) !== 0)
+        throw new Error(
+          "Recording directories must be private directories, not symlinks",
+        );
+    }
   }
   private async removeFile(file: string) {
     try {
@@ -163,11 +169,13 @@ export class RecordingService {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
-  private async finishEncryption(m: Meeting, r: Recording) {
+  private async finishEncryption(
+    m: Meeting,
+    r: Recording,
+    lock: RecordingLock,
+  ) {
     // Reload committed metadata; the caller may still hold the pre-encryption snapshot.
-    let row = (await this.store.get(m.code))?.recordings.find(
-      (entry) => entry.id === r.id,
-    );
+    let row = (await lock.get())?.recordings.find((entry) => entry.id === r.id);
     if (!row?.metadata || row.status !== "encrypting")
       throw new Error("Recording encryption state changed");
     if (this.objectStorage && !row.metadata.storage) {
@@ -178,7 +186,7 @@ export class RecordingService {
         this.context(m, row),
         this.provider!,
       );
-      await this.store.change(m.code, (state) => {
+      await lock.change((state) => {
         const current = state.recordings.find((entry) => entry.id === r.id)!;
         if (
           current.status !== "encrypting" ||
@@ -188,19 +196,23 @@ export class RecordingService {
         }
         current.metadata.storage = reference;
       });
-      row = (await this.store.get(m.code))!.recordings.find(
-        (entry) => entry.id === r.id,
-      )!;
+      row = (await lock.get())!.recordings.find((entry) => entry.id === r.id)!;
     }
-    // Do not remove either recovery file until object upload and its reference are committed.
-    await this.removeFile(this.file(r, true));
-    if (row.metadata.storage) await this.removeFile(this.file(r));
-    await this.store.change(m.code, (state) => {
+    // Verify the committed recovery copy before deleting plaintext, including after restart.
+    for await (const plaintext of await this.openEncrypted(m, row))
+      (plaintext as Buffer).fill(0);
+    await lock.check();
+    await this.removeFile(this.file(row, true));
+    if (row.metadata.storage) {
+      await lock.check();
+      await this.removeFile(this.file(row));
+    }
+    await lock.change((state) => {
       const current = state.recordings.find((entry) => entry.id === r.id)!;
       if (current.status === "encrypting" && current.metadata)
         current.status = "ready";
     });
-    await this.store.audit(m.code, "recorder", "recording.encrypted", r.id);
+    await lock.audit("recorder", "recording.encrypted", r.id);
   }
   private async openEncrypted(m: Meeting, r: Recording, metadata = r.metadata) {
     if (!this.provider)
@@ -231,39 +243,46 @@ export class RecordingService {
   async rotateKey(m: Meeting, id: string): Promise<void> {
     if (!this.provider)
       throw new HttpError(503, "Recording keys are not configured");
-    const snapshot = (await this.store.get(m.code))?.recordings.find(
-      (entry) => entry.id === id,
-    );
-    if (!snapshot || snapshot.status !== "ready" || !snapshot.metadata)
-      throw new HttpError(409, "Recording is not ready");
-    const previous = structuredClone(snapshot.metadata);
-    const rotated = await rotateRecordingKey(
-      previous as EncryptedRecordingMetadata,
-      this.context(m, snapshot),
-      this.provider,
-      this.provider,
-    );
-    for await (const plaintext of await this.openEncrypted(
-      m,
-      snapshot,
-      rotated,
-    ))
-      (plaintext as Buffer).fill(0);
-    await this.store.change(m.code, (state) => {
-      const row = state.recordings.find((entry) => entry.id === id);
-      if (
-        !row ||
-        row.status !== "ready" ||
-        JSON.stringify(row.metadata) !== JSON.stringify(previous)
-      ) {
-        throw new HttpError(
-          409,
-          "Recording changed during key rotation; retry",
+    const result = await this.store.withRecordingLock(
+      m.code,
+      id,
+      async (lock) => {
+        const snapshot = (await lock.get())?.recordings.find(
+          (entry) => entry.id === id,
         );
-      }
-      row.metadata = rotated;
-    });
-    await this.store.audit(m.code, "operator", "recording.key.rotate", id);
+        if (!snapshot || snapshot.status !== "ready" || !snapshot.metadata)
+          throw new HttpError(409, "Recording is not ready");
+        const previous = structuredClone(snapshot.metadata);
+        const rotated = await rotateRecordingKey(
+          previous as EncryptedRecordingMetadata,
+          this.context(m, snapshot),
+          this.provider!,
+          this.provider!,
+        );
+        for await (const plaintext of await this.openEncrypted(
+          m,
+          snapshot,
+          rotated,
+        ))
+          (plaintext as Buffer).fill(0);
+        await lock.change((state) => {
+          const row = state.recordings.find((entry) => entry.id === id);
+          if (
+            !row ||
+            row.status !== "ready" ||
+            JSON.stringify(row.metadata) !== JSON.stringify(previous)
+          ) {
+            throw new HttpError(
+              409,
+              "Recording changed during key rotation; retry",
+            );
+          }
+          row.metadata = rotated;
+        });
+        await lock.audit("operator", "recording.key.rotate", id);
+      },
+    );
+    if (!result.acquired) throw new HttpError(409, "Recording is busy; retry");
   }
   private belongsToRecording(info: EgressInfo, m: Meeting, r: Recording) {
     if (info.roomName !== m.room) return false;
@@ -291,7 +310,11 @@ export class RecordingService {
       (output) => output.filename === expected || output.location === expected,
     );
   }
-  private async recoverUntracked(m: Meeting, r: Recording) {
+  private async recoverUntracked(
+    m: Meeting,
+    r: Recording,
+    lock: RecordingLock,
+  ) {
     const matches = (await this.client.listEgress({ roomName: m.room })).filter(
       (info) => this.belongsToRecording(info, m, r),
     );
@@ -305,6 +328,7 @@ export class RecordingService {
           EgressStatus.EGRESS_ENDING,
         ].includes(info.status)
       ) {
+        await lock.check();
         await this.client.stopEgress(info.egressId);
       }
     }
@@ -313,7 +337,7 @@ export class RecordingService {
       throw new Error("Multiple recorder jobs require operator review");
     }
     const info = matches[0]!;
-    await this.store.change(m.code, (state) => {
+    await lock.change((state) => {
       const row = state.recordings.find((recording) => recording.id === r.id)!;
       row.egressId = info.egressId;
       row.status = "stopping";
@@ -330,84 +354,92 @@ export class RecordingService {
       status: "starting",
       createdAt: Date.now(),
     };
-    await this.store.change(meeting.code, (m) => {
-      if (m.participants.some(activePhone))
-        throw new HttpError(
-          409,
-          "Recording is unavailable while phone calls are active; phone recording announcements are not implemented",
-        );
-      if (m.ended || !m.recordingAllowed)
-        throw new HttpError(403, "Enable recording first");
-      if (!m.hostEmailVerified)
-        throw new HttpError(403, "Verify the host email first");
-      if (
-        m.recordings.some((r) =>
-          ["starting", "recording", "stopping", "encrypting"].includes(
-            r.status,
-          ),
+    await this.store.withRecordingLock(meeting.code, r.id, async (lock) => {
+      await lock.change((m) => {
+        if (m.participants.some(activePhone))
+          throw new HttpError(
+            409,
+            "Recording is unavailable while phone calls are active; phone recording announcements are not implemented",
+          );
+        if (m.ended || !m.recordingAllowed)
+          throw new HttpError(403, "Enable recording first");
+        if (!m.hostEmailVerified)
+          throw new HttpError(403, "Verify the host email first");
+        if (
+          m.recordings.some((r) =>
+            ["starting", "recording", "stopping", "encrypting"].includes(
+              r.status,
+            ),
+          )
         )
-      )
-        throw new HttpError(409, "A recording is already active");
-      m.recordings.push(r);
-    });
-    let startedId: string | undefined;
-    this.working.add(r.id);
-    try {
-      const info = await this.client.startRoomCompositeEgress(
-        meeting.room,
-        new EncodedFileOutput({
-          fileType: EncodedFileType.MP4,
-          filepath: `${this.config.egressFileRoot}/raw/${r.id}.mp4`,
-        }),
-        { layout: "grid" },
-      );
-      startedId = info.egressId;
-      if (!startedId) throw new Error("Recorder response omitted its job ID");
-      const mustStop = await this.store.change(meeting.code, (m) => {
-        const row = m.recordings.find((x) => x.id === r.id)!;
-        row.egressId = info.egressId;
-        const stop =
-          m.ended || !m.recordingAllowed || row.status === "stopping";
-        row.status = stop
-          ? "stopping"
-          : info.status === EgressStatus.EGRESS_ACTIVE
-            ? "recording"
-            : "starting";
-        return stop;
+          throw new HttpError(409, "A recording is already active");
+        m.recordings.push(r);
       });
-      if (mustStop) await this.client.stopEgress(info.egressId);
-      await this.store.audit(meeting.code, "host", "recording.start", r.id);
-    } catch {
-      // Stop before trying to persist recovery state: the database may be unavailable.
-      if (startedId) await this.client.stopEgress(startedId).catch(() => {});
-      await this.store
-        .change(meeting.code, (m) => {
-          const row = m.recordings.find((recording) => recording.id === r.id)!;
-          if (startedId) row.egressId = startedId;
-          row.status = "stopping";
-          row.error =
-            "Recorder start did not complete; stop recovery is pending";
-        })
-        .catch(() => {});
-      if (!startedId) await this.recoverUntracked(meeting, r).catch(() => {});
-      throw new HttpError(
-        503,
-        "Recorder start failed; stop recovery is pending",
-      );
-    } finally {
-      this.working.delete(r.id);
-    }
+      let startedId: string | undefined;
+      try {
+        await lock.check();
+        const info = await this.client.startRoomCompositeEgress(
+          meeting.room,
+          new EncodedFileOutput({
+            fileType: EncodedFileType.MP4,
+            filepath: `${this.config.egressFileRoot}/raw/${r.id}.mp4`,
+          }),
+          { layout: "grid" },
+        );
+        startedId = info.egressId;
+        if (!startedId) throw new Error("Recorder response omitted its job ID");
+        const mustStop = await lock.change((m) => {
+          const row = m.recordings.find((x) => x.id === r.id)!;
+          row.egressId = info.egressId;
+          const stop =
+            m.ended || !m.recordingAllowed || row.status === "stopping";
+          row.status = stop
+            ? "stopping"
+            : info.status === EgressStatus.EGRESS_ACTIVE
+              ? "recording"
+              : "starting";
+          return stop;
+        });
+        if (mustStop) await this.client.stopEgress(info.egressId);
+        await lock.audit("host", "recording.start", r.id);
+      } catch {
+        // Stop before trying to persist recovery state: the database may be unavailable.
+        if (startedId) await this.client.stopEgress(startedId).catch(() => {});
+        await lock
+          .change((m) => {
+            const row = m.recordings.find(
+              (recording) => recording.id === r.id,
+            )!;
+            if (startedId) row.egressId = startedId;
+            row.status = "stopping";
+            row.error =
+              "Recorder start did not complete; stop recovery is pending";
+          })
+          .catch(() => {});
+        if (!startedId)
+          await this.recoverUntracked(meeting, r, lock).catch(() => {});
+        throw new HttpError(
+          503,
+          "Recorder start failed; stop recovery is pending",
+        );
+      }
+    });
   }
   async stop(m: Meeting, id: string) {
-    const row = await this.store.change(m.code, (state) => {
+    await this.store.change(m.code, (state) => {
       const r = state.recordings.find((x) => x.id === id);
       if (!r) throw new HttpError(404, "Recording unavailable");
       if (["starting", "recording", "stopping"].includes(r.status))
         r.status = "stopping";
-      return structuredClone(r);
     });
-    if (row.egressId && row.status === "stopping")
-      await this.client.stopEgress(row.egressId);
+    // Stop intent is durable even when the starting/finalizing owner is busy.
+    await this.store.withRecordingLock(m.code, id, async (lock) => {
+      const row = (await lock.get())?.recordings.find((r) => r.id === id);
+      if (row?.egressId && row.status === "stopping") {
+        await lock.check();
+        await this.client.stopEgress(row.egressId);
+      }
+    });
   }
   async stopAll(m: Meeting) {
     for (const r of m.recordings.filter((r) =>
@@ -415,106 +447,169 @@ export class RecordingService {
     ))
       await this.stop(m, r.id);
   }
-  async reconcile(m: Meeting) {
-    for (const r of m.recordings) {
-      if (this.working.has(r.id)) continue;
+  async reconcile(snapshot: Meeting) {
+    for (const candidate of snapshot.recordings) {
       if (
-        r.status !== "ready" &&
-        !["recording", "starting", "stopping", "encrypting"].includes(r.status)
+        ![
+          "ready",
+          "deleting",
+          "recording",
+          "starting",
+          "stopping",
+          "encrypting",
+        ].includes(candidate.status)
       )
         continue;
-      this.working.add(r.id);
       try {
-        if (r.status === "ready") {
-          if (r.createdAt < Date.now() - 7 * 86400000) {
-            await this.revoke(m, r.id);
-            if (r.metadata?.storage) {
-              if (!this.objectStorage)
-                throw new Error(
-                  "Recording object storage is required for deletion",
+        await this.store.withRecordingLock(
+          snapshot.code,
+          candidate.id,
+          async (lock) => {
+            // The timer snapshot may predate another process's completed encryption or deletion.
+            const m = await lock.get();
+            const r = m?.recordings.find((row) => row.id === candidate.id);
+            if (!m || !r) return;
+            if (
+              r.status === "deleting" ||
+              (r.status === "ready" && r.createdAt < Date.now() - 7 * 86400000)
+            ) {
+              await lock.change((state) => {
+                const row = state.recordings.find(
+                  (entry) => entry.id === r.id,
+                )!;
+                row.status = "deleting";
+                delete row.tokenHash;
+                delete row.passwordHash;
+                delete row.expiresAt;
+              });
+              await lock.audit("recorder", "recording.revoke", r.id);
+              await lock.check();
+              if (r.metadata?.storage) {
+                if (!this.objectStorage)
+                  throw new Error(
+                    "Recording object storage is required for deletion",
+                  );
+                await this.objectStorage.delete(
+                  r.metadata.storage,
+                  r.metadata,
+                  this.context(m, r),
                 );
-              await this.objectStorage.delete(
-                r.metadata.storage,
-                r.metadata,
-                this.context(m, r),
-              );
+              }
+              await lock.check();
+              await this.removeFile(this.file(r));
+              await lock.check();
+              await this.removeFile(this.file(r, true));
+              await lock.change((state) => {
+                const row = state.recordings.find(
+                  (entry) => entry.id === r.id,
+                )!;
+                row.status = "deleted";
+                delete row.metadata;
+              });
+              return;
             }
-            await this.removeFile(this.file(r));
-            await this.removeFile(this.file(r, true));
-            await this.store.change(m.code, (state) => {
-              const row = state.recordings.find((x) => x.id === r.id)!;
-              row.status = "deleted";
-              delete row.metadata;
-            });
-          }
-          continue;
-        }
-        if (r.status === "encrypting" && r.metadata) {
-          await this.finishEncryption(m, r);
-          continue;
-        }
-        const recovered = !r.egressId;
-        const info = recovered
-          ? await this.recoverUntracked(m, r)
-          : (await this.client.listEgress({ egressId: r.egressId }))[0];
-        if (!info) continue;
-        if (info.status === EgressStatus.EGRESS_COMPLETE) {
-          await this.directories();
-          // An interrupted encryption may leave an orphan encrypted file; it has never been offered for download.
-          await this.removeFile(this.file(r));
-          const metadata = await encryptRecording(
-            this.file(r, true),
-            this.file(r),
-            this.context(m, r),
-            this.provider!,
-          );
-          await this.store.change(m.code, (state) => {
-            const row = state.recordings.find((x) => x.id === r.id)!;
-            row.metadata = metadata;
-            row.status = "encrypting";
-          });
-          await this.finishEncryption(m, r);
-        } else if (
-          [
-            EgressStatus.EGRESS_FAILED,
-            EgressStatus.EGRESS_ABORTED,
-            EgressStatus.EGRESS_LIMIT_REACHED,
-          ].includes(info.status)
-        ) {
-          await this.removeFile(this.file(r, true));
-          await this.store.change(m.code, (state) => {
-            const row = state.recordings.find((x) => x.id === r.id)!;
-            row.status = "failed";
-            row.error = info.error?.includes("Start signal not received")
-              ? "No published media was available to record"
-              : "Recording did not complete";
-          });
-        } else if (
-          r.status === "stopping" ||
-          recovered ||
-          !this.available ||
-          !m.recordingAllowed ||
-          m.ended
-        ) {
-          await this.client.stopEgress(info.egressId);
-          await this.store.change(m.code, (state) => {
-            const row = state.recordings.find((x) => x.id === r.id)!;
-            if (["starting", "recording"].includes(row.status))
-              row.status = "stopping";
-          });
-        } else if (
-          info.status === EgressStatus.EGRESS_ACTIVE &&
-          r.status === "starting"
-        ) {
-          await this.store.change(m.code, (state) => {
-            const row = state.recordings.find((x) => x.id === r.id)!;
-            if (row.status === "starting") row.status = "recording";
-          });
-        }
+            if (
+              r.status === "ready" ||
+              !["recording", "starting", "stopping", "encrypting"].includes(
+                r.status,
+              )
+            )
+              return;
+            if (r.status === "encrypting" && r.metadata) {
+              await this.directories();
+              await this.finishEncryption(m, r, lock);
+              return;
+            }
+            const recovered = !r.egressId;
+            const info = recovered
+              ? await this.recoverUntracked(m, r, lock)
+              : (await this.client.listEgress({ egressId: r.egressId }))[0];
+            if (!info) return;
+            if (info.status === EgressStatus.EGRESS_COMPLETE) {
+              if (!this.provider)
+                throw new Error("Recording keys are not configured");
+              await this.directories();
+              const raw = await lstat(this.file(r, true));
+              if (!raw.isFile() || raw.size > this.config.recordingMaxBytes)
+                throw new Error(
+                  "Recording spool is not a bounded regular file",
+                );
+              await lock.check();
+              // A disconnected old worker can finish only its own immutable attempt.
+              // Never remove or overwrite ciphertext whose database commit may have succeeded.
+              const attempt = { ...r, ciphertextId: randomUUID() };
+              const metadata = await encryptRecording(
+                this.file(r, true),
+                this.file(attempt),
+                this.context(m, r),
+                this.provider,
+              );
+              await lock.change((state) => {
+                const row = state.recordings.find(
+                  (entry) => entry.id === r.id,
+                )!;
+                if (row.metadata)
+                  throw new Error("Recording encryption state changed");
+                row.metadata = metadata;
+                row.ciphertextId = attempt.ciphertextId;
+                row.status = "encrypting";
+              });
+              await this.finishEncryption(m, attempt, lock);
+            } else if (
+              [
+                EgressStatus.EGRESS_FAILED,
+                EgressStatus.EGRESS_ABORTED,
+                EgressStatus.EGRESS_LIMIT_REACHED,
+              ].includes(info.status)
+            ) {
+              await lock.check();
+              await this.removeFile(this.file(r, true));
+              await lock.change((state) => {
+                const row = state.recordings.find(
+                  (entry) => entry.id === r.id,
+                )!;
+                row.status = "failed";
+                row.error = info.error?.includes("Start signal not received")
+                  ? "No published media was available to record"
+                  : "Recording did not complete";
+              });
+            } else {
+              const current = (await lock.get())!;
+              const row = current.recordings.find(
+                (entry) => entry.id === r.id,
+              )!;
+              if (
+                row.status === "stopping" ||
+                recovered ||
+                !this.available ||
+                !current.recordingAllowed ||
+                current.ended
+              ) {
+                await lock.check();
+                await this.client.stopEgress(info.egressId);
+                await lock.change((state) => {
+                  const row = state.recordings.find(
+                    (entry) => entry.id === r.id,
+                  )!;
+                  if (["starting", "recording"].includes(row.status))
+                    row.status = "stopping";
+                });
+              } else if (
+                info.status === EgressStatus.EGRESS_ACTIVE &&
+                row.status === "starting"
+              ) {
+                await lock.change((state) => {
+                  const row = state.recordings.find(
+                    (entry) => entry.id === r.id,
+                  )!;
+                  if (row.status === "starting") row.status = "recording";
+                });
+              }
+            }
+          },
+        );
       } catch {
-        /* Keep pending state for retry; never expose unencrypted or incomplete output. */
-      } finally {
-        this.working.delete(r.id);
+        /* Keep pending state and recovery copies; never expose incomplete output. */
       }
     }
   }

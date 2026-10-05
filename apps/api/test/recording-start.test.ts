@@ -242,3 +242,47 @@ test("missing remote job stays pending and blocks another recording instead of h
     (error) => error instanceof HttpError && error.status === 409,
   );
 });
+
+test("another API cannot recover an in-flight start, and stop intent survives its ownership", async (t) => {
+  const f = await fixture(t);
+  let release!: () => void;
+  let entered!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const pending = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const original = f.client.startRoomCompositeEgress.bind(f.client);
+  f.client.startRoomCompositeEgress = async (...args) => {
+    const job = await original(...args);
+    entered();
+    await blocked;
+    return job;
+  };
+  const other = new RecordingService(
+    f.config,
+    f.store,
+    {} as Transporter,
+    f.client,
+  );
+  const starting = f.service.start(f.meeting);
+  await pending;
+  const snapshot = (await f.store.get(f.meeting.code))!;
+  await other.reconcile(snapshot);
+  assert.deepEqual(
+    f.stops,
+    [],
+    "A healthy owner's start must not be recovered by another API",
+  );
+  await assert.rejects(
+    other.start(snapshot),
+    (error: any) => error.status === 409,
+  );
+  await other.stop(snapshot, snapshot.recordings[0]!.id);
+  assert.equal((await f.row()).status, "stopping");
+  release();
+  await starting;
+  assert.equal(f.jobs.length, 1);
+  assert.deepEqual(f.stops, [f.jobs[0]!.egressId]);
+});

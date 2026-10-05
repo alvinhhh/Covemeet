@@ -45,6 +45,7 @@ export type Recording = {
   status: string;
   createdAt: number;
   egressId?: string;
+  ciphertextId?: string;
   metadata?: any;
   tokenHash?: string;
   passwordHash?: string;
@@ -93,7 +94,18 @@ export function participantRoom(m: Meeting, p: Participant) {
     ? (m.breakouts.find((b) => b.id === p.breakoutId)?.room ?? m.room)
     : m.room;
 }
+export interface RecordingLock {
+  get(): Promise<Meeting | null>;
+  check(): Promise<void>;
+  change<T>(fn: (m: Meeting) => Promise<T> | T): Promise<T>;
+  audit(actor: string, action: string, target?: string): Promise<void>;
+}
 export interface Store {
+  withRecordingLock<T>(
+    code: string,
+    id: string,
+    fn: (lock: RecordingLock) => Promise<T>,
+  ): Promise<{ acquired: false } | { acquired: true; value: T }>;
   getSettings(): Promise<any>;
   setSettings(value: any): Promise<void>;
   getAsset(id: string): Promise<{ mime: string; data: string } | null>;
@@ -524,6 +536,17 @@ export class PgStore implements Store {
   ): Promise<T> {
     const c = await this.pool.connect();
     try {
+      return await this.changeWithClient(c, code, fn);
+    } finally {
+      c.release();
+    }
+  }
+  private async changeWithClient<T>(
+    c: pg.PoolClient,
+    code: string,
+    fn: (m: Meeting) => Promise<T> | T,
+  ): Promise<T> {
+    try {
       await c.query("BEGIN");
       const m = (
         await c.query("SELECT data FROM meetings WHERE code=$1 FOR UPDATE", [
@@ -539,11 +562,75 @@ export class PgStore implements Store {
       ]);
       await c.query("COMMIT");
       return result;
-    } catch (e) {
-      await c.query("ROLLBACK");
-      throw e;
+    } catch (error) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw error;
+    }
+  }
+  async withRecordingLock<T>(
+    code: string,
+    id: string,
+    fn: (lock: RecordingLock) => Promise<T>,
+  ): Promise<{ acquired: false } | { acquired: true; value: T }> {
+    const c = await this.pool.connect();
+    const key = JSON.stringify(["recording", code, id]);
+    let acquired = false;
+    let lost = false;
+    let active = true;
+    const onError = () => {
+      lost = true;
+    };
+    c.on("error", onError);
+    const check = async () => {
+      if (lost || !active)
+        throw new Error("Recording ownership connection lost");
+      await c.query("SELECT 1");
+    };
+    try {
+      acquired = (
+        await c.query(
+          "SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired",
+          [key],
+        )
+      ).rows[0].acquired;
+      if (!acquired) return { acquired: false };
+      const value = await fn({
+        check,
+        get: async () => {
+          await check();
+          return (
+            (await c.query("SELECT data FROM meetings WHERE code=$1", [code]))
+              .rows[0]?.data ?? null
+          );
+        },
+        change: async (change) => {
+          await check();
+          return this.changeWithClient(c, code, change);
+        },
+        audit: async (actor, action, target) => {
+          await check();
+          await c.query(
+            "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,$3,$4)",
+            [code, actor, action, target],
+          );
+        },
+      });
+      await check();
+      return { acquired: true, value };
     } finally {
-      c.release();
+      active = false;
+      // A broken session must never return to the pool with an advisory lock.
+      if (acquired && !lost) {
+        try {
+          await c.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [
+            key,
+          ]);
+        } catch {
+          lost = true;
+        }
+      }
+      c.removeListener("error", onError);
+      c.release(lost);
     }
   }
   async audit(code: string, actor: string, action: string, target?: string) {
@@ -566,6 +653,41 @@ export class MemoryStore implements Store {
   phoneAttempts = new Map<string, { bucket: number; attempts: number }>();
   settings: any = null;
   assets = new Map<string, { mime: string; data: string }>();
+  private recordingLocks = new Set<string>();
+  async withRecordingLock<T>(
+    code: string,
+    id: string,
+    fn: (lock: RecordingLock) => Promise<T>,
+  ): Promise<{ acquired: false } | { acquired: true; value: T }> {
+    const key = JSON.stringify([code, id]);
+    if (this.recordingLocks.has(key)) return { acquired: false };
+    this.recordingLocks.add(key);
+    let active = true;
+    const check = async () => {
+      if (!active) throw new Error("Recording ownership connection lost");
+    };
+    try {
+      const value = await fn({
+        check,
+        get: async () => {
+          await check();
+          return this.get(code);
+        },
+        change: async (change) => {
+          await check();
+          return this.change(code, change);
+        },
+        audit: async (actor, action, target) => {
+          await check();
+          await (this as Store).audit(code, actor, action, target);
+        },
+      });
+      return { acquired: true, value };
+    } finally {
+      active = false;
+      this.recordingLocks.delete(key);
+    }
+  }
   async getSettings() {
     return structuredClone(this.settings);
   }
