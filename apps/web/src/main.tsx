@@ -5,10 +5,12 @@ import {
   useRef,
   useState,
   type ButtonHTMLAttributes,
+  type CSSProperties,
   type FormEvent,
   type ReactNode,
 } from "react";
 import { createRoot } from "react-dom/client";
+import { createPortal } from "react-dom";
 import {
   LiveKitRoom,
   RoomAudioRenderer,
@@ -38,6 +40,7 @@ import "./styles.css";
 import { brandLogo } from "./brand";
 import { BrandingEditor } from "./branding";
 import { selectStage } from "./stage-policy";
+import { observeAudioSignals, type AudioSignal } from "./audio-signal";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
 let initialHostToken = location.pathname.startsWith("/host/")
@@ -864,7 +867,9 @@ function Conference({
 }) {
   const [panel, setPanel] = useState<
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
-  >(() => (window.innerWidth < 760 ? null : "participants"));
+  >(null);
+  const [mediaControlsTarget, setMediaControlsTarget] =
+    useState<HTMLDivElement | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -999,80 +1004,11 @@ function Conference({
             </button>
           )}
         </div>
-        <div className="stage-controls">
-          {credentials ? (
-            <MediaControls me={state.me} />
-          ) : (
-            <>
-              <Button disabled>
-                <Icon name="mic" />
-                Microphone
-              </Button>
-              <Button disabled>
-                <Icon name="video" />
-                Camera
-              </Button>
-              <Button disabled>
-                <Icon name="screen" />
-                Share
-              </Button>
-            </>
-          )}
-          <Button
-            className="leave-button"
-            disabled={busy}
-            onClick={() => void mutate("/leave")}
-          >
-            <Icon name="exit" />
-            Leave
-          </Button>
-        </div>
       </div>
     </>
   );
-  return (
-    <div className="conference">
-      <header className="meeting-header">
-        <Logo name={config.brandName} small />
-        <div className="meeting-title">
-          <h1>{state.meeting.title}</h1>
-          <span>
-            {state.meeting.mode === "webinar" ? "Webinar" : "Meeting"}
-            <i /> {admitted.length}{" "}
-            {admitted.length === 1 ? "participant" : "participants"}
-          </span>
-        </div>
-        <div className="meeting-header-actions">
-          {state.meeting.recordingActive && (
-            <span className="recording-status">
-              <span />
-              Recording
-            </span>
-          )}
-          <Button onClick={() => void copyInvite()}>
-            <Icon name="link" size={17} />
-            <span>Invite</span>
-          </Button>
-          {host && (
-            <Button
-              className={state.meeting.locked ? "lock-active" : ""}
-              disabled={busy}
-              onClick={() =>
-                void mutate("", { locked: !state.meeting.locked }, "PATCH")
-              }
-            >
-              <Icon name={state.meeting.locked ? "lock" : "unlock"} size={17} />
-              <span>{state.meeting.locked ? "Unlock" : "Lock"}</span>
-            </Button>
-          )}
-        </div>
-      </header>
-      {(error || networkError || notice) && (
-        <div className="room-notices">
-          {(error || networkError) && <Notice>{error || networkError}</Notice>}
-          {notice && <Notice kind="info">{notice}</Notice>}
-        </div>
-      )}
+  const roomContent = (
+    <>
       <div className="meeting-workspace">
         <main className="meeting-stage">
           {credentials ? (
@@ -1104,6 +1040,11 @@ function Conference({
                 </div>
               )}
               {stage}
+              {mediaControlsTarget &&
+                createPortal(
+                  <MediaControls me={state.me} />,
+                  mediaControlsTarget,
+                )}
             </LiveKitRoom>
           ) : (
             stage
@@ -1172,46 +1113,102 @@ function Conference({
               : "Participant"}
           <span> · {state.me.name}</span>
         </span>
-        <div className="panel-tabs">
-          <button
-            className={panel === "participants" ? "selected" : ""}
-            onClick={() =>
-              setPanel(panel === "participants" ? null : "participants")
-            }
-          >
-            <Icon name="users" />
-            <span>Participants</span>
-            {host && waiting.length > 0 && <b>{waiting.length}</b>}
-          </button>
-          <button
-            className={panel === "chat" ? "selected" : ""}
-            onClick={() => setPanel(panel === "chat" ? null : "chat")}
-          >
-            <Icon name="chat" />
-            <span>Chat</span>
-          </button>
-          {host && (
+        <div className="meeting-dock">
+          <div className="stage-controls">
+            <div className="media-controls-slot" ref={setMediaControlsTarget}>
+              {!credentials && (
+                <>
+                  <Button
+                    disabled
+                    aria-label="Microphone unavailable"
+                    title="Microphone unavailable"
+                  >
+                    <Icon name="mic-off" />
+                    <span>Microphone</span>
+                  </Button>
+                  <Button
+                    disabled
+                    aria-label="Camera unavailable"
+                    title="Camera unavailable"
+                  >
+                    <Icon name="camera-off" />
+                    <span>Camera</span>
+                  </Button>
+                  <Button
+                    disabled
+                    aria-label="Screen sharing unavailable"
+                    title="Screen sharing unavailable"
+                  >
+                    <Icon name="screen" />
+                    <span>Share screen</span>
+                  </Button>
+                </>
+              )}
+            </div>
+            <Button
+              className="leave-button"
+              aria-label="Leave meeting"
+              title="Leave meeting"
+              disabled={busy}
+              onClick={() => void mutate("/leave")}
+            >
+              <Icon name="exit" />
+              <span>Leave</span>
+            </Button>
+          </div>
+          <div className="panel-tabs">
             <button
-              className={panel === "breakouts" ? "selected" : ""}
+              className={panel === "participants" ? "selected" : ""}
+              aria-label="Participants"
+              title="Participants"
+              aria-pressed={panel === "participants"}
               onClick={() =>
-                setPanel(panel === "breakouts" ? null : "breakouts")
+                setPanel(panel === "participants" ? null : "participants")
               }
             >
-              <Icon name="grid" />
-              <span>Breakouts</span>
+              <Icon name="users" />
+              <span>Participants</span>
+              {host && waiting.length > 0 && <b>{waiting.length}</b>}
             </button>
-          )}
-          {host && (
             <button
-              className={panel === "recordings" ? "selected" : ""}
-              onClick={() =>
-                setPanel(panel === "recordings" ? null : "recordings")
-              }
+              className={panel === "chat" ? "selected" : ""}
+              aria-label="Chat"
+              title="Chat"
+              aria-pressed={panel === "chat"}
+              onClick={() => setPanel(panel === "chat" ? null : "chat")}
             >
-              <Icon name="record" />
-              <span>Recordings</span>
+              <Icon name="chat" />
+              <span>Chat</span>
             </button>
-          )}
+            {host && (
+              <button
+                className={panel === "breakouts" ? "selected" : ""}
+                aria-label="Breakout rooms"
+                title="Breakout rooms"
+                aria-pressed={panel === "breakouts"}
+                onClick={() =>
+                  setPanel(panel === "breakouts" ? null : "breakouts")
+                }
+              >
+                <Icon name="grid" />
+                <span>Breakouts</span>
+              </button>
+            )}
+            {host && (
+              <button
+                className={panel === "recordings" ? "selected" : ""}
+                aria-label="Recordings"
+                title="Recordings"
+                aria-pressed={panel === "recordings"}
+                onClick={() =>
+                  setPanel(panel === "recordings" ? null : "recordings")
+                }
+              >
+                <Icon name="record" />
+                <span>Recordings</span>
+              </button>
+            )}
+          </div>
         </div>
         {host && (
           <Button
@@ -1226,6 +1223,60 @@ function Conference({
           </Button>
         )}
       </footer>
+    </>
+  );
+  return (
+    <div className="conference">
+      <header className="meeting-header">
+        <Logo name={config.brandName} small />
+        <div className="meeting-title">
+          <h1>{state.meeting.title}</h1>
+          <span>
+            {state.meeting.mode === "webinar" ? "Webinar" : "Meeting"}
+            <i /> {admitted.length}{" "}
+            {admitted.length === 1 ? "participant" : "participants"}
+          </span>
+        </div>
+        <div className="meeting-header-actions">
+          {state.meeting.recordingActive && (
+            <span className="recording-status">
+              <span />
+              Recording
+            </span>
+          )}
+          <Button
+            onClick={() => void copyInvite()}
+            aria-label="Copy meeting invitation"
+            title="Copy meeting invitation"
+          >
+            <Icon name="link" size={17} />
+            <span>Invite</span>
+          </Button>
+          {host && (
+            <Button
+              className={state.meeting.locked ? "lock-active" : ""}
+              aria-label={
+                state.meeting.locked ? "Unlock meeting" : "Lock meeting"
+              }
+              title={state.meeting.locked ? "Unlock meeting" : "Lock meeting"}
+              disabled={busy}
+              onClick={() =>
+                void mutate("", { locked: !state.meeting.locked }, "PATCH")
+              }
+            >
+              <Icon name={state.meeting.locked ? "lock" : "unlock"} size={17} />
+              <span>{state.meeting.locked ? "Unlock" : "Lock"}</span>
+            </Button>
+          )}
+        </div>
+      </header>
+      {(error || networkError || notice) && (
+        <div className="room-notices">
+          {(error || networkError) && <Notice>{error || networkError}</Notice>}
+          {notice && <Notice kind="info">{notice}</Notice>}
+        </div>
+      )}
+      <div className="meeting-session">{roomContent}</div>
     </div>
   );
 }
@@ -1270,6 +1321,32 @@ function MediaStage({
     .sort()
     .join(",");
   const eligibleIds = [...selection.eligibleIds].sort().join(",");
+  const allowedAudioIds = participants
+    .filter(
+      (participant) =>
+        selection.eligibleIds.has(participant.id) && participant.audioAllowed,
+    )
+    .map((participant) => participant.id)
+    .sort()
+    .join(",");
+  const [signals, setSignals] = useState<Map<string, AudioSignal>>(new Map());
+  const otherSpeakers = participants.filter(
+    (participant) =>
+      selection.eligibleIds.has(participant.id) &&
+      participant.audioAllowed &&
+      signals.get(participant.id)?.speaking &&
+      !visible.some((track) => track.participant.identity === participant.id),
+  );
+  useEffect(
+    () =>
+      observeAudioSignals(
+        room,
+        new Set(eligibleIds.split(",")),
+        new Set(allowedAudioIds.split(",")),
+        setSignals,
+      ),
+    [room, eligibleIds, allowedAudioIds],
+  );
   useEffect(() => {
     const selected = new Set(selectedVideoIds.split(","));
     const eligible = new Set(eligibleIds.split(","));
@@ -1314,7 +1391,18 @@ function MediaStage({
     <>
       <div className="connection-label">
         <span className={connection === "connected" ? "connected" : ""} />
-        {connection}
+        {connection === "connected" ? "Connected" : connection}
+        {otherSpeakers.length > 0 && (
+          <div
+            className="other-speakers"
+            title={otherSpeakers
+              .map((participant) => participant.name)
+              .join(", ")}
+          >
+            Speaking:{" "}
+            {otherSpeakers.map((participant) => participant.name).join(", ")}
+          </div>
+        )}
         {selection.pageCount > 1 && (
           <nav className="video-pagination" aria-label="Video pages">
             <button
@@ -1339,34 +1427,52 @@ function MediaStage({
       </div>
       <div
         className={`video-grid ${visible.some((track) => track.source === Track.Source.ScreenShare) ? "has-screen" : ""}`}
+        data-tile-count={visible.length}
+        style={
+          {
+            "--tile-columns":
+              visible.length <= 1
+                ? 1
+                : visible.length <= 4
+                  ? 2
+                  : visible.length <= 9
+                    ? 3
+                    : 4,
+          } as CSSProperties
+        }
       >
-        {visible.map((track) => (
-          <div
-            className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""}`}
-            key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
-          >
-            {isTrackReference(track) && !track.publication.isMuted ? (
-              <VideoTrack trackRef={track} manageSubscription={false} />
-            ) : (
-              <div className="tile-placeholder">
-                <span className="stage-avatar">
-                  {initials(
-                    track.participant.name ||
-                      (track.participant.isLocal
-                        ? me.name
-                        : track.participant.identity),
-                  )}
+        {visible.map((track) => {
+          const signal = signals.get(track.participant.identity);
+          const name =
+            participants.find(
+              (participant) => participant.id === track.participant.identity,
+            )?.name ||
+            track.participant.name ||
+            "Participant";
+          return (
+            <div
+              className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""}`}
+              data-speaking={signal?.speaking ? "true" : "false"}
+              key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
+            >
+              {isTrackReference(track) && !track.publication.isMuted ? (
+                <VideoTrack trackRef={track} manageSubscription={false} />
+              ) : (
+                <div className="tile-placeholder">
+                  <span className="stage-avatar">{initials(name)}</span>
+                </div>
+              )}
+              <div className="tile-caption">
+                <span className="tile-name" title={name}>
+                  {name}
+                  {track.participant.isLocal ? " (you)" : ""}
+                  {track.source === Track.Source.ScreenShare ? " · Screen" : ""}
                 </span>
+                <SpeakingIndicator name={name} signal={signal} />
               </div>
-            )}
-            <span className="tile-name">
-              {track.participant.name ||
-                (track.participant.isLocal ? me.name : "Participant")}
-              {track.participant.isLocal ? " (you)" : ""}
-              {track.source === Track.Source.ScreenShare ? " · Screen" : ""}
-            </span>
-          </div>
-        ))}
+            </div>
+          );
+        })}
       </div>
       {visible.length === 0 && (
         <div className="empty-stage">
@@ -1379,11 +1485,68 @@ function MediaStage({
   );
 }
 
+function SpeakingIndicator({
+  name,
+  signal,
+}: {
+  name: string;
+  signal?: AudioSignal;
+}) {
+  const status = signal?.speaking
+    ? "Speaking"
+    : signal?.microphoneOn
+      ? "Microphone on"
+      : "Microphone off";
+  return (
+    <span
+      className={`tile-audio ${signal?.speaking ? "speaking" : ""}`}
+      role="img"
+      aria-label={`${name}: ${status}`}
+      title={status}
+    >
+      {signal?.speaking ? (
+        <>
+          <span className="audio-level" aria-hidden="true">
+            {[1, 2, 3, 4].map((bar) => (
+              <i key={bar} className={bar <= signal.bars ? "active" : ""} />
+            ))}
+          </span>
+          <span className="speaking-label" aria-hidden="true">
+            Speaking
+          </span>
+        </>
+      ) : (
+        <Icon name={signal?.microphoneOn ? "mic" : "mic-off"} size={17} />
+      )}
+    </span>
+  );
+}
+
 function MediaControls({ me }: { me: Participant }) {
-  const { localParticipant } = useLocalParticipant();
+  const {
+    localParticipant,
+    isMicrophoneEnabled,
+    isCameraEnabled,
+    isScreenShareEnabled,
+  } = useLocalParticipant();
   const [error, setError] = useState("");
   const audioAllowed = me.role !== "viewer" && me.audioAllowed;
   const videoAllowed = me.role !== "viewer" && me.videoAllowed;
+  const microphoneAction = !audioAllowed
+    ? "Microphone blocked by host"
+    : isMicrophoneEnabled
+      ? "Mute microphone"
+      : "Unmute microphone";
+  const cameraAction = !videoAllowed
+    ? "Camera blocked by host"
+    : isCameraEnabled
+      ? "Turn camera off"
+      : "Turn camera on";
+  const shareAction = !videoAllowed
+    ? "Screen sharing blocked by host"
+    : isScreenShareEnabled
+      ? "Stop sharing"
+      : "Share screen";
   useEffect(() => {
     if (!audioAllowed)
       void localParticipant
@@ -1413,12 +1576,17 @@ function MediaControls({ me }: { me: Participant }) {
         disabled={!audioAllowed}
         showIcon={false}
         onDeviceError={(e) => setError(e.message)}
-        title={
-          audioAllowed ? "Toggle microphone" : "Microphone blocked by host"
-        }
+        title={microphoneAction}
+        aria-label={microphoneAction}
       >
-        <Icon name="mic" />
-        <span>{audioAllowed ? "Microphone" : "Mic blocked"}</span>
+        <Icon name={audioAllowed && isMicrophoneEnabled ? "mic" : "mic-off"} />
+        <span>
+          {!audioAllowed
+            ? "Mic blocked"
+            : isMicrophoneEnabled
+              ? "Mute"
+              : "Unmute"}
+        </span>
       </TrackToggle>
       <TrackToggle
         className="button media-toggle"
@@ -1426,10 +1594,17 @@ function MediaControls({ me }: { me: Participant }) {
         disabled={!videoAllowed}
         showIcon={false}
         onDeviceError={(e) => setError(e.message)}
-        title={videoAllowed ? "Toggle camera" : "Camera blocked by host"}
+        title={cameraAction}
+        aria-label={cameraAction}
       >
-        <Icon name="video" />
-        <span>{videoAllowed ? "Camera" : "Camera blocked"}</span>
+        <Icon name={videoAllowed && isCameraEnabled ? "video" : "camera-off"} />
+        <span>
+          {!videoAllowed
+            ? "Camera blocked"
+            : isCameraEnabled
+              ? "Stop video"
+              : "Start video"}
+        </span>
       </TrackToggle>
       <TrackToggle
         className="button media-toggle"
@@ -1437,9 +1612,11 @@ function MediaControls({ me }: { me: Participant }) {
         disabled={!videoAllowed || me.role === "viewer"}
         showIcon={false}
         onDeviceError={(e) => setError(e.message)}
+        title={shareAction}
+        aria-label={shareAction}
       >
         <Icon name="screen" />
-        <span>Share</span>
+        <span>{isScreenShareEnabled ? "Stop sharing" : "Share screen"}</span>
       </TrackToggle>
     </>
   );

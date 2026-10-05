@@ -3,6 +3,7 @@ import type { CSSProperties, ReactNode } from "react";
 export type IconName =
   | "video"
   | "mic"
+  | "mic-off"
   | "screen"
   | "users"
   | "chat"
@@ -34,6 +35,11 @@ const paths: Record<IconName, ReactNode> = {
     <>
       <rect x="9" y="2" width="6" height="13" rx="3" />
       <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8" />
+    </>
+  ),
+  "mic-off": (
+    <>
+      <path d="m3 3 18 18M9 9v3a3 3 0 0 0 5 2.2M9 5V4a3 3 0 0 1 6 0v6M5 10v2a7 7 0 0 0 11.9 5M19 10v2a7 7 0 0 1-.2 1.7M12 19v3M8 22h8" />
     </>
   ),
   screen: (
