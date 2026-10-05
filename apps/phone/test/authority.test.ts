@@ -104,3 +104,100 @@ test("service endpoint policy rejects plaintext production, credentials and inje
   );
   assert.throws(() => serviceUrl("http://external.example", ["http:"], true));
 });
+
+test("journal private routes validate identifiers, authenticate, and reject unexpected response fields", async (t) => {
+  const previous = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const routes: string[] = [];
+  const ownerId = randomUUID();
+  const dialogInput = {
+    callId: input.callId,
+    ownerId,
+    pbxId: "fixture",
+    pbxEpoch: "fixture-epoch",
+    callerChannelId: "caller",
+    trunkId: "fixture",
+    inboundEndpoint: "phone",
+    outboundEndpoint: "livekit",
+    sipTrunkId: "ST_fixture",
+    sipRuleId: "SDR_fixture",
+  };
+  const dialog = {
+    ...dialogInput,
+    state: "open",
+    revision: 1,
+    operations: {},
+    uncertain: false,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  let extra = false;
+  globalThis.fetch = async (url, init) => {
+    const pathname = new URL(String(url)).pathname;
+    routes.push(pathname);
+    const headers = new Headers(init?.headers);
+    assert.equal(init?.method, "POST");
+    assert.equal(init?.redirect, "error");
+    assert.equal(headers.get("Authorization"), `Bearer ${"k".repeat(40)}`);
+    assert.equal(headers.get("X-Requested-With"), "CovemeetPhone");
+    assert.equal(headers.get("Origin"), null);
+    assert(init?.signal);
+    const body = JSON.parse(String(init?.body));
+    if (pathname === "/api/internal/phone/dialogs/query") {
+      assert.deepEqual(body, { callId: input.callId });
+      return Response.json({ dialogs: [dialog] });
+    }
+    return Response.json({
+      ...dialog,
+      ...(extra ? { sessionToken: "unexpected-secret" } : {}),
+    });
+  };
+  const authority = new HttpAuthority("https://core.example", "k".repeat(40));
+  await authority.journalCreate(dialogInput);
+  await authority.journalQuery({ callId: input.callId });
+  await authority.journalChange(input.callId, ownerId, 1, {
+    type: "begin",
+    operation: "answer",
+  });
+  await authority.journalStop(input.callId, ownerId, 1);
+  await authority.journalFinish(input.callId, ownerId, 1, {
+    allocationsStopped: true,
+    callerAbsent: true,
+    outboundAbsent: true,
+    bridgeAbsent: true,
+    nativeAbsent: true,
+    holdingRelayAbsent: true,
+    rtcClosed: true,
+  });
+  assert.deepEqual(routes, [
+    "/api/internal/phone/dialogs",
+    "/api/internal/phone/dialogs/query",
+    `/api/internal/phone/dialogs/${input.callId}`,
+    `/api/internal/phone/dialogs/${input.callId}/stop`,
+    `/api/internal/phone/dialogs/${input.callId}/finish`,
+  ]);
+  const count = routes.length;
+  await assert.rejects(authority.journalStop("../other-route", ownerId, 1));
+  await assert.rejects(authority.journalStop(input.callId, ownerId, 1.5));
+  assert.equal(routes.length, count);
+  extra = true;
+  await assert.rejects(authority.journalCreate(dialogInput));
+});
+
+test("journaled join transmits its process owner with credentials", async (t) => {
+  const previous = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = previous;
+  });
+  const ownerId = randomUUID();
+  globalThis.fetch = async (_url, init) => {
+    assert.equal(JSON.parse(String(init?.body)).ownerId, ownerId);
+    return Response.json(session);
+  };
+  await new HttpAuthority("https://core.example", "k".repeat(40)).join({
+    ...input,
+    ownerId,
+  });
+});

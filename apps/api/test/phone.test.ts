@@ -141,6 +141,131 @@ test("phone configuration is disabled by default and rejects shared keys or exce
     assert.throws(() => loadConfig({ ...env, ...override }));
 });
 
+test("disabled phone configuration still validates a supplied gateway key", () => {
+  for (const key of ["short", secret, creationKey, env.LIVEKIT_API_SECRET])
+    assert.throws(() =>
+      loadConfig({ ...env, PHONE_ENABLED: "false", PHONE_GATEWAY_KEY: key }),
+    );
+  assert.equal(
+    loadConfig({ ...env, PHONE_ENABLED: "false" }).phoneGatewayKey,
+    gatewayKey,
+  );
+  assert.equal(
+    loadConfig({ SESSION_SECRET: secret, PHONE_GATEWAY_KEY: "" }).phoneEnabled,
+    false,
+  );
+});
+
+test("disabled phone authentication never accepts an empty or short configured key", async (t) => {
+  const f = await fixture(t, {
+    PHONE_ENABLED: "false",
+    PHONE_GATEWAY_KEY: "",
+  });
+  for (const key of ["", "short"]) {
+    // Also guard against a malformed Config supplied without loadConfig.
+    f.config.phoneGatewayKey = key;
+    assert.equal(
+      (
+        await f.gateway(
+          "/api/internal/phone/calls",
+          {},
+          {
+            authorization: `Bearer ${key}`,
+          },
+        )
+      ).statusCode,
+      403,
+    );
+  }
+});
+
+test("global phone disable terminates authenticated existing actions without releasing reservations", async (t) => {
+  const f = await fixture(t),
+    h = await f.host();
+  const calls = [];
+  for (const action of ["poll", "toggle-mute", "toggle-hand"]) {
+    const call = await f.call(h);
+    assert.equal((await h.action(call.participantId, "admit")).statusCode, 200);
+    calls.push({ call, action, grant: (await call.update()).json().grant });
+  }
+  f.config.phoneEnabled = false;
+  assert.equal(
+    (await f.browser("POST", `/api/meetings/${h.code}/phone`, {}, h.cookie))
+      .statusCode,
+    503,
+  );
+  assert.equal(
+    (
+      await f.gateway("/api/internal/phone/calls", {
+        locator: h.access.locator,
+        pin: h.access.pin,
+        callId: randomUUID(),
+        trunkId: "test-trunk",
+      })
+    ).statusCode,
+    503,
+  );
+  const first = calls[0]!.call;
+  const url = `/api/internal/phone/calls/${h.code}/${first.participantId}`;
+  const payload = {
+    callId: first.callId,
+    sessionToken: first.sessionToken,
+    action: "leave",
+  };
+  for (const headers of [
+    { authorization: "Bearer " },
+    { authorization: `Bearer ${creationKey}` },
+    { origin },
+    { "x-requested-with": "MeetingPlatform" },
+  ])
+    assert.equal((await f.gateway(url, payload, headers)).statusCode, 403);
+  assert.equal(
+    (await first.update("leave", { sessionToken: "x".repeat(43) })).statusCode,
+    403,
+  );
+  assert.equal(
+    (await first.update("leave", { callId: randomUUID() })).statusCode,
+    403,
+  );
+  for (const { call, action, grant } of calls) {
+    const response = await call.update(action);
+    assert.equal(response.statusCode, 200, response.body);
+    const policy = response.json();
+    assert.equal(policy.state, "ended");
+    assert.equal(policy.leaseExpiresAt, 0);
+    assert.equal(policy.grant, undefined);
+    assert.equal(policy.muted, true);
+    assert.equal(policy.handRaised, false);
+    assert.ok(f.media.removed.includes(call.participantId));
+    await assert.rejects(f.media.authorize(grant.token));
+    assert.equal(f.store.phoneCalls.get(call.callId)!.released, false);
+    assert.equal((await call.update("leave")).statusCode, 200);
+    assert.equal(f.store.phoneCalls.get(call.callId)!.released, true);
+  }
+});
+
+test("global phone disable retains capacity when cleanup fails and accepts a later cleanup acknowledgement", async (t) => {
+  const f = await fixture(t),
+    h = await f.host(),
+    call = await f.call(h);
+  await h.action(call.participantId, "admit");
+  f.config.phoneEnabled = false;
+  f.media.failRemove = true;
+  assert.equal((await call.update("leave")).statusCode, 503);
+  assert.equal(f.store.phoneCalls.get(call.callId)!.released, false);
+  const participant = (await f.store.get(h.code))!.participants.find(
+    (p) => p.id === call.participantId,
+  )!;
+  assert.equal(participant.status, "left");
+  assert.equal(participant.phone!.leaseExpiresAt, 0);
+  assert.equal(participant.enforcementPending, true);
+  f.media.failRemove = false;
+  const response = await call.update("leave");
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().state, "ended");
+  assert.equal(f.store.phoneCalls.get(call.callId)!.released, true);
+});
+
 test("phone locator/PIN are host-only independent credentials; public state does not expose authority", async (t) => {
   const f = await fixture(t),
     h = await f.host();
@@ -646,4 +771,22 @@ test("phone attempt counters are bounded by expired minute-bucket cleanup", asyn
   await store.phoneAttempt("current-test-counter", 10, now);
   assert.equal(store.phoneAttempts.has("old-test-counter"), false);
   assert.equal(store.phoneAttempts.size, 1);
+});
+
+test("runtime phone admission requires durable ownership outside isolated test mode", async (t) => {
+  const f = await fixture(t, { NODE_ENV: "development" }),
+    h = await f.host();
+  const response = await f.gateway("/api/internal/phone/calls", {
+    locator: h.access.locator,
+    pin: h.access.pin,
+    callId: randomUUID(),
+    trunkId: "test-trunk",
+  });
+  assert.equal(response.statusCode, 403);
+  assert.equal(
+    (await f.store.get(h.code))!.participants.filter(
+      (p) => p.transport === "phone",
+    ).length,
+    0,
+  );
 });

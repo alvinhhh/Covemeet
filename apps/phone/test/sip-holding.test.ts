@@ -36,6 +36,7 @@ function fixture() {
   };
   const log: string[] = [];
   const native = {
+    sid: "PA_fixture",
     identity: `sip_${createHash("sha256").update("covemeet-pbx").digest("hex").slice(0, 16)}`,
     kind: 3,
     attributes: {
@@ -45,6 +46,7 @@ function fixture() {
     },
   };
   const room = {
+    sid: "RM_fixture",
     name: `phone-hold-${config.callId}_abcdefgh`,
     maxParticipants: 2,
   };
@@ -52,6 +54,7 @@ function fixture() {
   let peers = [native];
   let originated = false;
   let channelLive = false;
+  let bridgeLive = false;
   let channelState = "Up";
   const rtc: AudioBridge = {
     silence() {
@@ -77,6 +80,7 @@ function fixture() {
     | "getChannelVariable"
     | "hangup"
     | "createBridge"
+    | "getBridge"
     | "addChannel"
     | "destroyBridge"
   > = {
@@ -106,13 +110,19 @@ function fixture() {
     },
     async createBridge(id) {
       log.push(`bridge:${id}`);
-      return { id, bridge_type: "mixing" };
+      bridgeLive = true;
+      return { id, channels: [] };
     },
     async addChannel(bridgeId, channelId) {
       log.push(`add:${bridgeId}:${channelId}`);
     },
     async destroyBridge(id) {
       log.push(`destroy:${id}`);
+      bridgeLive = false;
+    },
+    async getBridge(id) {
+      log.push(`get-bridge:${id}`);
+      return bridgeLive ? { id, channels: [] } : undefined;
     },
   };
   const service = {
@@ -128,6 +138,27 @@ function fixture() {
       peers = peers.filter((p) => p.identity !== identity);
     },
   };
+  const journal = {
+    async mutate<T>(name: string, operation: () => Promise<T>) {
+      log.push(`journal:begin:${name}`);
+      const value = await operation();
+      log.push(`journal:confirmed:${name}`);
+      return value;
+    },
+    async holding(fields: {
+      roomName: string;
+      roomSid: string;
+      nativeIdentity: string;
+      nativeSid: string;
+    }) {
+      assert.equal(fields.roomSid, room.sid);
+      assert.equal(fields.nativeSid, native.sid);
+      log.push(`journal:holding:${fields.roomName}`);
+    },
+    async uncertain() {
+      log.push("journal:uncertain");
+    },
+  };
   const holding = new SipHolding(
     config,
     ari,
@@ -135,6 +166,7 @@ function fixture() {
       RoomServiceClient,
       "listRooms" | "listParticipants" | "removeParticipant"
     >,
+    journal,
     async (...args) => {
       log.push("rtc:open");
       opened.push(args[0]);
@@ -147,6 +179,7 @@ function fixture() {
     ari,
     service,
     holding,
+    journal,
     native,
     room,
     rtc,
@@ -186,7 +219,12 @@ test("holding configuration fixes random namespace, endpoint and SIP identifiers
   ]) {
     assert.throws(
       () =>
-        new SipHolding({ ...f.config, ...change }, f.ari, f.service as never),
+        new SipHolding(
+          { ...f.config, ...change },
+          f.ari,
+          f.service as never,
+          f.journal,
+        ),
     );
   }
 });
@@ -265,7 +303,13 @@ test("holding refuses pre-existing or ambiguous destinations and larger rooms", 
     existing.log.some((item) => item.startsWith("originate:")),
     false,
   );
-  await existing.holding.close();
+  await assert.rejects(existing.holding.close(), /Unowned SIP holding/);
+  assert.equal(
+    existing.log.some(
+      (entry) => entry.startsWith("remove:") || entry.startsWith("hangup:"),
+    ),
+    false,
+  );
   const ambiguous = fixture();
   ambiguous.setRooms([
     ambiguous.room,
@@ -307,7 +351,11 @@ test("holding refuses multiple native peers even when both share the trusted tru
     f.log.some((item) => item.startsWith("bridge:")),
     false,
   );
-  await f.holding.close();
+  await assert.rejects(f.holding.close(), /SIP holding participant remains/);
+  assert.equal(
+    f.log.some((entry) => entry.endsWith(":second-sip")),
+    false,
+  );
 });
 
 for (const wrong of ["trunk", "rule", "kind", "status", "identity"])
@@ -327,7 +375,7 @@ for (const wrong of ["trunk", "rule", "kind", "status", "identity"])
     ]);
     let checks = 0;
     const original = f.ari.getChannel;
-    f.ari.getChannel = async (id) => (++checks > 1 ? undefined : original(id));
+    f.ari.getChannel = async (id) => (++checks > 2 ? undefined : original(id));
     await assert.rejects(
       f.holding.open(() => {}),
       AudioBridgeOpenError,
@@ -338,8 +386,11 @@ for (const wrong of ["trunk", "rule", "kind", "status", "identity"])
     );
     // Cleanup never removes another trunk/rule's identity; that unresolved SIP
     // participant must retain capacity instead of claiming the room is clean.
-    if (wrong === "trunk" || wrong === "rule") {
-      await assert.rejects(f.holding.close(), /Native SIP participant remains/);
+    if (["trunk", "rule", "kind", "identity"].includes(wrong)) {
+      await assert.rejects(
+        f.holding.close(),
+        /SIP holding participant remains/,
+      );
       assert.equal(
         f.log.some((item) => item.startsWith("remove:")),
         false,
@@ -357,8 +408,8 @@ test("unknown originate outcome remains unresolved despite immediate channel abs
     AudioBridgeOpenError,
   );
   await assert.rejects(f.holding.close(), /reconciliation/);
-  assert(f.log.includes(`hangup:${f.holding.outboundId}`));
-  assert(f.log.includes(`destroy:${f.holding.bridgeId}`));
+  assert.equal(f.log.includes(`hangup:${f.holding.outboundId}`), false);
+  assert.equal(f.log.includes(`destroy:${f.holding.bridgeId}`), false);
 });
 
 test("late originate is awaited and removed before cleanup can finish", async () => {
@@ -412,7 +463,7 @@ test("holding cleanup does not touch unrelated rooms and fails if scoped channel
     name: "PJSIP/fixture",
     state: "Up",
   });
-  await assert.rejects(stuck.holding.close(), /outbound leg remains/);
+  await assert.rejects(stuck.holding.close(), /Unowned SIP holding/);
 });
 
 test("ringing opens silent holding before Up, but the PBX bridge waits for encryption verification", async () => {
@@ -565,3 +616,135 @@ test("a changed native room after early RTC setup never bridges the original cal
   );
   await Promise.all([error.bridge.close(), f.holding.close()]);
 });
+
+test("holding persists allocating intent and exact native binding before resource use", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  assert(
+    f.log.indexOf("journal:begin:originate") <
+      f.log.findIndex((v) => v.startsWith("originate:")),
+  );
+  assert(
+    f.log.indexOf(`journal:holding:${f.room.name}`) < f.log.indexOf("rtc:open"),
+  );
+  assert(
+    f.log.indexOf("journal:begin:create-bridge") <
+      f.log.indexOf(`bridge:${f.holding.bridgeId}`),
+  );
+  await f.holding.close();
+});
+
+test("successful bridge deletion acknowledgement does not prove actual bridge absence", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  f.ari.destroyBridge = async () => {};
+  await assert.rejects(f.holding.close(), /SIP bridge remains/);
+});
+
+test("holding closure waits for its RTC owner and preserves an unrelated peer", async () => {
+  const f = fixture(),
+    pending = deferred();
+  await f.holding.open(() => {});
+  f.setPeers([f.native, { ...f.native, identity: "unrelated-peer", kind: 0 }]);
+  f.rtc.close = async () => {
+    await pending.promise;
+  };
+  let settled = false;
+  const closing = f.holding
+    .close()
+    .catch((error) => error)
+    .finally(() => {
+      settled = true;
+    });
+  await delay(10);
+  assert.equal(settled, false);
+  pending.resolve();
+  assert.match((await closing).message, /SIP holding participant remains/);
+  assert.equal(
+    f.log.some((entry) => entry.endsWith(":unrelated-peer")),
+    false,
+  );
+});
+
+test("unknown RTC setup is journaled and cannot acknowledge cleanup", async () => {
+  const f = fixture();
+  f.factory.open = async () => {
+    throw new Error("unknown allocation outcome");
+  };
+  await assert.rejects(
+    f.holding.open(() => {}),
+    AudioBridgeOpenError,
+  );
+  assert(f.log.includes("journal:uncertain"));
+  await assert.rejects(f.holding.close(), /reconciliation/);
+});
+
+test("a deferred outbound collision is quarantined without deleting the conflicting resource", async () => {
+  const f = fixture();
+  f.ari.originate = async () => {
+    f.setChannel(true);
+    throw new AriRequestError("rejected", 409);
+  };
+  await assert.rejects(
+    f.holding.open(() => {}),
+    AudioBridgeOpenError,
+  );
+  await assert.rejects(f.holding.close(), /outbound leg remains/);
+  assert.equal(f.log.includes(`hangup:${f.holding.outboundId}`), false);
+  assert.equal(f.log.includes(`destroy:${f.holding.bridgeId}`), false);
+});
+
+test("a rejected bridge collision does not become bridge ownership", async () => {
+  const f = fixture();
+  let conflicting = false;
+  f.ari.createBridge = async () => {
+    conflicting = true;
+    throw new AriRequestError("rejected", 409);
+  };
+  f.ari.getBridge = async (id) =>
+    conflicting ? { id, channels: ["unrelated"] } : undefined;
+  await assert.rejects(
+    f.holding.open(() => {}),
+    AudioBridgeOpenError,
+  );
+  await assert.rejects(f.holding.close(), /SIP bridge remains/);
+  assert(f.log.includes(`hangup:${f.holding.outboundId}`));
+  assert.equal(f.log.includes(`destroy:${f.holding.bridgeId}`), false);
+});
+
+for (const stage of [
+  "originate",
+  "create-bridge",
+  "attach-outbound",
+  "attach-caller",
+]) {
+  test(`late ${stage} journal acknowledgement cannot allocate after close`, async () => {
+    const f = fixture(),
+      begun = deferred(),
+      resume = deferred();
+    const mutate = f.journal.mutate;
+    f.journal.mutate = async (name, operation) => {
+      if (name === stage) {
+        begun.resolve();
+        await resume.promise;
+      }
+      return mutate(name, operation);
+    };
+    const opening = f.holding.open(() => {}).catch((error: unknown) => error);
+    await begun.promise;
+    const closing = f.holding.close();
+    resume.resolve();
+    assert((await opening) instanceof AudioBridgeOpenError);
+    await closing;
+    const prefix =
+      stage === "originate"
+        ? "originate:"
+        : stage === "create-bridge"
+          ? "bridge:"
+          : `add:${f.holding.bridgeId}:${stage === "attach-outbound" ? f.holding.outboundId : f.config.callerChannelId}`;
+    assert.equal(
+      f.log.some((entry) => entry.startsWith(prefix)),
+      false,
+    );
+  });
+}

@@ -27,6 +27,10 @@ if (process.env.PHONE_ENABLED !== "true") {
     .strict();
   let relay: PhoneRelay | undefined;
   try {
+    if (process.env.NODE_ENV !== "test")
+      throw new Error(
+        "Standalone phone relay requires the managed SIP supervisor",
+      );
     const file = process.env.PHONE_CALL_FILE;
     if (!file) throw new Error("Phone call file required");
     const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -62,7 +66,7 @@ if (process.env.PHONE_ENABLED !== "true") {
     }
     const config = schema.parse(JSON.parse(callInput));
     callInput = "";
-    const development = process.env.NODE_ENV !== "production";
+    const development = true; // The call-file harness is restricted to NODE_ENV=test.
     const authority = new HttpAuthority(
       process.env.PHONE_AUTHORITY_URL ?? "",
       process.env.PHONE_GATEWAY_KEY ?? "",

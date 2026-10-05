@@ -1,10 +1,24 @@
 import { z } from "zod";
+import {
+  phoneDialogInputSchema,
+  phoneDialogSchema,
+  phoneDialogsSchema,
+  phoneDialogQuerySchema,
+  phoneDialogChangeSchema,
+  phoneCleanupProofSchema,
+  type JournalAuthority,
+  type PhoneDialogInput,
+  type PhoneDialogQuery,
+  type PhoneDialogChange,
+  type PhoneCleanupProof,
+} from "./journal.js";
 
 export const joinSchema = z
   .object({
     locator: z.string().regex(/^\d{12}$/),
     pin: z.string().regex(/^\d{8}$/),
     callId: z.string().uuid(),
+    ownerId: z.string().uuid().optional(),
     trunkId: z.string().min(1).max(128),
     callerId: z
       .string()
@@ -74,7 +88,13 @@ export function serviceUrl(
 
 export class PhoneActionDenied extends Error {}
 
-export class HttpAuthority implements Authority {
+export class PhoneAuthorityRejected extends Error {
+  constructor(readonly status: number) {
+    super(`Phone authority rejected request (${status})`);
+  }
+}
+
+export class HttpAuthority implements Authority, JournalAuthority {
   private readonly base: URL;
   constructor(
     url: string,
@@ -130,10 +150,73 @@ export class HttpAuthority implements Authority {
         if (body?.error === "Speaking permission required")
           throw new PhoneActionDenied("Speaking permission required");
       }
-      throw new Error(`Phone authority rejected request (${response.status})`);
+      throw new PhoneAuthorityRejected(response.status);
     }
     return JSON.parse(text);
   }
+  async journalCreate(input: PhoneDialogInput) {
+    return phoneDialogSchema.parse(
+      await this.request(
+        "/api/internal/phone/dialogs",
+        phoneDialogInputSchema.parse(input),
+      ),
+    );
+  }
+  async journalQuery(query: PhoneDialogQuery) {
+    return phoneDialogsSchema.parse(
+      await this.request(
+        "/api/internal/phone/dialogs/query",
+        phoneDialogQuerySchema.parse(query),
+      ),
+    );
+  }
+  private journalOwner(callId: string, ownerId: string, revision: number) {
+    z.string().uuid().parse(callId);
+    return z
+      .object({
+        ownerId: z.string().uuid(),
+        revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      })
+      .strict()
+      .parse({ ownerId, revision });
+  }
+  async journalChange(
+    callId: string,
+    ownerId: string,
+    revision: number,
+    change: PhoneDialogChange,
+  ) {
+    const owner = this.journalOwner(callId, ownerId, revision);
+    return phoneDialogSchema.parse(
+      await this.request(`/api/internal/phone/dialogs/${callId}`, {
+        ...owner,
+        change: phoneDialogChangeSchema.parse(change),
+      }),
+    );
+  }
+  async journalStop(callId: string, ownerId: string, revision: number) {
+    return phoneDialogSchema.parse(
+      await this.request(
+        `/api/internal/phone/dialogs/${callId}/stop`,
+        this.journalOwner(callId, ownerId, revision),
+      ),
+    );
+  }
+  async journalFinish(
+    callId: string,
+    ownerId: string,
+    revision: number,
+    proof: PhoneCleanupProof,
+  ) {
+    const owner = this.journalOwner(callId, ownerId, revision);
+    return phoneDialogSchema.parse(
+      await this.request(`/api/internal/phone/dialogs/${callId}/finish`, {
+        ...owner,
+        proof: phoneCleanupProofSchema.parse(proof),
+      }),
+    );
+  }
+
   async join(input: JoinInput) {
     return sessionSchema.parse(
       await this.request("/api/internal/phone/calls", joinSchema.parse(input)),

@@ -26,6 +26,7 @@ import {
 } from "./security.js";
 import { RecordingService } from "./recordings.js";
 import { PhoneService, revokePhoneParticipants } from "./phone.js";
+import { PhoneDialogService } from "./phone-dialogs.js";
 
 const name = z.string().trim().min(1).max(80),
   password = z.string().min(8).max(256);
@@ -89,6 +90,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
   });
   const recordings = new RecordingService(config, store, mail);
   const phone = new PhoneService(config, store, media);
+  const phoneDialogs = new PhoneDialogService(config, store, media);
   const defaults = {
     brandName: config.brandName,
     headline: "Meetings",
@@ -287,6 +289,36 @@ export async function createApp(config: Config, store: Store, media: Media) {
       return phone.update(codeOf(req), (req.params as any).id, req.body);
     },
   );
+  app.post(
+    "/api/internal/phone/dialogs",
+    { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
+    async (req) => {
+      phone.authenticate(req.headers);
+      return phoneDialogs.create(req.body);
+    },
+  );
+  app.post(
+    "/api/internal/phone/dialogs/query",
+    { config: { rateLimit: { max: 3000, timeWindow: "1 minute" } } },
+    async (req) => {
+      phone.authenticate(req.headers);
+      return phoneDialogs.query(req.body);
+    },
+  );
+  for (const action of ["change", "stop", "finish"] as const) {
+    const suffix = action === "change" ? "" : `/${action}`;
+    app.post(
+      `/api/internal/phone/dialogs/:callId${suffix}`,
+      { config: { rateLimit: { max: 3000, timeWindow: "1 minute" } } },
+      async (req) => {
+        phone.authenticate(req.headers);
+        return phoneDialogs[action](
+          (req.params as { callId: string }).callId,
+          req.body,
+        );
+      },
+    );
+  }
   app.get("/api/meetings/:code/phone", async (req) => {
     const m = await find(req);
     actor(req, m, true);

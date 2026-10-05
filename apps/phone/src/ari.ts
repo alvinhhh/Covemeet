@@ -482,6 +482,18 @@ export class AriClient {
       }),
     );
   }
+  async getBridge(bridgeId: string): Promise<AriBridge | undefined> {
+    const result = await this.request(
+      "GET",
+      `/bridges/${parameter(id, bridgeId)}`,
+      undefined,
+      undefined,
+      true,
+    );
+    return result === absentResource
+      ? undefined
+      : this.result(bridgeSchema.extend({ id: z.literal(bridgeId) }), result);
+  }
   async addChannel(bridgeId: string, channelId: string): Promise<void> {
     this.admitting();
     await this.request(

@@ -26,6 +26,7 @@ export const phoneCallSchema = z
     locator: z.string().regex(/^\d{12}$/),
     pin: z.string().regex(/^\d{8}$/),
     callId: z.string().uuid(),
+    ownerId: z.string().uuid().optional(),
     trunkId: z.string().regex(/^[A-Za-z0-9_.:-]{1,80}$/),
     callerId: z
       .string()
@@ -65,8 +66,8 @@ export class PhoneService {
       throw new HttpError(503, "Phone access is disabled");
   }
   authenticate(headers: Record<string, unknown>) {
-    this.requireEnabled();
     if (
+      this.config.phoneGatewayKey.length < 32 ||
       headers.origin !== undefined ||
       headers["x-requested-with"] !== "CovemeetPhone" ||
       !safeEqual(
@@ -95,6 +96,8 @@ export class PhoneService {
   async create(raw: unknown) {
     this.requireEnabled();
     const body = phoneCallSchema.parse(raw);
+    if (!body.ownerId && !this.config.phoneAllowUnjournaledTestCalls)
+      throw new HttpError(403, "Phone dialog ownership required");
     if (body.trunkId !== this.config.phoneTrunkId)
       throw new HttpError(403, "Phone access unavailable");
     const now = Date.now();
@@ -193,10 +196,10 @@ export class PhoneService {
           expiresAt: p.expiresAt,
         };
       },
+      body.ownerId,
     );
   }
   async update(code: string, id: string, raw: unknown) {
-    this.requireEnabled();
     const body = phonePollSchema.parse(raw);
     const snapshot = await this.store.change(code, (m) => {
       const p = m.participants.find((p) => p.id === id);
@@ -211,6 +214,7 @@ export class PhoneService {
       const now = Date.now();
       const ended =
         body.action === "leave" ||
+        !this.config.phoneEnabled ||
         m.ended ||
         !m.phoneAccess?.enabled ||
         p.expiresAt <= now ||

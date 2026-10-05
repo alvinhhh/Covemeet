@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
-import type { AriClient, AriEvent, AriChannel } from "./ari.js";
+import {
+  AriRequestError,
+  type AriClient,
+  type AriEvent,
+  type AriChannel,
+} from "./ari.js";
 import type { Authority, CallPolicy, MeetingGrant } from "./authority.js";
 import { AudioBridgeOpenError, PhoneRelay, type AudioBridge } from "./relay.js";
+import type { CallJournal, JournalRegistry } from "./journal.js";
 
 export type SupervisorAri = Pick<
   AriClient,
@@ -46,7 +52,9 @@ interface Call {
   timer: ReturnType<typeof setTimeout>;
   lifetime: ReturnType<typeof setTimeout>;
   relay?: PhoneRelay;
-  media: SupervisedMedia;
+  media?: SupervisedMedia;
+  journal: CallJournal;
+  journalStopping?: Promise<void>;
   stopping?: Promise<void>;
 }
 const error = () => new Error("Phone call control unavailable");
@@ -77,7 +85,9 @@ export class SipSupervisor {
     private createMedia: (
       callId: string,
       callerChannelId: string,
+      journal: CallJournal,
     ) => SupervisedMedia,
+    private journals: Pick<JournalRegistry, "forCall">,
   ) {
     for (const value of [
       config.inboundContext,
@@ -185,9 +195,14 @@ export class SipSupervisor {
   }
   private startCall(channel: AriChannel) {
     const id = randomUUID();
-    let media: SupervisedMedia;
+    let journal: CallJournal;
     try {
-      media = this.createMedia(id, channel.id);
+      journal = this.journals.forCall(
+        id,
+        channel.id,
+        this.config.inboundEndpoint,
+        this.config.trunkId,
+      );
     } catch {
       void this.ari.hangup(channel.id).catch(() => {});
       return;
@@ -202,7 +217,7 @@ export class SipSupervisor {
       actionAt: 0,
       queued: 0,
       queue: Promise.resolve(),
-      media,
+      journal,
       timer: setTimeout(() => {
         void this.stopCall(call).catch(() => {});
       }, this.credentialMs),
@@ -218,7 +233,20 @@ export class SipSupervisor {
       )
         throw error();
       if (this.isClosed(call)) return;
-      await this.ari.answer(channel.id);
+      await call.journal.reserve();
+      if (this.isClosed(call)) return;
+      try {
+        call.media = this.createMedia(id, channel.id, call.journal);
+      } catch {
+        await call.journal.uncertain().catch(() => {});
+        throw error();
+      }
+      await call.journal.mutate("answer", () => {
+        // A journal round trip may finish after local termination. No ARI
+        // request has been issued, so this cancellation is definitive.
+        if (this.isClosed(call)) throw new AriRequestError("rejected");
+        return this.ari.answer(channel.id);
+      });
       const [signaling, media] = await Promise.all([
         this.ari.getChannelVariable(channel.id, "CHANNEL(pjsip,secure)"),
         this.ari.getChannelVariable(channel.id, "CHANNEL(rtp,secure)"),
@@ -279,6 +307,7 @@ export class SipSupervisor {
           locator,
           pin,
           callId: call.id,
+          ownerId: call.journal.ownerId,
           trunkId: this.config.trunkId,
           ...(/^\+[1-9]\d{6,14}$/.test(caller ?? "")
             ? { callerId: caller }
@@ -311,6 +340,7 @@ export class SipSupervisor {
                 async close() {},
               });
             }
+            if (!call.media) throw error();
             const bridge = await call.media.open(failure);
             if (call.phase !== "closed") call.phase = "active";
             let previous: CallPolicy | undefined;
@@ -320,7 +350,14 @@ export class SipSupervisor {
                 return bridge.needsReconnect;
               },
               refreshGrant: (grant) => bridge.refreshGrant?.(grant),
-              close: () => bridge.close(),
+              close: async () => {
+                const stopped = await this.stopJournal(call).then(
+                  () => true,
+                  () => false,
+                );
+                await bridge.close();
+                if (!stopped) throw error();
+              },
               meeting: async (
                 grant: MeetingGrant | undefined,
                 policy: CallPolicy,
@@ -377,7 +414,7 @@ export class SipSupervisor {
     // DELETE before a pending POST finishes could return 404 and leave a late
     // announcement playing. Preserve ownership until creation has settled.
     await playback.creating?.catch(() => {});
-    await this.ari.stopPlayback(playback.id);
+    if (playback.id) await this.ari.stopPlayback(playback.id);
   }
   private async prompt(call: Call, name: string, wait: boolean) {
     if (call.phase === "closed" || !names.has(name)) throw error();
@@ -388,15 +425,16 @@ export class SipSupervisor {
       finish = (reason) => (reason ? reject(reason) : resolve());
     });
     void done.catch(() => {});
-    const playback: Playback = { id: `cm-play-${randomUUID()}`, finish };
+    const playback: Playback = { id: "", finish };
     call.playback = playback;
     const timer = setTimeout(() => finish(error()), 8000);
     try {
-      const creating = this.ari.play(
-        call.channel.id,
-        playback.id,
-        `covemeet-${name}`,
-      );
+      const creating = call.journal.mutate("play", (dialog) => {
+        if (this.isClosed(call)) throw new AriRequestError("rejected");
+        if (!dialog.playbackId) throw error();
+        playback.id = dialog.playbackId;
+        return this.ari.play(call.channel.id, playback.id, `covemeet-${name}`);
+      });
       playback.creating = creating;
       const result = await creating;
       if (result.state === "failed") throw error();
@@ -420,30 +458,59 @@ export class SipSupervisor {
       }
     }
   }
-  private async closeNative(call: Call) {
-    // setup() may still be answering a channel. Do not confirm closure until it
-    // has settled and all scoped legs have been removed and verified.
-    await call.setup?.catch(() => {});
-    const results = await Promise.allSettled([
-      this.cancelPrompt(call),
-      this.ari.hangup(call.channel.id),
-      call.media.close(),
-    ]);
-    const remains = await this.ari.getChannel(call.channel.id);
-    if (remains || results.some((result) => result.status === "rejected"))
-      throw error();
-  }
-  private stopCall(call: Call): Promise<void> {
-    if (call.stopping) return call.stopping;
+  private markClosed(call: Call) {
     call.phase = "closed";
     call.digits = "";
     call.locator = "";
     clearTimeout(call.timer);
     clearTimeout(call.lifetime);
     call.playback?.finish(error());
+  }
+  private stopJournal(call: Call): Promise<void> {
+    this.markClosed(call);
+    return (call.journalStopping ??= (async () => {
+      // No late answer or initial playback may outlive the terminal marker.
+      await call.setup?.catch(() => {});
+      await call.journal.stop();
+    })());
+  }
+  private async closeNative(call: Call) {
+    // Revocation is attempted first; a lost authority response must never
+    // prevent best-effort carrier teardown or release an uncertain slot.
+    const stopped = await this.stopJournal(call).then(
+      () => true,
+      () => false,
+    );
+    const results = await Promise.allSettled([
+      this.cancelPrompt(call),
+      this.ari.hangup(call.channel.id),
+      call.media?.close(),
+    ]);
+    const remains = await this.ari.getChannel(call.channel.id);
+    if (
+      !stopped ||
+      remains ||
+      results.some((result) => result.status === "rejected")
+    )
+      throw error();
+  }
+  private stopCall(call: Call): Promise<void> {
+    if (call.stopping) return call.stopping;
+    this.markClosed(call);
     call.stopping = (async () => {
       if (call.relay) await call.relay.stop();
       else await this.closeNative(call);
+      if (call.journal.createOutcome === "unknown") throw error();
+      if (call.journal.createOutcome === "reserved")
+        await call.journal.finish({
+          allocationsStopped: true,
+          callerAbsent: true,
+          outboundAbsent: true,
+          bridgeAbsent: true,
+          nativeAbsent: true,
+          holdingRelayAbsent: true,
+          rtcClosed: true,
+        });
       this.calls.delete(call.channel.id);
     })();
     // Keep uncertain calls counted against the local cap for reconciliation.

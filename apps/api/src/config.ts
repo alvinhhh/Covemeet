@@ -96,7 +96,7 @@ export function loadConfig(env = process.env) {
     7200,
     7200,
   );
-  if (phoneEnabled) {
+  if (phoneEnabled || phoneGatewayKey !== "") {
     if (
       phoneGatewayKey.length < 32 ||
       [
@@ -109,6 +109,8 @@ export function loadConfig(env = process.env) {
       throw new Error(
         "Phone gateway requires an independent random key of at least 32 characters",
       );
+  }
+  if (phoneEnabled) {
     if (!/^[A-Za-z0-9_.:-]{1,80}$/.test(phoneTrunkId))
       throw new Error("PHONE_TRUNK_ID is required");
     if (!phoneDialInNumber && !phoneSipAddress)
@@ -141,6 +143,8 @@ export function loadConfig(env = process.env) {
     livekitSecret: env.LIVEKIT_API_SECRET ?? env.LIVEKIT_SECRET ?? "",
     mediaUrl: env.LIVEKIT_PUBLIC_URL ?? "ws://localhost:4100",
     phoneEnabled,
+    // Only the isolated RTC stand-in tests may omit native dialog ownership.
+    phoneAllowUnjournaledTestCalls: env.NODE_ENV === "test",
     phoneGatewayKey,
     phoneTrunkId,
     phoneDialInNumber,

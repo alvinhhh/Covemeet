@@ -195,6 +195,7 @@ test("ARI authenticates HTTP and WS only in headers and exposes exact scoped ope
     playback,
   );
   assert.deepEqual(await f.client.createBridge(bridge.id), bridge);
+  assert.deepEqual(await f.client.getBridge(bridge.id), bridge);
   await f.client.addChannel(bridge.id, channel.id);
   await f.client.stopPlayback(playback.id);
   await f.client.destroyBridge(bridge.id);
@@ -322,6 +323,7 @@ test("ARI treats only confirmed 404 as absent or idempotent deletion", async (t)
   );
   await f.client.connect();
   assert.equal(await f.client.getChannel(channel.id), undefined);
+  assert.equal(await f.client.getBridge(bridge.id), undefined);
   await f.client.hangup(channel.id);
   await f.client.stopPlayback(playback.id);
   await f.client.destroyBridge(bridge.id);

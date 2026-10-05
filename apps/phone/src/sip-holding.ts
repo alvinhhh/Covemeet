@@ -12,6 +12,7 @@ import { AudioBridgeOpenError, type AudioBridge } from "./relay.js";
 import { openRtcBridge } from "./rtc.js";
 import { isHoldingRoom } from "./holding-name.js";
 import type { SupervisedMedia } from "./supervisor.js";
+import type { CallJournal, PhoneMutation } from "./journal.js";
 
 type SipAri = Pick<
   AriClient,
@@ -20,6 +21,7 @@ type SipAri = Pick<
   | "getChannelVariable"
   | "hangup"
   | "createBridge"
+  | "getBridge"
   | "addChannel"
   | "destroyBridge"
 >;
@@ -61,6 +63,9 @@ export class SipHolding implements SupervisedMedia {
   private opening?: Promise<AudioBridge>;
   private closing?: Promise<void>;
   private stopped = false;
+  private allocationAttempted = false;
+  private outboundOwned = false;
+  private bridgeOwned = false;
   private uncertain = false;
   private native?: { room: string; identity: string };
   private rtc?: AudioBridge;
@@ -68,6 +73,7 @@ export class SipHolding implements SupervisedMedia {
     private config: SipHoldingConfig,
     private ari: SipAri,
     private rooms: Rooms,
+    private journal: Pick<CallJournal, "mutate" | "holding" | "uncertain">,
     private openHolding: typeof openRtcBridge = openRtcBridge,
   ) {
     if (
@@ -98,9 +104,17 @@ export class SipHolding implements SupervisedMedia {
       );
     });
   }
-  private async mutate<T>(operation: () => Promise<T>): Promise<T> {
+  private async mutate<T>(
+    name: PhoneMutation,
+    operation: () => Promise<T>,
+  ): Promise<T> {
     try {
-      return await operation();
+      return await this.journal.mutate(name, () => {
+        // The durable intent round trip may finish after local termination.
+        // No request was issued, so cancellation has a definitive outcome.
+        if (this.stopped) throw new AriRequestError("rejected");
+        return operation();
+      });
     } catch (error) {
       if (!(error instanceof AriRequestError) || error.outcome === "unknown")
         this.uncertain = true;
@@ -110,7 +124,10 @@ export class SipHolding implements SupervisedMedia {
   open(onFailure: () => void): Promise<AudioBridge> {
     if (this.opening) return this.opening;
     this.opening = this.connect(onFailure).catch((error) => {
-      if (error instanceof AudioBridgeOpenError) throw error;
+      if (error instanceof AudioBridgeOpenError) {
+        this.rtc = error.bridge;
+        throw error;
+      }
       // A pre-answer holding connection may already own RTC resources. Its
       // cleanup and the independently owned native legs must both succeed.
       throw new AudioBridgeOpenError(this.rtc ?? noRtc);
@@ -121,15 +138,24 @@ export class SipHolding implements SupervisedMedia {
     this.check();
     if ((await this.matchingRooms()).length)
       throw new Error("SIP dialog destination already exists");
+    if (
+      (await this.ari.getChannel(this.outboundId)) ||
+      (await this.ari.getBridge(this.bridgeId))
+    )
+      throw new Error("SIP dialog resource already exists");
     this.check();
-    await this.mutate(() =>
-      this.ari.originate({
+    await this.mutate("originate", async () => {
+      this.check();
+      this.allocationAttempted = true;
+      const channel = await this.ari.originate({
         channelId: this.outboundId,
         endpoint: `PJSIP/${this.destination}@${this.config.outboundEndpoint}`,
         appArgs: ["outbound", this.config.callId],
         timeoutSeconds: 5,
-      }),
-    );
+      });
+      this.outboundOwned = true;
+      return channel;
+    });
     this.check();
     const deadline = Date.now() + 6000;
     const relayIdentity = `cm-relay-${this.config.callId}`;
@@ -181,6 +207,12 @@ export class SipHolding implements SupervisedMedia {
         ) {
           this.native = { room: room.name, identity: peer.identity };
           if (!this.rtc) {
+            await this.journal.holding({
+              roomName: room.name,
+              roomSid: room.sid,
+              nativeIdentity: peer.identity,
+              nativeSid: peer.sid,
+            });
             // Native SIP waits to subscribe to remote audio before SIP 200.
             // Open only the isolated, silent holding leg at this point. No
             // original PBX bridge or meeting grant exists until verification.
@@ -199,20 +231,30 @@ export class SipHolding implements SupervisedMedia {
             });
             const jwt = await token.toJwt();
             this.check();
-            this.rtc = await this.openHolding(
-              {
-                holding: {
-                  roomName: room.name,
-                  participantIdentity: peer.identity,
-                  url: this.config.livekitWsUrl,
-                  token: jwt,
+            try {
+              this.rtc = await this.openHolding(
+                {
+                  holding: {
+                    roomName: room.name,
+                    participantIdentity: peer.identity,
+                    url: this.config.livekitWsUrl,
+                    token: jwt,
+                  },
+                  meetingOrigin: this.config.meetingOrigin,
+                  development: this.config.development,
                 },
-                meetingOrigin: this.config.meetingOrigin,
-                development: this.config.development,
-              },
-              onFailure,
-              () => {},
-            );
+                onFailure,
+                () => {},
+              );
+            } catch (error) {
+              if (error instanceof AudioBridgeOpenError)
+                this.rtc = error.bridge;
+              else {
+                this.uncertain = true;
+                await this.journal.uncertain().catch(() => {});
+              }
+              throw error;
+            }
             this.check();
           }
           if (
@@ -229,13 +271,17 @@ export class SipHolding implements SupervisedMedia {
     if (!verified || !this.rtc)
       throw new Error("SIP call binding deadline exceeded");
     this.check();
-    await this.mutate(() => this.ari.createBridge(this.bridgeId));
+    await this.mutate("create-bridge", async () => {
+      const bridge = await this.ari.createBridge(this.bridgeId);
+      this.bridgeOwned = true;
+      return bridge;
+    });
     this.check();
-    await this.mutate(() =>
+    await this.mutate("attach-outbound", () =>
       this.ari.addChannel(this.bridgeId, this.outboundId),
     );
     this.check();
-    await this.mutate(() =>
+    await this.mutate("attach-caller", () =>
       this.ari.addChannel(this.bridgeId, this.config.callerChannelId),
     );
     this.check();
@@ -247,12 +293,32 @@ export class SipHolding implements SupervisedMedia {
     this.stopped = true;
     this.closing = (async () => {
       await this.opening?.catch(() => {});
+      if (!this.allocationAttempted) {
+        // A collision seen before allocation is not ownership. Preserve it for
+        // reconciliation rather than deleting another dialog's resources.
+        if (
+          (await this.ari.getChannel(this.outboundId)) ||
+          (await this.ari.getBridge(this.bridgeId)) ||
+          (await this.matchingRooms()).length
+        )
+          throw new Error(
+            "Unowned SIP holding resources require reconciliation",
+          );
+        return;
+      }
       const results = await Promise.allSettled([
-        this.ari.hangup(this.outboundId),
-        this.ari.destroyBridge(this.bridgeId),
+        this.rtc?.close(),
+        this.outboundOwned
+          ? this.ari.hangup(this.outboundId)
+          : Promise.resolve(),
+        this.bridgeOwned
+          ? this.ari.destroyBridge(this.bridgeId)
+          : Promise.resolve(),
       ]);
       if (await this.ari.getChannel(this.outboundId))
         throw new Error("SIP outbound leg remains");
+      if (await this.ari.getBridge(this.bridgeId))
+        throw new Error("SIP bridge remains");
       const matches = await this.matchingRooms();
       for (const room of matches) {
         if (!isHoldingRoom(room.name))
@@ -265,7 +331,9 @@ export class SipHolding implements SupervisedMedia {
           });
         for (const peer of peers) {
           if (
+            !this.outboundOwned ||
             peer.kind !== 3 ||
+            peer.identity !== nativeIdentity ||
             peer.attributes["sip.trunkID"] !== this.config.sipTrunkId ||
             peer.attributes["sip.ruleID"] !== this.config.sipRuleId
           )
@@ -282,8 +350,8 @@ export class SipHolding implements SupervisedMedia {
             if (absent(error)) return [];
             throw error;
           });
-        if (remaining.some((peer) => peer.kind === 3))
-          throw new Error("Native SIP participant remains");
+        if (remaining.length)
+          throw new Error("SIP holding participant remains");
       }
       if (
         this.uncertain ||

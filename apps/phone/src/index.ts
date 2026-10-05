@@ -34,3 +34,16 @@ export {
   type SupervisedMedia,
 } from "./supervisor.js";
 export { SipHolding, type SipHoldingConfig } from "./sip-holding.js";
+
+export {
+  JournalRegistry,
+  type JournalRegistryConfig,
+  type JournalAuthority,
+  type CallJournal,
+  type PhoneDialog,
+  type PhoneDialogInput,
+  type PhoneDialogChange,
+  type PhoneMutation,
+  type PhoneHoldingBinding,
+  type PhoneCleanupProof,
+} from "./journal.js";

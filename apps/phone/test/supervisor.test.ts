@@ -16,6 +16,7 @@ import type {
   PhoneSession,
 } from "../src/authority.js";
 import type { AudioBridge } from "../src/relay.js";
+import type { CallJournal, PhoneDialog } from "../src/journal.js";
 
 const deferred = <T = void>() => {
   let resolve!: (value: T) => void;
@@ -122,6 +123,41 @@ function fixture(t: TestContext, config: Partial<SupervisorConfig> = {}) {
     },
   };
   let constructionFails = false;
+  const ownerId = randomUUID();
+  let outcome: CallJournal["createOutcome"] = "unattempted";
+  let uncertain = false;
+  let playbackRevision = 0;
+  const journal: CallJournal = {
+    ownerId,
+    get createOutcome() {
+      return outcome;
+    },
+    async reserve() {
+      log.push("journal:reserve");
+      outcome = "reserved";
+    },
+    async mutate(operation, action) {
+      log.push(`journal:begin:${operation}`);
+      const result = await action({
+        playbackId: `cm-play-${randomUUID()}-${++playbackRevision}`,
+      } as PhoneDialog);
+      log.push(`journal:confirmed:${operation}`);
+      return result;
+    },
+    async holding() {},
+    async uncertain() {
+      uncertain = true;
+      log.push("journal:uncertain");
+    },
+    async stop() {
+      log.push("journal:stop");
+    },
+    async finish(proof) {
+      assert(Object.values(proof).every((value) => value === true));
+      if (uncertain) throw new Error("synthetic unresolved allocation");
+      log.push("journal:finish");
+    },
+  };
   const supervisor = new SipSupervisor(
     { ...configuration, ...config },
     ari,
@@ -130,6 +166,7 @@ function fixture(t: TestContext, config: Partial<SupervisorConfig> = {}) {
       if (constructionFails) throw new Error("synthetic allocation failure");
       return media;
     },
+    { forCall: () => journal },
   );
   t.after(async () => {
     await supervisor.stop().catch(() => {});
@@ -204,6 +241,10 @@ function fixture(t: TestContext, config: Partial<SupervisorConfig> = {}) {
     },
     policy(value: Partial<CallPolicy>) {
       policy = { ...policy, ...value };
+    },
+    journal,
+    setCreateOutcome(value: CallJournal["createOutcome"]) {
+      outcome = value;
     },
     grant: {
       token: "t".repeat(64),
@@ -362,7 +403,7 @@ test("authority-ended calls close both legs and acknowledge leave", async (t) =>
   assert(f.log.indexOf("authority:leave") > f.log.indexOf("rtc:closed"));
 });
 
-test("unknown application channels and synchronous media construction failures are hung up", async (t) => {
+test("unknown application channels are hung up; failed media construction retains its reservation", async (t) => {
   const f = fixture(t);
   const wrongContext = f.channel();
   wrongContext.dialplan!.context = "other-context";
@@ -375,7 +416,9 @@ test("unknown application channels and synchronous media construction failures a
       f.log.includes(`hangup:${c.id}`),
     ),
   );
-  assert.equal(f.supervisor.status.calls, 0);
+  assert.equal(f.supervisor.status.calls, 1);
+  assert.equal(f.supervisor.status.unresolved, 1);
+  assert.equal(f.log.includes("journal:finish"), false);
   assert.equal(f.joins.length, 0);
 });
 
@@ -418,3 +461,104 @@ test("early DTMF waits for late prompt creation before cancelling and starting t
   );
   assert.equal(f.joins.length, 0);
 });
+
+test("supervisor reserves before answer and finishes only after journal revocation and both media paths close", async (t) => {
+  const f = fixture(t),
+    c = f.start();
+  await f.credentials(c);
+  await until(() => f.log.includes("meeting:waiting"));
+  await f.supervisor.stop();
+  assert.equal(f.joins[0].ownerId, f.journal.ownerId);
+  assert(f.log.indexOf("journal:reserve") < f.log.indexOf(`answer:${c.id}`));
+  assert(
+    f.log.indexOf("journal:begin:answer") < f.log.indexOf(`answer:${c.id}`),
+  );
+  assert(f.log.indexOf("journal:stop") < f.log.indexOf("rtc:closed"));
+  assert(f.log.indexOf("journal:stop") < f.log.indexOf("native:closed"));
+  assert(f.log.indexOf("journal:finish") > f.log.indexOf("authority:leave"));
+  assert(f.log.indexOf("journal:finish") > f.log.indexOf(`hangup:${c.id}`));
+});
+
+test("definitively rejected reservation releases local slot only after caller closure", async (t) => {
+  const f = fixture(t);
+  f.journal.reserve = async () => {
+    f.setCreateOutcome("rejected");
+    throw new Error("denied");
+  };
+  const c = f.start();
+  await until(() => f.supervisor.status.calls === 0);
+  assert(f.log.includes(`hangup:${c.id}`));
+  assert.equal(f.log.includes(`answer:${c.id}`), false);
+  assert.equal(f.log.includes("journal:finish"), false);
+});
+
+test("unknown reservation outcome retains local slot even after caller cleanup", async (t) => {
+  const f = fixture(t);
+  f.journal.reserve = async () => {
+    f.setCreateOutcome("unknown");
+    throw new Error("lost create response");
+  };
+  const c = f.start();
+  await until(() => f.log.includes(`hangup:${c.id}`));
+  await assert.rejects(f.supervisor.stop());
+  assert.equal(f.supervisor.status.calls, 1);
+  assert.equal(f.supervisor.status.unresolved, 1);
+  assert.equal(f.log.includes(`answer:${c.id}`), false);
+  assert.equal(f.log.includes("journal:finish"), false);
+});
+
+test("lost join response still stops its journal before native teardown", async (t) => {
+  const f = fixture(t),
+    c = f.start();
+  f.authority.join = async () => {
+    f.log.push("binding:created");
+    throw new Error("join response lost");
+  };
+  await f.credentials(c);
+  await until(() => f.supervisor.status.calls === 0);
+  assert(f.log.indexOf("journal:stop") > f.log.indexOf("binding:created"));
+  assert(f.log.indexOf("journal:stop") < f.log.indexOf("native:closed"));
+  assert(f.log.includes("journal:finish"));
+  assert.equal(f.log.includes("authority:leave"), false);
+});
+
+test("failed journal stop does not prevent caller cleanup and cannot release reservation", async (t) => {
+  const f = fixture(t),
+    c = f.start();
+  await f.credentials(c);
+  await until(() => f.log.includes("meeting:waiting"));
+  f.journal.stop = async () => {
+    throw new Error("revoke unavailable");
+  };
+  await assert.rejects(f.supervisor.stop());
+  assert(f.log.includes(`hangup:${c.id}`));
+  assert(f.log.includes("rtc:closed"));
+  assert(f.log.includes("native:closed"));
+  assert.equal(f.log.includes("journal:finish"), false);
+  assert.equal(f.supervisor.status.calls, 1);
+});
+
+for (const operation of ["answer", "play"] as const)
+  test(`late ${operation} journal acknowledgment cannot issue ARI after local termination`, async (t) => {
+    const f = fixture(t),
+      entered = deferred(),
+      pending = deferred();
+    const mutate = f.journal.mutate;
+    f.journal.mutate = async (name, action) => {
+      if (name === operation) {
+        entered.resolve();
+        await pending.promise;
+      }
+      return mutate(name, action);
+    };
+    const c = f.start();
+    await entered.promise;
+    const stopping = f.supervisor.stop();
+    pending.resolve();
+    await stopping;
+    if (operation === "answer")
+      assert.equal(f.log.includes(`answer:${c.id}`), false);
+    assert.equal(f.plays.length, 0);
+    assert(f.log.includes(`hangup:${c.id}`));
+    assert.equal(f.supervisor.status.calls, 0);
+  });

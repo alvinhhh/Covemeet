@@ -23,6 +23,7 @@ import { HttpAuthority } from "../../apps/phone/dist/authority.js";
 import { AriClient } from "../../apps/phone/dist/ari.js";
 import { SipSupervisor } from "../../apps/phone/dist/supervisor.js";
 import { SipHolding } from "../../apps/phone/dist/sip-holding.js";
+import { JournalRegistry } from "../../apps/phone/dist/journal.js";
 import { openGateway } from "../../apps/phone/dist/gateway.js";
 import { SipClient } from "./sip-client.mjs";
 
@@ -525,6 +526,16 @@ async function run() {
         value === "1";
     return value;
   };
+  const registry = new JournalRegistry(authority, {
+    ownerId: randomUUID(),
+    pbxId: "native-fixture",
+    // Identifies this disposable fixture only; not a production fencing proof.
+    pbxEpoch: report.runId,
+    outboundEndpoint: "covemeet-livekit",
+    sipTrunkId: trunk.sipTrunkId,
+    sipRuleId: rule.sipDispatchRuleId,
+  });
+  await registry.initialize();
   supervisor = new SipSupervisor(
     {
       inboundContext: "covemeet-inbound",
@@ -535,7 +546,7 @@ async function run() {
     },
     ari,
     observedAuthority,
-    (callId, callerChannelId) => {
+    (callId, callerChannelId, journal) => {
       const holding = new SipHolding(
         {
           callId,
@@ -551,10 +562,12 @@ async function run() {
         },
         ari,
         sfu,
+        journal,
       );
       holdings.push(holding);
       return holding;
     },
+    registry,
   );
   assert.equal(
     (await ari.listChannels()).length,
@@ -597,6 +610,20 @@ async function run() {
   const access = await host.call(`/meetings/${meeting.code}/phone`, {});
   const client = await startClient();
   const negotiated = await connected(client);
+  const preEntryDialogs = await store.queryPhoneDialogs({
+    pbxId: "native-fixture",
+  });
+  assert.equal(preEntryDialogs.length, 1);
+  assert.equal(preEntryDialogs[0].state, "open");
+  assert.equal(preEntryDialogs[0].binding, undefined);
+  assert(
+    ["pending", "confirmed"].includes(preEntryDialogs[0].operations.answer),
+  );
+  await check("native call owns durable capacity before credential entry", {
+    activeDialogs: 1,
+    meetingBindingPresent: false,
+    answerIntentPersisted: true,
+  });
   assert.equal(negotiated.verificationErrors, 0);
   assert(
     negotiated.tlsAllowedProtocols > 0 &&
@@ -721,6 +748,19 @@ async function run() {
     [phoneSession.participantId],
   );
   assert.equal(reserve.rows[0]?.released, true);
+  assert.equal(
+    (await store.queryPhoneDialogs({ pbxId: "native-fixture" })).length,
+    0,
+  );
+  const [finishedDialog] = await store.queryPhoneDialogs({
+    callId: preEntryDialogs[0].callId,
+  });
+  assert.equal(finishedDialog.state, "closed");
+  assert.equal(finishedDialog.uncertain, false);
+  assert.equal(
+    finishedDialog.binding.participantId,
+    phoneSession.participantId,
+  );
   assert(releaseAfterTeardown);
   await check(
     "kick removes native and meeting media before releasing reserved capacity",
@@ -810,6 +850,10 @@ async function run() {
     );
   }
   assert.equal(ariFailed, false);
+  assert.equal(
+    (await store.queryPhoneDialogs({ pbxId: "native-fixture" })).length,
+    0,
+  );
   report.result = "passed";
 }
 const watchdog = setTimeout(() => {

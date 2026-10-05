@@ -5,6 +5,7 @@ import { loadConfig } from "../src/config.js";
 import { createApp } from "../src/server.js";
 import { PgStore, type Meeting, type Participant } from "../src/store.js";
 import type { Media } from "../src/media.js";
+import type { PhoneDialogInput } from "../src/phone-dialogs.js";
 
 // Opt-in against a disposable database only; the runner removes its container.
 // Two independent pools/API instances must share the same reservation limit.
@@ -170,12 +171,129 @@ test(
         replayInOtherMeeting.statusCode < 500,
       "A call ID must never be rebound to another meeting after teardown",
     );
+    const freshCallId = randomUUID();
     const fresh = await apps[1]!.inject({
       method: "POST",
       url: "/api/internal/phone/calls",
       headers: gatewayHeaders,
-      payload: { ...requests[deniedIndex], callId: randomUUID() },
+      payload: { ...requests[deniedIndex], callId: freshCallId },
     });
     assert.equal(fresh.statusCode, 200, fresh.body);
+
+    // Clear only the calls created above, then exercise durable pre-IVR slots
+    // through the same two pools. No table reset or unrelated state deletion.
+    const legacy = responses.flatMap((response, index) =>
+      response.statusCode === 200
+        ? [{ ...response.json(), callId: requests[index]!.callId }]
+        : [],
+    );
+    legacy.push({ ...fresh.json(), callId: freshCallId });
+    for (const call of legacy) {
+      const leave = await apps[0]!.inject({
+        method: "POST",
+        url: `/api/internal/phone/calls/${call.code}/${call.participantId}`,
+        headers: gatewayHeaders,
+        payload: {
+          callId: call.callId,
+          sessionToken: call.sessionToken,
+          action: "leave",
+        },
+      });
+      assert.equal(leave.statusCode, 200, leave.body);
+    }
+    const dialogInput = (): PhoneDialogInput => ({
+      callId: randomUUID(),
+      ownerId: randomUUID(),
+      pbxId: "postgres-fixture",
+      pbxEpoch: "boot-1",
+      callerChannelId: `caller-${randomUUID()}`,
+      trunkId: "local-test",
+      inboundEndpoint: "inbound",
+      outboundEndpoint: "outbound",
+      sipTrunkId: "ST_test",
+      sipRuleId: "SDR_test",
+    });
+    const claims = await Promise.allSettled(
+      [0, 1, 2].map((index) =>
+        stores[index % 2]!.createPhoneDialog(dialogInput(), 2),
+      ),
+    );
+    const claimed = claims.flatMap((r) =>
+      r.status === "fulfilled" ? [r.value] : [],
+    );
+    assert.equal(
+      claimed.length,
+      2,
+      "Pre-IVR slots must serialize across API pools",
+    );
+    let dialog = claimed[0]!;
+    dialog = await stores[1]!.changePhoneDialog(
+      dialog.callId,
+      dialog.ownerId,
+      dialog.revision,
+      { type: "begin", operation: "answer" },
+    );
+    dialog = await stores[1]!.changePhoneDialog(
+      dialog.callId,
+      dialog.ownerId,
+      dialog.revision,
+      { type: "settle", operation: "answer", outcome: "confirmed" },
+    );
+    const bound = await apps[0]!.inject({
+      method: "POST",
+      url: "/api/internal/phone/calls",
+      headers: gatewayHeaders,
+      payload: {
+        ...requests[deniedIndex],
+        callId: dialog.callId,
+        ownerId: dialog.ownerId,
+      },
+    });
+    assert.equal(
+      bound.statusCode,
+      200,
+      "Binding an existing final slot must not count it twice",
+    );
+    const persisted = (
+      await stores[1]!.queryPhoneDialogs({ callId: dialog.callId })
+    )[0]!;
+    assert.equal(persisted.binding?.participantId, bound.json().participantId);
+    await stores[1]!.releasePhone(
+      dialog.callId,
+      persisted.binding!.code,
+      persisted.binding!.participantId,
+    );
+    await assert.rejects(
+      stores[0]!.createPhoneDialog(dialogInput(), 2),
+      /capacity/,
+    );
+    const stopped = await apps[1]!.inject({
+      method: "POST",
+      url: `/api/internal/phone/dialogs/${dialog.callId}/stop`,
+      headers: gatewayHeaders,
+      payload: { ownerId: dialog.ownerId, revision: persisted.revision },
+    });
+    assert.equal(stopped.statusCode, 200, stopped.body);
+    const finishedDialog = await apps[1]!.inject({
+      method: "POST",
+      url: `/api/internal/phone/dialogs/${dialog.callId}/finish`,
+      headers: gatewayHeaders,
+      payload: {
+        ownerId: dialog.ownerId,
+        revision: stopped.json().revision,
+        proof: {
+          allocationsStopped: true,
+          callerAbsent: true,
+          outboundAbsent: true,
+          bridgeAbsent: true,
+          nativeAbsent: true,
+          holdingRelayAbsent: true,
+          rtcClosed: true,
+        },
+      },
+    });
+    assert.equal(finishedDialog.statusCode, 200, finishedDialog.body);
+    assert.equal(finishedDialog.json().state, "closed");
+    await stores[0]!.createPhoneDialog(dialogInput(), 2);
   },
 );
