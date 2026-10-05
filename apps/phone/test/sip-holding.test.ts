@@ -641,6 +641,26 @@ test("successful bridge deletion acknowledgement does not prove actual bridge ab
   await assert.rejects(f.holding.close(), /SIP bridge remains/);
 });
 
+test("holding closure waits for acknowledged PBX teardown to become visible", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  const getChannel = f.ari.getChannel;
+  const getBridge = f.ari.getBridge;
+  let staleChannelReads = 2;
+  let staleBridgeReads = 2;
+  f.ari.getChannel = async (id) =>
+    id === f.holding.outboundId && staleChannelReads-- > 0
+      ? { id, name: "PJSIP/covemeet-livekit-fixture", state: "Up" }
+      : getChannel(id);
+  f.ari.getBridge = async (id) =>
+    id === f.holding.bridgeId && staleBridgeReads-- > 0
+      ? { id, channels: [] }
+      : getBridge(id);
+  await f.holding.close();
+  assert.equal(staleChannelReads, -1);
+  assert.equal(staleBridgeReads, -1);
+});
+
 test("holding closure waits for its RTC owner and preserves an unrelated peer", async () => {
   const f = fixture(),
     pending = deferred();

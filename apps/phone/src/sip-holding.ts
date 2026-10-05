@@ -288,6 +288,19 @@ export class SipHolding implements SupervisedMedia {
     return this.rtc;
   }
 
+  private async absentAfterTeardown(
+    read: () => Promise<unknown>,
+    owned: boolean,
+  ): Promise<boolean> {
+    // ARI can acknowledge a hangup before the channel disappears from reads.
+    for (let attempt = 0; attempt <= 30; attempt++) {
+      if (!(await read())) return true;
+      if (!owned || attempt === 30) return false;
+      await delay(100);
+    }
+    return false;
+  }
+
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.stopped = true;
@@ -315,9 +328,19 @@ export class SipHolding implements SupervisedMedia {
           ? this.ari.destroyBridge(this.bridgeId)
           : Promise.resolve(),
       ]);
-      if (await this.ari.getChannel(this.outboundId))
+      if (
+        !(await this.absentAfterTeardown(
+          () => this.ari.getChannel(this.outboundId),
+          this.outboundOwned,
+        ))
+      )
         throw new Error("SIP outbound leg remains");
-      if (await this.ari.getBridge(this.bridgeId))
+      if (
+        !(await this.absentAfterTeardown(
+          () => this.ari.getBridge(this.bridgeId),
+          this.bridgeOwned,
+        ))
+      )
         throw new Error("SIP bridge remains");
       const matches = await this.matchingRooms();
       for (const room of matches) {
