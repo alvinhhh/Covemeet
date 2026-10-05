@@ -881,7 +881,11 @@ test(
     await f.stores[0].setHostedEntitlement({
       ...grant,
       revision: 2,
-      quota: { ...grant.quota, recordingSecondsPerMonth: 30 },
+      quota: {
+        ...grant.quota,
+        recordingSecondsPerMonth: 30,
+        storageBytes: 1000,
+      },
     });
     for (const code of codes)
       await f.stores[0].change(code, (m) => {
@@ -909,6 +913,7 @@ test(
             (m) => {
               assert.equal(m.hosted!.billingOwnerId, owner);
             },
+            { maxBytes: 100, copies: 1 },
           ),
         ),
       ),
@@ -980,6 +985,147 @@ test(
         0,
       ),
       12345,
+    );
+  },
+);
+
+test(
+  "PostgreSQL storage reserves once across pools and keeps uncertain copies across restart and downgrade",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account(),
+      otherOwner = f.account();
+    const created = await Promise.all([
+      f.create(0, owner, randomUUID()),
+      f.create(1, owner, randomUUID()),
+      f.create(0, otherOwner, randomUUID()),
+    ]);
+    for (const response of created)
+      assert.equal(response.statusCode, 200, response.body);
+    const codes = created.map((r) => r.json().code);
+    const grant = (
+      await f.stores[0].pool.query(
+        "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+        [owner],
+      )
+    ).rows[0]!.data;
+    await f.stores[0].setHostedEntitlement({
+      ...grant,
+      revision: 2,
+      quota: {
+        ...grant.quota,
+        storageBytes: 1000,
+        recordingSecondsPerMonth: 3600,
+      },
+    });
+    for (const code of codes)
+      await f.stores[0].change(code, (m) => {
+        m.recordingAllowed = true;
+      });
+    const narrow = async () => {
+      const store = new PgStore(databaseUrl!);
+      await store.pool.end();
+      store.pool = new pg.Pool({
+        connectionString: databaseUrl,
+        max: 1,
+        connectionTimeoutMillis: 1000,
+      });
+      t.after(() => store.close());
+      return store;
+    };
+    const stores = await Promise.all([narrow(), narrow()]),
+      ids = [randomUUID(), randomUUID()];
+    const starts = await Promise.allSettled(
+      stores.map((store, i) =>
+        store.withRecordingLock(codes[i], ids[i]!, (lock) =>
+          lock.reserveRecording(
+            { id: ids[i]!, status: "starting", createdAt: Date.now() },
+            () => {},
+            { maxBytes: 1000, copies: 1 },
+          ),
+        ),
+      ),
+    );
+    assert.equal(starts.filter((r) => r.status === "fulfilled").length, 1);
+    assert.equal(starts.filter((r) => r.status === "rejected").length, 1);
+    const index = starts.findIndex((r) => r.status === "fulfilled"),
+      code = codes[index]!,
+      id = ids[index]!;
+    assert.deepEqual(
+      (await f.stores[0].hostedUsage(owner)).recordingStorageBytes,
+      { limit: 1000, used: 0, reserved: 1000, available: 0 },
+    );
+    const current = (await f.stores[0].get(code))!,
+      slot = current.recordings[0]!.storage!.attempts[0]!;
+    const metadata = {
+      version: 1 as const,
+      context: {
+        tenantId: "installation",
+        meetingId: current.id,
+        recordingId: id,
+      },
+      recordingKeyId: randomUUID(),
+      wrappedKey: {
+        provider: "fixture",
+        keyId: "fixture",
+        ciphertext: "wrapped",
+      },
+      plaintextBytes: 1,
+      encryptedBytes: 400,
+    };
+    await stores[index]!.withRecordingLock(code, id, (lock) =>
+      lock.prepareRecordingStorage(slot.id, { kind: "local", metadata }),
+    );
+    const restarted = await narrow();
+    await restarted.setHostedEntitlement({
+      ...grant,
+      revision: 3,
+      enabled: false,
+      quota: {
+        ...grant.quota,
+        storageBytes: 300,
+        recordingSecondsPerMonth: 3600,
+      },
+    });
+    assert.deepEqual(
+      (await restarted.hostedUsage(owner)).recordingStorageBytes,
+      { limit: 300, used: 0, reserved: 1000, available: 0 },
+    );
+    await assert.rejects(
+      restarted.withRecordingLock(code, id, (lock) =>
+        lock.releaseRecordingStorage(slot.id, { kind: "unused" }),
+      ),
+      /attempt changed/,
+    );
+    await restarted.withRecordingLock(code, id, async (lock) => {
+      const receipt = { version: 1 as const, published: true, bytes: 400 };
+      await lock.retainRecordingStorage(slot.id, {
+        kind: "local",
+        metadata,
+        receipt,
+      });
+      await lock.removeRecordingStorage(slot.id);
+      await lock.releaseRecordingStorage(slot.id, {
+        kind: "local",
+        metadata,
+        receipt,
+        removed: true,
+      });
+      await lock.releaseRecordingStorage(slot.id, {
+        kind: "local",
+        metadata,
+        receipt,
+        removed: true,
+      });
+    });
+    assert.deepEqual(
+      (await f.stores[1].hostedUsage(owner)).recordingStorageBytes,
+      { limit: 300, used: 0, reserved: 0, available: 300 },
+    );
+    assert.deepEqual(
+      (await f.stores[0].hostedUsage(otherOwner)).recordingStorageBytes,
+      { limit: 0, used: 0, reserved: 0, available: 0 },
     );
   },
 );

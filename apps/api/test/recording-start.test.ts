@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
-import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import {
+  access,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Transporter } from "nodemailer";
@@ -11,7 +19,11 @@ import {
   RoomCompositeEgressRequest,
   type EncodedFileOutput,
 } from "livekit-server-sdk";
-import { LocalKeyProvider } from "@meeting-platform/recording";
+import {
+  LocalKeyProvider,
+  type RecordingObjectReference,
+  type RecordingObjectStorage,
+} from "@meeting-platform/recording";
 import { loadConfig } from "../src/config.js";
 import { RecordingService, type RecorderClient } from "../src/recordings.js";
 import { MemoryStore, type Meeting } from "../src/store.js";
@@ -135,7 +147,11 @@ async function fixture(t: TestContext, timestamped = false) {
   };
 }
 
-async function hostedFixture(t: TestContext, seconds = 90) {
+async function hostedFixture(
+  t: TestContext,
+  seconds = 90,
+  storageBytes = 3_000_000_000,
+) {
   const now = Date.UTC(2026, 9, 5, 12);
   t.mock.timers.enable({ apis: ["Date"], now });
   const f = await fixture(t, true);
@@ -154,6 +170,7 @@ async function hostedFixture(t: TestContext, seconds = 90) {
       anchorAt: Date.UTC(2026, 8, 5, 12),
       participantSecondsPerMonth: 360_000,
       recordingSecondsPerMonth: seconds,
+      storageBytes,
     },
   });
   await f.store.change(f.meeting.code, (m) => {
@@ -172,6 +189,280 @@ async function hostedFixture(t: TestContext, seconds = 90) {
   };
   return { ...f, now, owner, current, usage, another };
 }
+
+test("hosted ciphertext is accounted through key rotation and failed retention cleanup", async (t) => {
+  const f = await hostedFixture(t, 90, 2000);
+  await f.service.start(await f.current());
+  const id = (await f.row()).id;
+  await writeFile(
+    path.join(f.directory, "raw", `${id}.mp4`),
+    Buffer.alloc(400, 42),
+    { mode: 0o600 },
+  );
+  f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;
+  f.jobs[0]!.endedAt = BigInt(f.now + 1000) * 1_000_000n;
+  t.mock.timers.tick(2000);
+  await f.reconcile();
+  const ready = await f.row();
+  assert.equal(ready.status, "ready");
+  const bytes = ready.metadata.encryptedBytes;
+  assert.deepEqual((await f.store.hostedUsage(f.owner)).recordingStorageBytes, {
+    limit: 2000,
+    used: bytes,
+    reserved: 0,
+    available: 2000 - bytes,
+  });
+  const encrypted = path.join(
+    f.directory,
+    "encrypted",
+    `${id}.${ready.ciphertextId}.mprec`,
+  );
+  await access(`${encrypted}.closed`);
+  await assert.rejects(access(path.join(f.directory, "raw", `${id}.mp4`)));
+  await f.service.rotateKey(await f.current(), id);
+  assert.equal(
+    (await f.store.hostedUsage(f.owner)).recordingStorageBytes.used,
+    bytes,
+  );
+  t.mock.timers.tick(8 * 86400000);
+  const service = f.service as unknown as {
+    removeFile(file: string): Promise<void>;
+  };
+  const remove = service.removeFile.bind(service);
+  service.removeFile = async (file) => {
+    if (file === encrypted) throw new Error("Synthetic local removal failure");
+    return remove(file);
+  };
+  await f.reconcile();
+  assert.equal((await f.row()).status, "deleting");
+  assert.ok((await f.row()).metadata);
+  assert.equal(
+    (await f.store.hostedUsage(f.owner)).recordingStorageBytes.used,
+    bytes,
+  );
+  service.removeFile = remove;
+  await f.reconcile();
+  assert.equal((await f.row()).status, "deleted");
+  assert.equal((await f.row()).metadata, undefined);
+  assert.equal(
+    (await f.store.hostedUsage(f.owner)).recordingStorageBytes.available,
+    2000,
+  );
+  await assert.rejects(access(encrypted));
+  await access(`${encrypted}.closed`);
+});
+
+test("closed owned ciphertext recovers after the selected metadata commit is lost without a second allocation", async (t) => {
+  const f = await hostedFixture(t, 90, 2000);
+  await f.service.start(await f.current());
+  const id = (await f.row()).id;
+  await writeFile(
+    path.join(f.directory, "raw", `${id}.mp4`),
+    Buffer.alloc(400, 42),
+    { mode: 0o600 },
+  );
+  f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;
+  f.jobs[0]!.endedAt = BigInt(f.now + 1000) * 1_000_000n;
+  t.mock.timers.tick(2000);
+  await f.service.reconcile(await f.current(), "capture");
+  const original = f.store.withRecordingLock.bind(f.store);
+  f.store.withRecordingLock = (code, recordingId, work) =>
+    original(code, recordingId, (lock) =>
+      work({
+        ...lock,
+        change: async (change) => {
+          const r = (await lock.get())!.recordings.find(
+            (r) => r.id === recordingId,
+          )!;
+          if (
+            !r.metadata &&
+            r.storage?.attempts.some(
+              (a) => a.proof?.kind === "local" && a.proof.receipt.published,
+            )
+          )
+            throw new Error("Synthetic lost selected-metadata commit");
+          return lock.change(change);
+        },
+      }),
+    );
+  await f.service.reconcile(await f.current(), "files");
+  assert.equal((await f.row()).metadata, undefined);
+  assert.equal((await f.row()).storage!.attempts.length, 1);
+  const charged = (await f.store.hostedUsage(f.owner)).recordingStorageBytes
+    .used;
+  assert.ok(charged > 0);
+  f.store.withRecordingLock = original;
+  await f.service.reconcile(await f.current(), "files");
+  assert.equal((await f.row()).status, "ready");
+  assert.equal((await f.row()).storage!.attempts.length, 1);
+  assert.equal(
+    (await f.store.hostedUsage(f.owner)).recordingStorageBytes.used,
+    charged,
+  );
+  assert.equal(
+    (await readdir(path.join(f.directory, "encrypted"))).filter((file) =>
+      file.endsWith(".mprec"),
+    ).length,
+    1,
+  );
+});
+
+test("storage ceiling stops capture before a failed listing and rejects an oversized terminal spool", async (t) => {
+  const f = await hostedFixture(t, 90, 2000);
+  await f.service.start(await f.current());
+  const id = (await f.row()).id,
+    raw = path.join(f.directory, "raw", `${id}.mp4`);
+  await writeFile(raw, Buffer.alloc(1850), { mode: 0o600 });
+  f.controls.listFailures = 1;
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.row()).status, "stopping");
+  assert.deepEqual(f.stops, [f.jobs[0]!.egressId]);
+  assert.equal(
+    (await f.store.hostedUsage(f.owner)).recordingStorageBytes.reserved,
+    2000,
+  );
+  // Shutdown can overshoot the raw target, but no unfunded ciphertext is written.
+  await writeFile(raw, Buffer.alloc(2000), { mode: 0o600 });
+  f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;
+  f.jobs[0]!.endedAt = BigInt(f.now + 1000) * 1_000_000n;
+  t.mock.timers.tick(2000);
+  await f.reconcile();
+  assert.equal((await f.row()).status, "failed");
+  assert.equal((await f.row()).rawCleanupPending, true);
+  assert.deepEqual(await readdir(path.join(f.directory, "encrypted")), []);
+  await f.reconcile();
+  assert.equal((await f.row()).rawCleanupPending, undefined);
+  assert.equal(
+    (await f.store.hostedUsage(f.owner)).recordingStorageBytes.available,
+    2000,
+  );
+  await assert.rejects(access(raw));
+});
+
+test("owned object upload recovers a lost response and retains capacity until every copy is fenced or removed", async (t) => {
+  const f = await hostedFixture(t, 90, 4000);
+  let ciphertext: Buffer | undefined,
+    reference: RecordingObjectReference | undefined;
+  let puts = 0,
+    failFence = true;
+  const storage: RecordingObjectStorage = {
+    async put() {
+      throw new Error("Legacy upload must not run for paid storage");
+    },
+    async delete() {
+      throw new Error("Legacy deletion must not run for paid storage");
+    },
+    async read(ref) {
+      assert.deepEqual(ref, reference);
+      if (!ciphertext) throw new Error("Object unavailable");
+      return Readable.from([ciphertext]);
+    },
+    async putOwned(file, metadata, _context, _provider, options) {
+      puts++;
+      const data = await readFile(file);
+      const intent = {
+        provider: "s3-single" as const,
+        storageId: "b".repeat(64),
+        key: `owned/${metadata.recordingKeyId}`,
+        bytes: data.length,
+        sha256: createHash("sha256").update(data).digest("hex"),
+      };
+      await options.onPrepared(intent);
+      ciphertext = data;
+      reference = {
+        provider: "s3",
+        key: intent.key,
+        bytes: intent.bytes,
+        sha256: intent.sha256,
+        etag: "data-etag",
+        versionId: "data-version",
+      };
+      throw new Error("Provider completed but response was lost");
+    },
+    async recoverOwned(intent) {
+      assert.equal(intent.key, reference?.key);
+      return reference ?? null;
+    },
+    async fenceOwned(intent) {
+      if (failFence) throw new Error("Provider cleanup unavailable");
+      assert.equal(intent.key, reference?.key);
+      ciphertext = undefined;
+      return {
+        provider: "s3-single",
+        storageId: intent.storageId,
+        key: intent.key,
+        etag: "fence-etag",
+        versionId: "fence-version",
+        bytes: 0,
+        cleaned: true,
+      };
+    },
+  };
+  const service = new RecordingService(
+    { ...f.config, recordingStorage: "s3" },
+    f.store,
+    {} as Transporter,
+    f.client,
+    { objectStorage: storage },
+  );
+  await service.start(await f.current());
+  const id = (await f.row()).id;
+  await writeFile(
+    path.join(f.directory, "raw", `${id}.mp4`),
+    Buffer.alloc(400, 42),
+    { mode: 0o600 },
+  );
+  f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;
+  f.jobs[0]!.endedAt = BigInt(f.now + 1000) * 1_000_000n;
+  t.mock.timers.tick(2000);
+  await service.reconcile(await f.current());
+  const pending = await f.row(),
+    bytes = pending.metadata.encryptedBytes;
+  assert.equal(pending.status, "encrypting");
+  assert.deepEqual((await f.store.hostedUsage(f.owner)).recordingStorageBytes, {
+    limit: 4000,
+    used: bytes,
+    reserved: 2000,
+    available: 2000 - bytes,
+  });
+  await service.reconcile(await f.current());
+  const ready = await f.row();
+  assert.equal(ready.status, "ready");
+  assert.equal(
+    puts,
+    1,
+    "Recover the exact committed intent before another PUT",
+  );
+  assert.deepEqual((await f.store.hostedUsage(f.owner)).recordingStorageBytes, {
+    limit: 4000,
+    used: bytes,
+    reserved: 0,
+    available: 4000 - bytes,
+  });
+  const encrypted = path.join(
+    f.directory,
+    "encrypted",
+    `${id}.${ready.ciphertextId}.mprec`,
+  );
+  await assert.rejects(access(encrypted));
+  await access(`${encrypted}.closed`);
+  await service.rotateKey(await f.current(), id);
+  t.mock.timers.tick(8 * 86400000);
+  await service.reconcile(await f.current());
+  assert.equal((await f.row()).status, "deleting");
+  assert.ok((await f.row()).metadata);
+  assert.equal(
+    (await f.store.hostedUsage(f.owner)).recordingStorageBytes.used,
+    bytes,
+  );
+  failFence = false;
+  await service.reconcile(await f.current());
+  assert.equal((await f.row()).status, "deleted");
+  assert.equal(
+    (await f.store.hostedUsage(f.owner)).recordingStorageBytes.available,
+    4000,
+  );
+});
 
 test("hosted recording settles verified job time once before file finalization", async (t) => {
   const f = await hostedFixture(t);
@@ -415,7 +706,7 @@ test(
   "blocked encryption does not prevent another room's capture-phase stop",
   { timeout: 10_000 },
   async (t) => {
-    const f = await hostedFixture(t);
+    const f = await hostedFixture(t, 90, 6_000_000_000);
     await f.service.start(await f.current());
     const first = await f.row();
     f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;

@@ -7,6 +7,7 @@ import {
   type HostedEntitlement,
 } from "./meeting-limits.js";
 import { HttpError } from "./security.js";
+import { recordingStorageView } from "./recording-storage-quota.js";
 
 export const PARTICIPANT_PREPAY_MS = 30_000;
 export const PARTICIPANT_PRESENCE_MS = 15_000;
@@ -189,6 +190,7 @@ export function usageView(
       available: Math.max(0, downloadLimit - downloadUsed),
     },
     recordingSeconds: recordingTimeView(ledger, grant, meetings, now),
+    recordingStorageBytes: recordingStorageView(grant, meetings),
     asOf: now,
     blocked: usageBlocked(grant, meetings, now) || used + reserved > limit,
   };

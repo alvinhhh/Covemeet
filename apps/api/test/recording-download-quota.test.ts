@@ -50,7 +50,14 @@ async function fixture(
     bans: { ip: [], device: [] },
     breakouts: [],
     messages: [],
-    recordings: [{ id: "recording", status: "ready", passwordHash: "initial" }],
+    recordings: [
+      {
+        id: "recording",
+        status: "ready",
+        passwordHash: "initial",
+        storage: { billingOwnerId: owner, maxBytes: 100, attempts: [] },
+      },
+    ],
   };
   await store.create(m);
   const debit = (bytes: number, authorize: (m: Meeting) => void = () => {}) =>

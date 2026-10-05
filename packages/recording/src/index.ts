@@ -3,10 +3,18 @@ import {
   createDecipheriv,
   createHash,
   randomBytes,
+  randomUUID,
   timingSafeEqual,
 } from "node:crypto";
 import { constants } from "node:fs";
-import { open, realpath, unlink, type FileHandle } from "node:fs/promises";
+import {
+  link,
+  open,
+  realpath,
+  rename,
+  unlink,
+  type FileHandle,
+} from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 import { Readable } from "node:stream";
 import * as argon2 from "argon2";
@@ -47,6 +55,19 @@ export interface EncryptedRecordingMetadata extends KeyBinding {
 export interface EncryptRecordingOptions {
   /** 64 KiB–4 MiB; defaults to 1 MiB. Memory use is bounded by this value. */
   chunkSize?: number;
+  /** Enforced before every ciphertext frame, including framing and final tag. */
+  maxEncryptedBytes?: number;
+  signal?: AbortSignal;
+  /** Enables durable owned-attempt publication; must persist this exact metadata. */
+  onPrepared?: (metadata: EncryptedRecordingMetadata) => Promise<void>;
+}
+
+export interface EncryptionReceipt {
+  version: 1;
+  /** Final publication occurs only after the writer's handles are closed. */
+  published: boolean;
+  /** Physical ciphertext bytes in the partial/final inode, never both hardlinks. */
+  bytes: number;
 }
 
 export class RecordingIntegrityError extends Error {
@@ -340,6 +361,108 @@ async function writeFrame(
  * Source spool encryption/deletion is the recorder's responsibility. This function
  * never creates a plaintext output. Keep returned metadata with the database row.
  */
+function receiptBinding(
+  outputPath: string,
+  metadata: EncryptedRecordingMetadata,
+) {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        outputPath,
+        metadata.version,
+        metadata.context.tenantId,
+        metadata.context.meetingId,
+        metadata.context.recordingId,
+        metadata.recordingKeyId,
+        metadata.wrappedKey.provider,
+        metadata.wrappedKey.keyId,
+        metadata.wrappedKey.ciphertext,
+        Object.entries(metadata.wrappedKey.metadata ?? {}).sort(([a], [b]) =>
+          a < b ? -1 : a > b ? 1 : 0,
+        ),
+        metadata.plaintextBytes,
+        metadata.encryptedBytes,
+      ]),
+    )
+    .digest("hex");
+}
+async function syncDirectory(file: string) {
+  const directory = await open(
+    dirname(file),
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+async function writeReceipt(file: string, value: object, exclusive: boolean) {
+  const temporary = exclusive ? file : `${file}.${randomUUID()}.tmp`;
+  let created = false;
+  try {
+    const handle = await open(
+      temporary,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_NOFOLLOW,
+      0o600,
+    );
+    created = true;
+    try {
+      await writeAll(handle, Buffer.from(JSON.stringify(value) + "\n"));
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    if (!exclusive) await rename(temporary, file);
+    await syncDirectory(file);
+  } finally {
+    if (!exclusive && created) await unlink(temporary).catch(() => undefined);
+  }
+}
+
+/** Missing/pending receipts are uncertain writer state, never absence proof. */
+export async function readEncryptionReceipt(
+  outputPath: string,
+  metadata: EncryptedRecordingMetadata,
+  context: RecordingContext,
+): Promise<EncryptionReceipt | null> {
+  validateMetadata(metadata, context);
+  const resolved = await safePath(outputPath);
+  let file: FileHandle;
+  try {
+    file = await openInput(`${resolved}.closed`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const stat = await file.stat();
+    if (stat.size > 4096) throw new RecordingIntegrityError();
+    const receipt = JSON.parse(await file.readFile("utf8"));
+    if (
+      receipt.version !== 1 ||
+      receipt.binding !== receiptBinding(resolved, metadata)
+    )
+      throw new RecordingIntegrityError();
+    if (receipt.state === "pending") return null;
+    if (
+      receipt.state !== "closed" ||
+      typeof receipt.published !== "boolean" ||
+      !Number.isSafeInteger(receipt.bytes) ||
+      receipt.bytes < 0 ||
+      receipt.bytes > metadata.encryptedBytes ||
+      (receipt.published && receipt.bytes !== metadata.encryptedBytes)
+    )
+      throw new RecordingIntegrityError();
+    return { version: 1, published: receipt.published, bytes: receipt.bytes };
+  } finally {
+    await file.close();
+  }
+}
+
 export async function encryptRecording(
   inputPath: string,
   outputPath: string,
@@ -352,54 +475,116 @@ export async function encryptRecording(
     !Number.isInteger(chunkSize) ||
     chunkSize < MIN_CHUNK_SIZE ||
     chunkSize > MAX_CHUNK_SIZE
-  ) {
+  )
     throw new TypeError(
       "Recording chunk size must be between 64 KiB and 4 MiB",
     );
-  }
-  // Copy caller-owned context before any await so it cannot change during encryption.
+  const maximum = options.maxEncryptedBytes ?? Number.MAX_SAFE_INTEGER;
+  if (!Number.isSafeInteger(maximum) || maximum < 93)
+    throw new TypeError(
+      "Recording ciphertext ceiling must be at least 93 bytes",
+    );
+  options.signal?.throwIfAborted();
   contextBytes(context);
   const stableContext = {
     tenantId: context.tenantId,
     meetingId: context.meetingId,
     recordingId: context.recordingId,
   };
-  const key = randomBytes(32);
-  const recordingKeyId = randomBytes(16).toString("hex");
+  const key = randomBytes(32),
+    recordingKeyId = randomBytes(16).toString("hex");
   const binding: KeyBinding = { context: stableContext, recordingKeyId };
-  let input: FileHandle | undefined;
-  let output: FileHandle | undefined;
-  let resolvedOutput: string | undefined;
-  let completed = false;
+  let input: FileHandle | undefined,
+    output: FileHandle | undefined,
+    resolvedOutput: string | undefined;
+  let failure: unknown,
+    handlesClosed = true,
+    claimed = false,
+    published = false,
+    writtenBytes = 0;
+  let prepared: EncryptedRecordingMetadata | undefined,
+    result: EncryptedRecordingMetadata | undefined;
+  const owned = !!options.onPrepared;
   const readBuffer = Buffer.allocUnsafe(chunkSize);
   try {
     const wrappedKey = await keyProvider.wrapKey(key, binding);
+    options.signal?.throwIfAborted();
     input = await openInput(inputPath);
     resolvedOutput = await safePath(outputPath);
+    const expected = (await input.stat()).size;
+    const expectedEncrypted =
+      HEADER_SIZE +
+      expected +
+      (Math.ceil(expected / chunkSize) + 1) * (FRAME_HEADER_SIZE + TAG_SIZE);
+    if (!Number.isSafeInteger(expectedEncrypted) || expectedEncrypted > maximum)
+      throw new Error("Recording exceeds ciphertext allowance");
+    if (owned) {
+      prepared = {
+        version: 1,
+        ...binding,
+        wrappedKey,
+        plaintextBytes: expected,
+        encryptedBytes: expectedEncrypted,
+      };
+      await options.onPrepared!(structuredClone(prepared));
+      options.signal?.throwIfAborted();
+      // This retained marker also prevents a delayed duplicate invocation after cleanup.
+      await writeReceipt(
+        `${resolvedOutput}.closed`,
+        {
+          version: 1,
+          binding: receiptBinding(resolvedOutput, prepared),
+          state: "pending",
+        },
+        true,
+      );
+      claimed = true;
+    }
     output = await open(
-      resolvedOutput,
+      owned ? `${resolvedOutput}.partial` : resolvedOutput,
       constants.O_WRONLY |
         constants.O_CREAT |
         constants.O_EXCL |
         constants.O_NOFOLLOW,
       0o600,
     );
-    const prefix = randomBytes(8);
-    const header = Buffer.alloc(HEADER_SIZE);
+    const prefix = randomBytes(8),
+      header = Buffer.alloc(HEADER_SIZE);
     MAGIC.copy(header, 0);
     header.writeUInt32BE(chunkSize, 8);
     prefix.copy(header, 12);
     Buffer.from(recordingKeyId, "hex").copy(header, 20);
     hashContext(stableContext).copy(header, 36);
     await writeAll(output, header);
-    let index = 0;
-    let plaintextBytes = 0;
-    let encryptedBytes = header.length;
+    let index = 0,
+      plaintextBytes = 0,
+      encryptedBytes = header.length;
     while (true) {
-      const { bytesRead } = await input.read(readBuffer, 0, chunkSize, null);
-      if (bytesRead === 0) break;
+      options.signal?.throwIfAborted();
+      let bytesRead = 0;
+      const target = owned
+        ? Math.min(chunkSize, expected - plaintextBytes)
+        : chunkSize;
+      while (bytesRead < target) {
+        const next = await input.read(
+          readBuffer,
+          bytesRead,
+          target - bytesRead,
+          null,
+        );
+        if (!next.bytesRead) break;
+        bytesRead += next.bytesRead;
+      }
+      if (owned && bytesRead !== target) throw new RecordingIntegrityError();
+      if (!bytesRead) break;
       if (index === MAX_FRAME_INDEX)
         throw new Error("Recording exceeds maximum format size");
+      if (
+        encryptedBytes + bytesRead + 2 * (FRAME_HEADER_SIZE + TAG_SIZE) >
+        maximum
+      )
+        throw new Error("Recording exceeds ciphertext allowance");
+      options.signal?.throwIfAborted();
       encryptedBytes += await writeFrame(
         output,
         key,
@@ -412,6 +597,11 @@ export async function encryptRecording(
       plaintextBytes += bytesRead;
       readBuffer.fill(0, 0, bytesRead);
     }
+    if (owned && (await input.read(readBuffer, 0, 1, null)).bytesRead)
+      throw new RecordingIntegrityError();
+    options.signal?.throwIfAborted();
+    if (encryptedBytes + FRAME_HEADER_SIZE + TAG_SIZE > maximum)
+      throw new Error("Recording exceeds ciphertext allowance");
     encryptedBytes += await writeFrame(
       output,
       key,
@@ -422,34 +612,81 @@ export async function encryptRecording(
       1,
     );
     await output.sync();
-    // A durable file is insufficient if its new directory entry is lost after
-    // the caller commits metadata and removes the source recovery spool.
-    const directory = await open(
-      dirname(resolvedOutput),
-      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-    );
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-    completed = true;
-    return {
+    await syncDirectory(resolvedOutput);
+    result = {
       version: 1,
       ...binding,
       wrappedKey,
       plaintextBytes,
       encryptedBytes,
     };
+  } catch (error) {
+    failure = error;
+    // A colliding partial is not ours and may still have a live writer.
+    if (claimed && !output) handlesClosed = false;
   } finally {
     key.fill(0);
     readBuffer.fill(0);
-    await input?.close().catch(() => undefined);
-    await output?.close().catch(() => undefined);
-    // Only remove a file this invocation actually created, never an existing target.
-    if (!completed && output && resolvedOutput)
-      await unlink(resolvedOutput).catch(() => undefined);
+    if (output) {
+      try {
+        writtenBytes = (await output.stat()).size;
+      } catch (error) {
+        failure ??= error;
+        handlesClosed = false;
+      }
+      try {
+        await output.close();
+      } catch (error) {
+        failure ??= error;
+        handlesClosed = false;
+      }
+    }
+    try {
+      await input?.close();
+    } catch (error) {
+      failure ??= error;
+      handlesClosed = false;
+    }
   }
+  if (owned && resolvedOutput && prepared && claimed && handlesClosed) {
+    try {
+      if (result && !failure) {
+        options.signal?.throwIfAborted();
+        // Atomic exclusive publication of a closed immutable inode. Never undo it.
+        await link(`${resolvedOutput}.partial`, resolvedOutput);
+        published = true;
+        await syncDirectory(resolvedOutput);
+        await unlink(`${resolvedOutput}.partial`);
+        await syncDirectory(resolvedOutput);
+      }
+    } catch (error) {
+      failure ??= error;
+      // Never certify cleanup of a pre-existing final path owned by another writer.
+      if (!published && (error as NodeJS.ErrnoException).code === "EEXIST")
+        handlesClosed = false;
+    }
+    try {
+      if (handlesClosed)
+        await writeReceipt(
+          `${resolvedOutput}.closed`,
+          {
+            version: 1,
+            binding: receiptBinding(resolvedOutput, prepared),
+            state: "closed",
+            published,
+            bytes: writtenBytes,
+          },
+          false,
+        );
+    } catch (error) {
+      failure ??= error;
+    }
+  } else if (!owned && failure && output && resolvedOutput) {
+    await unlink(resolvedOutput).catch(() => undefined);
+  }
+  if (failure) throw failure;
+  if (!result) throw new RecordingIntegrityError();
+  return result;
 }
 
 function validateMetadata(
@@ -741,4 +978,7 @@ export {
   S3RecordingStorage,
   type RecordingObjectReference,
   type RecordingObjectStorage,
+  type OwnedRecordingUpload,
+  type OwnedRecordingFence,
+  type OwnedUploadOptions,
 } from "./storage.js";

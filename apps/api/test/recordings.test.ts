@@ -617,7 +617,14 @@ async function downloadAllowance(
     m.hosted = { accountId: owner, billingOwnerId: owner, version: 1 };
   });
   return async () =>
-    (await f.store.hostedUsage(owner)).recordingDownloadBytes.used;
+    // This preexisting file deliberately has no migrated storage inventory.
+    // Downloads remain authorized; the aggregate storage view must fail closed.
+    f.store.usageLedgers
+      .get(owner)!
+      .windows.reduce(
+        (total, window) => total + (window.recordingDownloadBytesUsed ?? 0),
+        0,
+      );
 }
 
 function boundedSourceClose(source: Readable) {

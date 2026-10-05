@@ -1,6 +1,27 @@
 import { fenceParticipantMedia } from "./media-identity.js";
 import pg from "pg";
 import {
+  allocateRecordingStorage,
+  prepareRecordingStorage,
+  releaseRecordingStorage,
+  removeRecordingStorage,
+  reserveRecordingStorage,
+  retainRecordingStorage,
+  type RecordingStorage,
+  type RecordingStorageAttempt,
+  type RecordingStoragePlan,
+  type RecordingStoragePrepared,
+  type RecordingStorageProof,
+  type RecordingStorageRelease,
+} from "./recording-storage-quota.js";
+export type {
+  RecordingStorageAttempt,
+  RecordingStoragePlan,
+  RecordingStoragePrepared,
+  RecordingStorageProof,
+  RecordingStorageRelease,
+} from "./recording-storage-quota.js";
+import {
   canSettleMeter,
   checkRecordingTime,
   debitDownloadBytes,
@@ -84,6 +105,7 @@ export type Participant = {
   previousRoom?: string;
 };
 export type Recording = {
+  storage?: RecordingStorage;
   timeReservation?: RecordingTimeReservation;
   rawCleanupPending?: boolean;
   id: string;
@@ -164,7 +186,24 @@ export interface RecordingLock {
   reserveRecording(
     recording: Recording,
     authorize: (current: Meeting) => void,
+    storagePlan?: RecordingStoragePlan,
   ): Promise<Recording>;
+  reserveRecordingStorage(
+    kind: "local" | "s3",
+  ): Promise<RecordingStorageAttempt>;
+  prepareRecordingStorage(
+    id: string,
+    prepared: RecordingStoragePrepared,
+  ): Promise<RecordingStorageAttempt>;
+  retainRecordingStorage(
+    id: string,
+    proof: RecordingStorageProof,
+  ): Promise<RecordingStorageAttempt>;
+  removeRecordingStorage(id: string): Promise<RecordingStorageAttempt>;
+  releaseRecordingStorage(
+    id: string,
+    proof: RecordingStorageRelease,
+  ): Promise<RecordingStorageAttempt>;
   checkRecordingTime(): Promise<{ recording: Recording; mustStop: boolean }>;
   observeRecordingTime(
     observation: RecordingTimeObservation,
@@ -190,13 +229,18 @@ function recordingTimeMethods(
     return r;
   };
   return {
-    reserveRecording: (recording: Recording, authorize: (m: Meeting) => void) =>
+    reserveRecording: (
+      recording: Recording,
+      authorize: (m: Meeting) => void,
+      storagePlan?: RecordingStoragePlan,
+    ) =>
       transaction((ledger, grant, meetings, m, now) => {
         authorize(m);
         if (
           recording.id !== id ||
           recording.status !== "starting" ||
           recording.timeReservation ||
+          recording.storage ||
           m.recordings.some((r) => r.id === id)
         )
           throw new HttpError(409, "Recording reservation changed");
@@ -205,10 +249,45 @@ function recordingTimeMethods(
           if (!ledger)
             throw new HttpError(404, "Usage unavailable", "USAGE_UNAVAILABLE");
           reserveRecordingTime(ledger, grant, meetings, m, r, now);
+          reserveRecordingStorage(grant, meetings, m, r, storagePlan);
         }
         m.recordings.push(r);
         return structuredClone(r);
       }, authorize),
+    reserveRecordingStorage: (kind: "local" | "s3") =>
+      transaction((_ledger, grant, meetings, m) =>
+        structuredClone(
+          allocateRecordingStorage(grant, meetings, m, current(m), kind),
+        ),
+      ),
+    prepareRecordingStorage: (
+      attemptId: string,
+      prepared: RecordingStoragePrepared,
+    ) =>
+      transaction((_ledger, _grant, _meetings, m) =>
+        structuredClone(
+          prepareRecordingStorage(m, current(m), attemptId, prepared),
+        ),
+      ),
+    retainRecordingStorage: (attemptId: string, proof: RecordingStorageProof) =>
+      transaction((_ledger, _grant, _meetings, m) =>
+        structuredClone(
+          retainRecordingStorage(m, current(m), attemptId, proof),
+        ),
+      ),
+    removeRecordingStorage: (attemptId: string) =>
+      transaction((_ledger, _grant, _meetings, m) =>
+        structuredClone(removeRecordingStorage(m, current(m), attemptId)),
+      ),
+    releaseRecordingStorage: (
+      attemptId: string,
+      proof: RecordingStorageRelease,
+    ) =>
+      transaction((_ledger, _grant, _meetings, m) =>
+        structuredClone(
+          releaseRecordingStorage(m, current(m), attemptId, proof),
+        ),
+      ),
     checkRecordingTime: () =>
       transaction((ledger, grant, meetings, m, now) => {
         const r = current(m);

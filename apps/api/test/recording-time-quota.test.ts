@@ -30,6 +30,7 @@ async function fixture(t: TestContext, allowance = 90, at = now) {
       participantSecondsPerMonth: 360000,
       downloadBytesPerMonth: 100,
       recordingSecondsPerMonth: allowance,
+      storageBytes: 10000,
     },
     hostAccountIds: [owner],
     limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 2 },
@@ -87,6 +88,7 @@ async function fixture(t: TestContext, allowance = 90, at = now) {
         l.reserveRecording(
           { id, status: "starting", createdAt: Date.now() },
           authorize,
+          { maxBytes: 100, copies: 1 },
         ),
       current,
     );
@@ -421,7 +423,7 @@ test("legacy bound capture stops with retained uncertainty; self-hosted capture 
     checked.recording.timeReservation!.reservedFrom,
     legacy.createdAt,
   );
-  assert.equal((await f.usage()).reserved, 10);
+  await assert.rejects(f.usage(), /storage inventory is unavailable/);
   const unbound = await f.room();
   await f.store.change(unbound.code, (m) => {
     delete m.hosted;
@@ -432,7 +434,11 @@ test("legacy bound capture stops with retained uncertainty; self-hosted capture 
     (await f.lock(free.id, (l) => l.checkRecordingTime(), unbound)).mustStop,
     false,
   );
-  assert.equal((await f.usage()).reserved, 10);
+  assert.equal(
+    (await f.store.get(f.m.code))!.recordings[0]!.timeReservation!.fundedUntil -
+      legacy.createdAt,
+    10000,
+  );
 });
 
 test("grant recording limits are bounded and same-revision changes are rejected", async (t) => {

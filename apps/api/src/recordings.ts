@@ -22,13 +22,20 @@ import {
   type RecordingObjectStorage,
   type EncryptedRecordingMetadata,
   encryptRecording,
+  readEncryptionReceipt,
   decryptRecordingToStream,
   createDownloadCredentials,
   digestDownloadToken,
   verifyRecordingPassword,
 } from "@meeting-platform/recording";
 import type { Config } from "./config.js";
-import type { Meeting, Recording, RecordingLock, Store } from "./store.js";
+import type {
+  Meeting,
+  Recording,
+  RecordingLock,
+  RecordingStorageAttempt,
+  Store,
+} from "./store.js";
 import { activePhone } from "./phone.js";
 import { HttpError, safeEqual } from "./security.js";
 
@@ -37,6 +44,9 @@ export type RecorderClient = Pick<
   "startRoomCompositeEgress" | "stopEgress" | "listEgress"
 >;
 const retentionMs = 7 * 86400000;
+const ownedChunkSize = 1024 * 1024;
+const encryptedSize = (rawBytes: number) =>
+  93 + rawBytes + Math.ceil(rawBytes / ownedChunkSize) * 25;
 const terminalStatuses = [
   EgressStatus.EGRESS_COMPLETE,
   EgressStatus.EGRESS_FAILED,
@@ -177,6 +187,278 @@ export class RecordingService {
       await unlink(file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  private attemptFile(r: Recording, attempt: RecordingStorageAttempt) {
+    return this.file({ ...r, ciphertextId: attempt.id });
+  }
+  private async cleanupStorage(
+    m: Meeting,
+    r: Recording,
+    lock: RecordingLock,
+    keep = new Set<string>(),
+  ) {
+    const row = (await lock.get())!.recordings.find(
+      (entry) => entry.id === r.id,
+    )!;
+    let complete = true;
+    for (const attempt of row.storage!.attempts) {
+      if (keep.has(attempt.id) || attempt.state === "released") continue;
+      if (attempt.state === "reserved") {
+        await lock.releaseRecordingStorage(attempt.id, { kind: "unused" });
+        continue;
+      }
+      await lock.removeRecordingStorage(attempt.id);
+      const prepared = attempt.prepared;
+      if (!prepared)
+        throw new Error("Recording storage evidence is unavailable");
+      if (prepared.kind === "local") {
+        const file = this.attemptFile(row, attempt);
+        const receipt = await readEncryptionReceipt(
+          file,
+          prepared.metadata,
+          this.context(m, row),
+        );
+        if (!receipt) {
+          complete = false;
+          continue;
+        }
+        await lock.check();
+        await this.removeFile(file);
+        await this.removeFile(`${file}.partial`);
+        // The permanent closed marker prevents this immutable attempt from
+        // being reopened after its data is removed.
+        await lock.releaseRecordingStorage(attempt.id, {
+          kind: "local",
+          metadata: prepared.metadata,
+          receipt,
+          removed: true,
+        });
+      } else {
+        if (!this.objectStorage?.fenceOwned)
+          throw new Error(
+            "Owned recording object storage is required for cleanup",
+          );
+        await lock.check();
+        const fence = await this.objectStorage.fenceOwned(
+          prepared.intent,
+          prepared.metadata,
+          this.context(m, row),
+        );
+        await lock.releaseRecordingStorage(attempt.id, {
+          kind: "s3",
+          metadata: prepared.metadata,
+          fence,
+        });
+      }
+    }
+    return complete;
+  }
+  private keptStorage(r: Recording) {
+    return new Set(
+      r
+        .storage!.attempts.filter((attempt) =>
+          r.metadata?.storage
+            ? attempt.kind === "s3" &&
+              attempt.proof?.kind === "s3" &&
+              isDeepStrictEqual(attempt.proof.reference, r.metadata.storage)
+            : attempt.kind === "local" && attempt.id === r.ciphertextId,
+        )
+        .map((attempt) => attempt.id),
+    );
+  }
+  private async finishOwnedEncryption(
+    m: Meeting,
+    r: Recording,
+    lock: RecordingLock,
+  ) {
+    let row = (await lock.get())!.recordings.find(
+      (entry) => entry.id === r.id,
+    )!;
+    if (!row.metadata) {
+      // A previous process may have closed a complete immutable attempt before
+      // it lost the metadata acknowledgement. Recover that exact resource.
+      for (const attempt of row.storage!.attempts) {
+        if (
+          attempt.kind !== "local" ||
+          !attempt.prepared ||
+          !["pending", "retained"].includes(attempt.state)
+        )
+          continue;
+        const metadata = attempt.prepared.metadata;
+        const receipt = await readEncryptionReceipt(
+          this.attemptFile(row, attempt),
+          metadata,
+          this.context(m, row),
+        );
+        if (!receipt) continue;
+        await lock.retainRecordingStorage(attempt.id, {
+          kind: "local",
+          metadata,
+          receipt,
+        });
+        if (receipt.published) {
+          await this.selectCiphertext(row, attempt.id, metadata, lock);
+          break;
+        }
+      }
+      row = (await lock.get())!.recordings.find((entry) => entry.id === r.id)!;
+      if (!row.metadata) {
+        // Unknown writers keep their allocation. Closed failed attempts may be
+        // removed; unused slots remain available for this capture's first write.
+        await this.cleanupStorage(
+          m,
+          row,
+          lock,
+          new Set(
+            row
+              .storage!.attempts.filter((a) => a.state === "reserved")
+              .map((a) => a.id),
+          ),
+        );
+        const raw = await lstat(this.file(row, true));
+        if (
+          !raw.isFile() ||
+          raw.size > this.config.recordingMaxBytes ||
+          encryptedSize(raw.size) > row.storage!.maxBytes
+        ) {
+          await lock.change((state) => {
+            const saved = state.recordings.find(
+              (entry) => entry.id === row.id,
+            )!;
+            saved.status = "failed";
+            saved.rawCleanupPending = true;
+            saved.error = "Recording exceeded the stored-file allowance";
+          });
+          return;
+        }
+        const attempt = await lock.reserveRecordingStorage("local");
+        await lock.check();
+        const metadata = await encryptRecording(
+          this.file(row, true),
+          this.attemptFile(row, attempt),
+          this.context(m, row),
+          this.provider!,
+          {
+            chunkSize: ownedChunkSize,
+            maxEncryptedBytes: attempt.maxBytes,
+            onPrepared: async (prepared) => {
+              await lock.prepareRecordingStorage(attempt.id, {
+                kind: "local",
+                metadata: prepared,
+              });
+            },
+          },
+        );
+        const receipt = await readEncryptionReceipt(
+          this.attemptFile(row, attempt),
+          metadata,
+          this.context(m, row),
+        );
+        if (!receipt?.published)
+          throw new Error("Recording writer completion is unavailable");
+        await lock.retainRecordingStorage(attempt.id, {
+          kind: "local",
+          metadata,
+          receipt,
+        });
+        await this.selectCiphertext(row, attempt.id, metadata, lock);
+      }
+      row = (await lock.get())!.recordings.find((entry) => entry.id === r.id)!;
+    }
+    if (this.objectStorage && !row.metadata.storage) {
+      if (!this.objectStorage.putOwned || !this.objectStorage.recoverOwned)
+        throw new Error("Owned recording object storage is required");
+      let attempt = row.storage!.attempts.find(
+        (a) =>
+          a.kind === "s3" &&
+          ["pending", "retained"].includes(a.state) &&
+          isDeepStrictEqual(a.prepared?.metadata, row.metadata),
+      );
+      attempt ??= await lock.reserveRecordingStorage("s3");
+      let reference =
+        attempt.proof?.kind === "s3" ? attempt.proof.reference : undefined;
+      if (!reference && attempt.prepared?.kind === "s3")
+        reference =
+          (await this.objectStorage.recoverOwned(
+            attempt.prepared.intent,
+            attempt.prepared.metadata,
+            this.context(m, row),
+          )) ?? undefined;
+      if (!reference) {
+        await lock.check();
+        reference = await this.objectStorage.putOwned(
+          this.file(row),
+          row.metadata,
+          this.context(m, row),
+          this.provider!,
+          {
+            maxBytes: attempt.maxBytes,
+            onPrepared: async (intent) => {
+              await lock.prepareRecordingStorage(attempt!.id, {
+                kind: "s3",
+                metadata: row.metadata,
+                intent,
+              });
+            },
+          },
+        );
+      }
+      await lock.retainRecordingStorage(attempt.id, {
+        kind: "s3",
+        metadata: row.metadata,
+        reference,
+      });
+      await lock.change((state) => {
+        const saved = state.recordings.find((entry) => entry.id === row.id)!;
+        if (
+          saved.status !== "encrypting" ||
+          !isDeepStrictEqual(saved.metadata, row.metadata)
+        )
+          throw new Error("Recording encryption state changed");
+        saved.metadata.storage = reference;
+      });
+      row = (await lock.get())!.recordings.find((entry) => entry.id === r.id)!;
+    }
+    for await (const plaintext of await this.openEncrypted(m, row))
+      (plaintext as Buffer).fill(0);
+    await lock.check();
+    await this.removeFile(this.file(row, true));
+    await this.cleanupStorage(m, row, lock, this.keptStorage(row));
+    await lock.change((state) => {
+      const saved = state.recordings.find((entry) => entry.id === row.id)!;
+      if (saved.status === "encrypting" && saved.metadata)
+        saved.status = "ready";
+    });
+    await lock.audit("recorder", "recording.encrypted", r.id);
+  }
+  private async selectCiphertext(
+    r: Recording,
+    ciphertextId: string,
+    metadata: EncryptedRecordingMetadata,
+    lock: RecordingLock,
+  ) {
+    await lock.change((state) => {
+      const row = state.recordings.find((entry) => entry.id === r.id)!;
+      if (row.status !== "encrypting" || row.metadata)
+        throw new Error("Recording encryption state changed");
+      row.metadata = metadata;
+      row.ciphertextId = ciphertextId;
+    });
+  }
+  private async storageCaptureFull(m: Meeting, r: Recording) {
+    if (!m.hosted?.billingOwnerId) return false;
+    if (!r.storage) return true;
+    try {
+      const raw = await lstat(this.file(r, true));
+      // The stop RPC can overshoot. Encryption separately enforces the hard
+      // ciphertext ceiling; the raw spool has its own deployment disk bound.
+      return (
+        !raw.isFile() || encryptedSize(raw.size) >= r.storage.maxBytes * 0.9
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      return true;
     }
   }
   private async finishEncryption(
@@ -410,25 +692,43 @@ export class RecordingService {
       createdAt: Date.now(),
     };
     await this.store.withRecordingLock(meeting.code, r.id, async (lock) => {
-      await lock.reserveRecording(r, (m) => {
-        if (m.participants.some(activePhone))
-          throw new HttpError(
-            409,
-            "Recording is unavailable while phone calls are active; phone recording announcements are not implemented",
-          );
-        if (!meetingAllowed(m) || !m.recordingAllowed)
-          throw new HttpError(403, "Enable recording first");
-        if (!m.hostEmailVerified)
-          throw new HttpError(403, "Verify the host email first");
-        if (
-          m.recordings.some((r) =>
-            ["starting", "recording", "stopping", "encrypting"].includes(
-              r.status,
-            ),
+      await lock.reserveRecording(
+        r,
+        (m) => {
+          if (m.participants.some(activePhone))
+            throw new HttpError(
+              409,
+              "Recording is unavailable while phone calls are active; phone recording announcements are not implemented",
+            );
+          if (!meetingAllowed(m) || !m.recordingAllowed)
+            throw new HttpError(403, "Enable recording first");
+          if (!m.hostEmailVerified)
+            throw new HttpError(403, "Verify the host email first");
+          if (
+            m.recordings.some((r) =>
+              ["starting", "recording", "stopping", "encrypting"].includes(
+                r.status,
+              ),
+            )
           )
-        )
-          throw new HttpError(409, "A recording is already active");
-      });
+            throw new HttpError(409, "A recording is already active");
+          if (
+            m.hosted?.billingOwnerId &&
+            this.objectStorage &&
+            (!this.objectStorage.putOwned ||
+              !this.objectStorage.recoverOwned ||
+              !this.objectStorage.fenceOwned)
+          )
+            throw new HttpError(
+              503,
+              "Owned recording object storage is not configured",
+            );
+        },
+        {
+          maxBytes: Math.min(this.config.recordingMaxBytes, 3_000_000_000),
+          copies: this.objectStorage ? 2 : 1,
+        },
+      );
       let startedId: string | undefined;
       try {
         await lock.check();
@@ -517,6 +817,7 @@ export class RecordingService {
     if (r.rawCleanupPending) {
       await lock.check();
       await this.removeFile(this.file(r, true));
+      if (r.storage && !(await this.cleanupStorage(m, r, lock))) return;
       await lock.change((state) => {
         delete state.recordings.find((row) => row.id === r.id)!
           .rawCleanupPending;
@@ -535,6 +836,17 @@ export class RecordingService {
         delete row.expiresAt;
       });
       await lock.audit("recorder", "recording.revoke", r.id);
+      if (r.storage) {
+        if (!(await this.cleanupStorage(m, r, lock))) return;
+        await lock.check();
+        await this.removeFile(this.file(r, true));
+        await lock.change((state) => {
+          const row = state.recordings.find((entry) => entry.id === r.id)!;
+          row.status = "deleted";
+          delete row.metadata;
+        });
+        return;
+      }
       await lock.check();
       if (r.metadata?.storage) {
         if (!this.objectStorage)
@@ -556,9 +868,19 @@ export class RecordingService {
       });
       return;
     }
+    if (r.status === "ready" && r.storage) {
+      await this.cleanupStorage(m, r, lock, this.keptStorage(r));
+      return;
+    }
     if (r.status !== "encrypting") return;
     if (!this.provider) throw new Error("Recording keys are not configured");
     await this.directories();
+    if (r.storage) {
+      await this.finishOwnedEncryption(m, r, lock);
+      return;
+    }
+    if (m.hosted?.billingOwnerId)
+      throw new Error("Recording storage inventory is unavailable");
     if (!r.metadata) {
       const raw = await lstat(this.file(r, true));
       if (!raw.isFile() || raw.size > this.config.recordingMaxBytes)
@@ -627,6 +949,7 @@ export class RecordingService {
                 timing.mustStop ||
                 r.status === "stopping" ||
                 !this.available ||
+                (await this.storageCaptureFull(m, r)) ||
                 !m.recordingAllowed ||
                 !meetingAllowed(m)
               ) {

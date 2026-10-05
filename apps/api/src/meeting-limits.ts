@@ -13,6 +13,7 @@ export type HostedEntitlement = {
     participantSecondsPerMonth: number;
     downloadBytesPerMonth?: number;
     recordingSecondsPerMonth?: number;
+    storageBytes?: number;
   } | null;
   hostAccountIds: string[];
   limits: {
@@ -52,6 +53,12 @@ export const entitlementSchema = z
           .int()
           .nonnegative()
           .max(360000)
+          .optional(),
+        storageBytes: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(300_000_000_000)
           .optional(),
       })
       .strict()
@@ -102,6 +109,7 @@ export function nextEntitlement(
       grant.quota?.participantSecondsPerMonth ?? null,
       grant.quota?.downloadBytesPerMonth ?? 0,
       grant.quota?.recordingSecondsPerMonth ?? 0,
+      grant.quota?.storageBytes ?? 0,
       [...grant.hostAccountIds].sort(),
       grant.limits.participants,
       grant.limits.durationSeconds,

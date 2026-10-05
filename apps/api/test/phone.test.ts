@@ -662,6 +662,7 @@ test("RecordingService itself blocks a waiting phone before starting an Egress j
   const service = Object.create(RecordingService.prototype) as RecordingService;
   Object.defineProperty(service, "available", { value: true });
   Object.assign(service, {
+    config: f.config,
     store: f.store,
     directories: async () => {},
     client: {

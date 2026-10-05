@@ -18,11 +18,12 @@ import {
   S3RecordingStorage,
   encryptRecording,
   decryptRecordingFromStream,
+  type OwnedRecordingUpload,
 } from "../src/index.js";
 
 // Explicit opt-in to an isolated loopback service. Never falls back to ambient AWS credentials/endpoints.
 test(
-  "isolated S3 provider: multipart immutability, version-pinned restore, and encrypted streaming",
+  "isolated S3 provider: owned upload fencing, multipart immutability, and version-pinned restore",
   {
     skip: !process.env.TEST_S3_ENDPOINT,
     timeout: 120_000,
@@ -48,6 +49,15 @@ test(
       credentials: { accessKeyId, secretAccessKey },
       // Match the production SDK policy, including reconnecting after a conditional response closes its socket.
       maxAttempts: 3,
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
+    });
+    const ownedClient = new S3Client({
+      endpoint,
+      region,
+      forcePathStyle: true,
+      credentials: { accessKeyId, secretAccessKey },
+      maxAttempts: 1,
       requestChecksumCalculation: "WHEN_REQUIRED",
       responseChecksumValidation: "WHEN_REQUIRED",
     });
@@ -125,6 +135,172 @@ test(
       const expected = createHash("sha256").update(source).digest("hex");
       phase = "initial download";
       assert.equal(await digest(), expected);
+      phase = "owned native upload and exact-version fencing";
+      const ownedStorage = new S3RecordingStorage({
+        bucket,
+        region,
+        endpoint,
+        forcePathStyle: true,
+        allowInsecureLocalEndpoint: true,
+        client,
+        ownedClient,
+      });
+      const ownedContext = {
+        ...context,
+        recordingId: randomBytes(16).toString("hex"),
+      };
+      const ownedPath = join(directory, "owned.mprec");
+      const ownedMetadata = await encryptRecording(
+        raw,
+        ownedPath,
+        ownedContext,
+        provider,
+      );
+      let intent!: OwnedRecordingUpload;
+      const options = {
+        maxBytes: 3_000_000_000,
+        onPrepared: async (value: OwnedRecordingUpload) => {
+          intent = value;
+        },
+      };
+      const ownedReference = await ownedStorage.putOwned(
+        ownedPath,
+        ownedMetadata,
+        ownedContext,
+        provider,
+        options,
+      );
+      assert.ok(ownedReference.versionId);
+      assert.deepEqual(
+        await ownedStorage.putOwned(
+          ownedPath,
+          ownedMetadata,
+          ownedContext,
+          provider,
+          options,
+        ),
+        ownedReference,
+      );
+      const fence = await ownedStorage.fenceOwned(
+        intent,
+        ownedMetadata,
+        ownedContext,
+      );
+      assert.equal(fence.cleaned, true);
+      await assert.rejects(
+        ownedStorage.read(ownedReference, ownedMetadata, ownedContext),
+      );
+      const afterFence = await client.send(
+        new ListObjectVersionsCommand({ Bucket: bucket, Prefix: intent.key }),
+      );
+      assert.deepEqual(
+        afterFence.Versions?.filter((v) => v.Key === intent.key).map(
+          (v) => v.Size,
+        ),
+        [0],
+      );
+      assert.equal(
+        afterFence.DeleteMarkers?.filter((v) => v.Key === intent.key).length ??
+          0,
+        0,
+      );
+      assert.deepEqual(
+        await ownedStorage.fenceOwned(intent, ownedMetadata, ownedContext),
+        fence,
+      );
+
+      phase = "delayed native request after durable fence";
+      const lateContext = {
+        ...context,
+        recordingId: randomBytes(16).toString("hex"),
+      };
+      const latePath = join(directory, "late.mprec");
+      const lateMetadata = await encryptRecording(
+        raw,
+        latePath,
+        lateContext,
+        provider,
+      );
+      let entered!: () => void,
+        release!: () => void,
+        lateIntent!: OwnedRecordingUpload;
+      const began = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const delayedClient = {
+        send: async (command: any, options: any) => {
+          if (
+            command instanceof PutObjectCommand &&
+            command.input.ContentLength! > 0
+          ) {
+            entered();
+            await gate;
+          }
+          return ownedClient.send(command, options);
+        },
+      } as unknown as S3Client;
+      const lateStorage = new S3RecordingStorage({
+        bucket,
+        region,
+        endpoint,
+        forcePathStyle: true,
+        allowInsecureLocalEndpoint: true,
+        client,
+        ownedClient: delayedClient,
+      });
+      const delayed = lateStorage.putOwned(
+        latePath,
+        lateMetadata,
+        lateContext,
+        provider,
+        {
+          maxBytes: 3_000_000_000,
+          onPrepared: async (value) => {
+            lateIntent = value;
+          },
+        },
+      );
+      const rejected = assert.rejects(delayed);
+      let deadline: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          began,
+          delayed.then(() => {
+            throw new Error("Delayed upload unexpectedly completed");
+          }),
+          new Promise<never>((_, reject) => {
+            deadline = setTimeout(
+              () => reject(new Error("Delayed upload did not reach its gate")),
+              15_000,
+            );
+            deadline.unref();
+          }),
+        ]);
+        assert.equal(
+          (await lateStorage.fenceOwned(lateIntent, lateMetadata, lateContext))
+            .cleaned,
+          true,
+        );
+      } finally {
+        if (deadline) clearTimeout(deadline);
+        release();
+        await rejected;
+      }
+      const lateVersions = await client.send(
+        new ListObjectVersionsCommand({
+          Bucket: bucket,
+          Prefix: lateIntent.key,
+        }),
+      );
+      assert.deepEqual(
+        lateVersions.Versions?.filter((v) => v.Key === lateIntent.key).map(
+          (v) => v.Size,
+        ),
+        [0],
+      );
       // Simulate an administrative overwrite outside the immutable adapter. Recovery must use the old exact version.
       const altered = await readFile(ciphertext);
       altered[100] = altered[100]! ^ 1;
@@ -175,6 +351,7 @@ test(
         await client.send(new DeleteBucketCommand({ Bucket: bucket }));
       }
       client.destroy();
+      ownedClient.destroy();
       await rm(directory, { recursive: true, force: true });
     }
   },
