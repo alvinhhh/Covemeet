@@ -15,7 +15,12 @@ import {
 
 const now = Date.UTC(2026, 9, 5, 12);
 const anchorAt = Date.UTC(2026, 0, 31, 12);
-async function fixture(t: TestContext, allowance = 360000, at = now) {
+async function fixture(
+  t: TestContext,
+  allowance = 360000,
+  at = now,
+  metering?: "meeting",
+) {
   t.mock.timers.enable({ apis: ["Date"], now: at });
   const store = new MemoryStore(),
     owner = randomUUID();
@@ -24,7 +29,11 @@ async function fixture(t: TestContext, allowance = 360000, at = now) {
     revision: 1,
     validUntil: at + 300000,
     enabled: true,
-    quota: { anchorAt, participantSecondsPerMonth: allowance },
+    quota: {
+      anchorAt,
+      participantSecondsPerMonth: allowance,
+      ...(metering ? { metering } : {}),
+    },
     hostAccountIds: [owner],
     limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 1 },
   };
@@ -283,60 +292,61 @@ test("display rounding never drives downgrade enforcement; absolute quota reduct
   assert.equal((await f.store.get(f.m.code))!.ended, true);
 });
 
-test("phone moderation can rejoin after confirmed shared-leg removal; terminal phone cleanup cannot refund early", async (t) => {
-  const f = await fixture(t);
-  await f.store.change(f.m.code, (m) => {
-    Object.assign(m.participants[0]!, {
-      transport: "phone",
-      phone: {
-        callId: randomUUID(),
-        trunkId: "fixture",
-        muted: false,
-        handRaised: false,
-        leaseExpiresAt: now + 10000,
-        callExpiresAt: now + 7200000,
-      },
+for (const metering of [undefined, "meeting"] as const)
+  test(`${metering ?? "participant"} phone moderation can rejoin after confirmed shared-leg removal; terminal phone cleanup cannot refund early`, async (t) => {
+    const f = await fixture(t, 360000, now, metering);
+    await f.store.change(f.m.code, (m) => {
+      Object.assign(m.participants[0]!, {
+        transport: "phone",
+        phone: {
+          callId: randomUUID(),
+          trunkId: "fixture",
+          muted: false,
+          handRaised: false,
+          leaseExpiresAt: now + 10000,
+          callExpiresAt: now + 7200000,
+        },
+      });
     });
+    await f.act(f.host, "first", "claim");
+    await f.act(f.host, "first", "connected");
+    t.mock.timers.tick(1000);
+    await f.store.change(f.m.code, (m) => {
+      m.participants[0]!.mediaVersion++;
+      m.participants[0]!.enforcementPending = true;
+    });
+    await f.store.settleParticipantMeter(f.m.code, f.host.id, 2, {
+      connectionId: "first",
+      mediaVersion: 1,
+    });
+    await f.store.change(f.m.code, (m) => {
+      m.participants[0]!.enforcementPending = false;
+    });
+    await f.act(f.host, "second", "claim", 2);
+    await f.act(f.host, "second", "connected", 2);
+    await f.store.change(f.m.code, (m) => {
+      const p = m.participants[0]!;
+      p.status = "left";
+      p.mediaVersion++;
+      p.enforcementPending = true;
+      p.phone!.leaseExpiresAt = 0;
+    });
+    await f.store.settleParticipantMeter(f.m.code, f.host.id, 3, {
+      connectionId: "second",
+      mediaVersion: 2,
+    });
+    assert.ok((await f.store.get(f.m.code))!.participants[0]!.meter);
+    assert.equal((await f.usage()).blocked, true);
+    await f.store.change(f.m.code, (m) => {
+      m.participants[0]!.enforcementPending = false;
+      m.participants[0]!.phone!.closed = true;
+    });
+    await f.store.reconcileParticipantMeters(f.m.code);
+    assert.equal(
+      (await f.store.get(f.m.code))!.participants[0]!.meter,
+      undefined,
+    );
   });
-  await f.act(f.host, "first", "claim");
-  await f.act(f.host, "first", "connected");
-  t.mock.timers.tick(1000);
-  await f.store.change(f.m.code, (m) => {
-    m.participants[0]!.mediaVersion++;
-    m.participants[0]!.enforcementPending = true;
-  });
-  await f.store.settleParticipantMeter(f.m.code, f.host.id, 2, {
-    connectionId: "first",
-    mediaVersion: 1,
-  });
-  await f.store.change(f.m.code, (m) => {
-    m.participants[0]!.enforcementPending = false;
-  });
-  await f.act(f.host, "second", "claim", 2);
-  await f.act(f.host, "second", "connected", 2);
-  await f.store.change(f.m.code, (m) => {
-    const p = m.participants[0]!;
-    p.status = "left";
-    p.mediaVersion++;
-    p.enforcementPending = true;
-    p.phone!.leaseExpiresAt = 0;
-  });
-  await f.store.settleParticipantMeter(f.m.code, f.host.id, 3, {
-    connectionId: "second",
-    mediaVersion: 2,
-  });
-  assert.ok((await f.store.get(f.m.code))!.participants[0]!.meter);
-  assert.equal((await f.usage()).blocked, true);
-  await f.store.change(f.m.code, (m) => {
-    m.participants[0]!.enforcementPending = false;
-    m.participants[0]!.phone!.closed = true;
-  });
-  await f.store.reconcileParticipantMeters(f.m.code);
-  assert.equal(
-    (await f.store.get(f.m.code))!.participants[0]!.meter,
-    undefined,
-  );
-});
 
 test("an unfunded late guest cannot end or extend another participant's prepaid access", async (t) => {
   const f = await fixture(t, 31);
@@ -388,4 +398,249 @@ test("a delayed cleanup proof cannot refund a replacement with the same particip
   assert.equal(p.meter!.connectionId, "replacement");
   assert.equal(p.meter!.phase, "active");
   assert.equal((await f.usage()).participantSeconds.reserved, 30);
+});
+
+test("meeting mode funds one interval for host, audience and phone peers, including a breakout", async (t) => {
+  const f = await fixture(t, 60, now, "meeting");
+  const phone = {
+    ...f.guest,
+    id: randomUUID(),
+    role: "viewer" as const,
+    transport: "phone" as const,
+    phone: {
+      callId: randomUUID(),
+      trunkId: "fixture",
+      muted: true,
+      handRaised: false,
+      leaseExpiresAt: now + 60000,
+      callExpiresAt: now + 60000,
+    },
+  };
+  await f.store.change(f.m.code, (m) => {
+    m.breakouts.push({ id: "breakout", name: "Room", room: randomUUID() });
+    m.participants[1]!.breakoutId = "breakout";
+    m.participants.push(phone);
+  });
+  for (const p of [f.host, f.guest, phone]) {
+    await f.act(p, p.id, "claim");
+    await f.act(p, p.id, "connected");
+  }
+  assert.deepEqual((await f.usage()).participantSeconds, {
+    limit: 60,
+    used: 0,
+    reserved: 30,
+    available: 30,
+  });
+  t.mock.timers.tick(10000);
+  for (const p of [f.host, f.guest, phone]) await f.act(p, p.id, "heartbeat");
+  const view = await f.usage();
+  assert.equal(view.metering, "meeting");
+  assert.equal(view.participantSeconds.used, 10);
+  assert.equal(view.participantSeconds.reserved, 20);
+  assert.equal(f.store.usageLedgers.get(f.owner)!.windows[0]!.usedMs, 0);
+});
+
+test("meeting mode admits peers against the same prepaid interval and stops the room at exhaustion", async (t) => {
+  const f = await fixture(t, 30, now, "meeting");
+  const claims = await Promise.allSettled([
+    f.act(f.host, "host", "claim"),
+    f.act(f.guest, "guest", "claim"),
+  ]);
+  assert.equal(claims.filter((r) => r.status === "fulfilled").length, 2);
+  assert.equal((await f.usage()).participantSeconds.reserved, 30);
+  await f.act(f.host, "host", "connected");
+  await f.act(f.guest, "guest", "connected");
+  for (let i = 0; i < 5; i++) {
+    t.mock.timers.tick(5000);
+    await f.act(f.host, "host", "heartbeat");
+    await f.act(f.guest, "guest", "heartbeat");
+  }
+  t.mock.timers.tick(5000);
+  await f.store.reconcileParticipantMeters(f.m.code);
+  const m = (await f.store.get(f.m.code))!;
+  assert.equal(m.ended, true);
+  for (const p of m.participants) {
+    assert.equal(p.meter!.phase, "closing");
+    await f.store.settleParticipantMeter(m.code, p.id, p.mediaVersion, p.meter);
+  }
+  assert.deepEqual((await f.usage()).participantSeconds, {
+    limit: 30,
+    used: 30,
+    reserved: 0,
+    available: 0,
+  });
+});
+
+test("simultaneous meetings consume separate pooled intervals without attendee multiplication", async (t) => {
+  const f = await fixture(t, 45, now, "meeting");
+  const other = structuredClone(f.m);
+  other.code = randomUUID();
+  other.id = randomUUID();
+  other.room = randomUUID();
+  other.participants = [{ ...f.host, id: randomUUID() }];
+  await f.store.create(other);
+  const p = other.participants[0]!;
+  for (const action of ["claim", "connected"] as const) {
+    await Promise.all([
+      f.act(f.host, "first", action),
+      f.store.updateParticipantMeter(other.code, {
+        participantId: p.id,
+        mediaVersion: 1,
+        connectionId: "second",
+        action,
+      }),
+    ]);
+  }
+  assert.equal((await f.usage()).participantSeconds.reserved, 45);
+  t.mock.timers.tick(10000);
+  await f.act(f.host, "first", "heartbeat");
+  const usage = await f.usage();
+  assert.equal(usage.participantSeconds.used, 20);
+  assert.equal(usage.participantSeconds.reserved, 25);
+});
+
+test("meeting reconnect and one peer cleanup preserve the shared reservation and newer connection", async (t) => {
+  const f = await fixture(t, 90, now, "meeting");
+  for (const [p, id] of [
+    [f.host, "host"],
+    [f.guest, "guest"],
+  ] as const) {
+    await f.act(p, id, "claim");
+    await f.act(p, id, "connected");
+  }
+  t.mock.timers.tick(5000);
+  await f.act(f.host, "successor", "claim");
+  await f.act(f.host, "successor", "connected");
+  await assert.rejects(
+    f.act(f.host, "host", "heartbeat"),
+    /connection changed/,
+  );
+  await f.store.change(f.m.code, (m) => {
+    m.participants[1]!.mediaVersion++;
+    m.participants[1]!.enforcementPending = true;
+  });
+  await f.store.reconcileParticipantMeters(f.m.code);
+  assert.equal((await f.usage()).blocked, true);
+  const guest = (await f.store.get(f.m.code))!.participants[1]!;
+  await f.store.settleParticipantMeter(
+    f.m.code,
+    guest.id,
+    guest.mediaVersion,
+    guest.meter,
+  );
+  assert.equal((await f.usage()).participantSeconds.reserved, 25);
+  assert.equal(
+    (await f.store.get(f.m.code))!.participants[0]!.meter!.connectionId,
+    "successor",
+  );
+  t.mock.timers.tick(5000);
+  await f.act(f.host, "successor", "heartbeat");
+  assert.equal((await f.usage()).participantSeconds.used, 10);
+});
+
+test("meeting mode preserves unused attempts and uncertain presence holds until exact cleanup", async (t) => {
+  const f = await fixture(t, 30, now, "meeting");
+  await f.act(f.host, "attempt", "claim");
+  t.mock.timers.tick(16000);
+  await f.store.reconcileParticipantMeters(f.m.code);
+  const pending = await f.usage();
+  assert.equal(pending.blocked, true);
+  assert.deepEqual(pending.participantSeconds, {
+    limit: 30,
+    used: 0,
+    reserved: 30,
+    available: 0,
+  });
+  t.mock.timers.tick(60000);
+  assert.deepEqual(
+    (await f.usage()).participantSeconds,
+    pending.participantSeconds,
+  );
+  const p = (await f.store.get(f.m.code))!.participants[0]!;
+  await f.store.settleParticipantMeter(f.m.code, p.id, p.mediaVersion, p.meter);
+  assert.deepEqual((await f.usage()).participantSeconds, {
+    limit: 30,
+    used: 0,
+    reserved: 0,
+    available: 30,
+  });
+  assert.equal((await f.store.get(f.m.code))!.meetingMeter, undefined);
+});
+
+test("meeting intervals split at the original monthly boundary", async (t) => {
+  const boundary = Date.UTC(2026, 9, 31, 12);
+  const f = await fixture(t, 60, boundary - 15000, "meeting");
+  for (const p of [f.host, f.guest]) {
+    await f.act(p, p.id, "claim");
+    await f.act(p, p.id, "connected");
+  }
+  for (let i = 0; i < 2; i++) {
+    t.mock.timers.tick(10000);
+    for (const p of [f.host, f.guest]) await f.act(p, p.id, "heartbeat");
+  }
+  const ledger = f.store.usageLedgers.get(f.owner)!;
+  assert.equal(
+    ledger.windows.find((w) => w.end === boundary)!.meetingUsedMs,
+    15000,
+  );
+  assert.equal((await f.usage()).participantSeconds.used, 5);
+  assert.equal((await f.usage()).participantSeconds.reserved, 30);
+});
+
+test("one-way migration drains legacy access without relabeling history or resetting later meeting usage", async (t) => {
+  const f = await fixture(t, 60);
+  await f.act(f.host, "legacy", "claim");
+  await f.act(f.host, "legacy", "connected");
+  t.mock.timers.tick(5000);
+  await f.act(f.host, "legacy", "heartbeat");
+  const grant = {
+    ...f.grant,
+    revision: 2,
+    quota: { ...f.grant.quota!, metering: "meeting" as const },
+  };
+  await f.store.setHostedEntitlement(grant);
+  const legacy = (await f.store.get(f.m.code))!;
+  assert.equal(legacy.ended, true);
+  assert.equal((await f.usage()).metering, "meeting");
+  assert.equal((await f.usage()).participantSeconds.used, 0);
+  assert.equal((await f.usage()).blocked, true);
+  const old = legacy.participants[0]!;
+  await f.store.settleParticipantMeter(
+    legacy.code,
+    old.id,
+    old.mediaVersion,
+    old.meter,
+  );
+  assert.equal(f.store.usageLedgers.get(f.owner)!.windows[0]!.usedMs, 5000);
+  const fresh = structuredClone(f.m);
+  fresh.code = randomUUID();
+  fresh.id = randomUUID();
+  fresh.room = randomUUID();
+  fresh.hosted!.entitlement = entitlementFor(grant, f.owner);
+  await f.store.create(fresh);
+  for (const action of ["claim", "connected"] as const)
+    await f.store.updateParticipantMeter(fresh.code, {
+      participantId: f.host.id,
+      mediaVersion: 1,
+      connectionId: "fresh",
+      action,
+    });
+  t.mock.timers.tick(1000);
+  assert.equal((await f.usage()).participantSeconds.used, 1);
+  await f.store.setHostedEntitlement({ ...grant, revision: 3 });
+  assert.equal((await f.usage()).participantSeconds.used, 1);
+  await f.store.setHostedEntitlement({
+    ...grant,
+    revision: 4,
+    enabled: false,
+    quota: null,
+  });
+  assert.equal((await f.usage()).metering, "meeting");
+  assert.equal((await f.usage()).participantSeconds.used, 1);
+  await f.store.setHostedEntitlement({ ...grant, revision: 5 });
+  await assert.rejects(
+    f.store.setHostedEntitlement({ ...f.grant, revision: 6 }),
+    /cannot revert/,
+  );
+  assert.equal((await f.usage()).participantSeconds.used, 1);
 });

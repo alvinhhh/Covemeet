@@ -10,14 +10,16 @@ export type HostedEntitlement = {
   enabled: boolean;
   quota: {
     anchorAt: number;
+    metering?: "meeting";
     participantSecondsPerMonth: number;
     downloadBytesPerMonth?: number;
-    recordingSecondsPerMonth?: number;
+    recordingSecondsPerMonth?: number | null;
     storageBytes?: number;
   } | null;
   hostAccountIds: string[];
   limits: {
     participants: number;
+    webinarParticipants?: number;
     durationSeconds: number;
     concurrentMeetings: number;
   };
@@ -41,24 +43,26 @@ export const entitlementSchema = z
     quota: z
       .object({
         anchorAt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        metering: z.literal("meeting").optional(),
         participantSecondsPerMonth: z.number().int().positive().max(36000000),
         downloadBytesPerMonth: z
           .number()
           .int()
           .nonnegative()
-          .max(1e12)
+          .max(2e12)
           .optional(),
         recordingSecondsPerMonth: z
           .number()
           .int()
           .nonnegative()
           .max(360000)
+          .nullable()
           .optional(),
         storageBytes: z
           .number()
           .int()
           .nonnegative()
-          .max(300_000_000_000)
+          .max(1_000_000_000_000)
           .optional(),
       })
       .strict()
@@ -74,8 +78,11 @@ export const entitlementSchema = z
     limits: z
       .object({
         participants: z.literal(100),
-        durationSeconds: z.literal(7200),
-        concurrentMeetings: z.union([z.literal(1), z.literal(2)]),
+        webinarParticipants: z
+          .union([z.literal(100), z.literal(1010)])
+          .optional(),
+        durationSeconds: z.union([z.literal(7200), z.literal(28800)]),
+        concurrentMeetings: z.number().int().min(1).max(100),
       })
       .strict(),
   })
@@ -106,12 +113,16 @@ export function nextEntitlement(
       grant.validUntil,
       grant.enabled,
       grant.quota?.anchorAt ?? null,
+      grant.quota?.metering ?? "participant",
       grant.quota?.participantSecondsPerMonth ?? null,
       grant.quota?.downloadBytesPerMonth ?? 0,
-      grant.quota?.recordingSecondsPerMonth ?? 0,
+      grant.quota?.recordingSecondsPerMonth === undefined
+        ? 0
+        : grant.quota.recordingSecondsPerMonth,
       grant.quota?.storageBytes ?? 0,
       [...grant.hostAccountIds].sort(),
       grant.limits.participants,
+      grant.limits.webinarParticipants ?? grant.limits.participants,
       grant.limits.durationSeconds,
       grant.limits.concurrentMeetings,
     ]);
@@ -207,6 +218,8 @@ export function occupiesMeetingSeat(p: Participant) {
 }
 
 export function participantLimit(m: Meeting) {
+  if (m.mode === "webinar" && m.hosted?.entitlement?.limits.webinarParticipants)
+    return m.hosted.entitlement.limits.webinarParticipants;
   return (
     m.hosted?.entitlement?.limits.participants ??
     m.limits?.participants ??

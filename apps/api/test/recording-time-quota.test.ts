@@ -16,7 +16,11 @@ import {
 const now = Date.UTC(2026, 9, 5, 12);
 const anchorAt = Date.UTC(2024, 0, 31, 12);
 
-async function fixture(t: TestContext, allowance = 90, at = now) {
+async function fixture(
+  t: TestContext,
+  allowance: number | null = 90,
+  at = now,
+) {
   t.mock.timers.enable({ apis: ["Date"], now: at });
   const store = new MemoryStore(),
     owner = randomUUID();
@@ -106,7 +110,14 @@ async function fixture(t: TestContext, allowance = 90, at = now) {
     lock,
     reserve,
     observe,
-    usage: async () => (await store.hostedUsage(owner)).recordingSeconds,
+    usage: async () => {
+      const usage = (await store.hostedUsage(owner)).recordingSeconds;
+      assert.ok(
+        usage,
+        "This legacy fixture expects a numeric recording allowance",
+      );
+      return usage;
+    },
   };
 }
 
@@ -499,4 +510,83 @@ test("legacy capture with missing usage history still stops without fabricating 
     (await f.store.get(f.m.code))!.recordings[0]!.timeReservation!.settled,
     undefined,
   );
+});
+
+test("explicit uncapped recording ignores monthly history but preserves exact terminal settlement", async (t) => {
+  const f = await fixture(t, null);
+  const view = await f.store.hostedUsage(f.owner);
+  const ledger = f.store.usageLedgers.get(f.owner)!;
+  const historicalMs = 36_000_000;
+  ledger.windows.push({
+    ...view.window!,
+    usedMs: 0,
+    recordingUsedMs: historicalMs,
+  });
+  const recording = await f.reserve();
+  assert.equal((await f.store.hostedUsage(f.owner)).recordingSeconds, null);
+  await f.observe(recording, {
+    egressId: "uncapped-job",
+    terminal: false,
+    startedAt: now,
+  });
+  t.mock.timers.tick(20_000);
+  const renewed = await f.observe(recording, {
+    egressId: "uncapped-job",
+    terminal: false,
+    startedAt: now,
+  });
+  assert.equal(renewed.mustStop, false);
+  assert.equal(renewed.recording.timeReservation!.fundedUntil, now + 50_000);
+  const terminal = {
+    egressId: "uncapped-job",
+    terminal: true as const,
+    startedAt: now,
+    endedAt: now + 20_000,
+  };
+  await f.observe(recording, terminal);
+  await f.observe(recording, terminal);
+  assert.equal(
+    f.store.usageLedgers.get(f.owner)!.windows[0]!.recordingUsedMs,
+    historicalMs + 20_000,
+  );
+  assert.equal((await f.store.hostedUsage(f.owner)).recordingSeconds, null);
+  await assert.rejects(
+    f.observe(recording, { ...terminal, endedAt: now + 19_000 }),
+    /settlement changed/,
+  );
+});
+
+test("uncapped recording keeps unknown capture holds and rejects expired paid access", async (t) => {
+  const f = await fixture(t, null);
+  const recording = await f.reserve();
+  t.mock.timers.tick(31_000);
+  const checked = await f.lock(recording.id, (lock) =>
+    lock.checkRecordingTime(),
+  );
+  assert.equal(checked.mustStop, true);
+  assert.equal(checked.recording.status, "stopping");
+  await assert.rejects(f.reserve(randomUUID(), await f.room()), /unavailable/);
+  assert.equal((await f.store.hostedUsage(f.owner)).recordingSeconds, null);
+  await f.observe(recording, {
+    egressId: "recovered-uncapped-job",
+    terminal: true,
+    startedAt: now,
+    endedAt: now + 31_000,
+  });
+  t.mock.timers.tick(300_000);
+  await assert.rejects(f.reserve(randomUUID(), await f.room()), /unavailable/);
+});
+
+test("a missing recording allowance stays denied rather than becoming uncapped", async (t) => {
+  const f = await fixture(t, null);
+  const quota = { ...f.grant.quota! };
+  delete quota.recordingSecondsPerMonth;
+  await f.store.setHostedEntitlement({ ...f.grant, revision: 2, quota });
+  await assert.rejects(f.reserve(), /unavailable/);
+  assert.deepEqual(await f.usage(), {
+    limit: 0,
+    used: 0,
+    reserved: 0,
+    available: 0,
+  });
 });

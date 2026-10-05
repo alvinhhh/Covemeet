@@ -269,6 +269,137 @@ test(
 );
 
 test(
+  "PostgreSQL meeting reservations serialize per room across pools and survive a process restart",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account(),
+      member = f.account();
+    const first = (await f.create(0, owner, randomUUID())).json();
+    const grant = (
+      await f.stores[0].pool.query(
+        "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+        [owner],
+      )
+    ).rows[0].data;
+    await f.stores[0].setHostedEntitlement({
+      ...grant,
+      revision: 2,
+      hostAccountIds: [owner, member],
+      quota: {
+        ...grant.quota,
+        metering: "meeting",
+        participantSecondsPerMonth: 45,
+      },
+      limits: { ...grant.limits, concurrentMeetings: 2 },
+    });
+    const secondReply = await f.apps[1].inject({
+      method: "POST",
+      url: "/api/internal/hosted/meetings",
+      headers: internalHeaders,
+      payload: {
+        accountId: member,
+        billingOwnerId: owner,
+        version: 1,
+        operationId: randomUUID(),
+        meeting,
+      },
+    });
+    assert.equal(secondReply.statusCode, 200, secondReply.body);
+    const second = secondReply.json();
+    for (const [i, row] of [first, second].entries()) {
+      const started = await f.apps[i]!.inject({
+        method: "POST",
+        url: `/api/meetings/${row.code}/host`,
+        headers: browserHeaders,
+        payload: { token: row.hostToken },
+      });
+      assert.equal(started.statusCode, 200, started.body);
+    }
+    await f.stores[0].change(first.code, (m) => {
+      m.participants.push({
+        ...m.participants[0]!,
+        id: randomUUID(),
+        name: "Guest",
+        role: "participant",
+      });
+    });
+    const peers = (
+      await Promise.all(
+        [first, second].map(async ({ code }) => {
+          const m = (await f.stores[0].get(code))!;
+          return m.participants.map((p) => ({
+            code,
+            participantId: p.id,
+            mediaVersion: p.mediaVersion,
+            connectionId: randomUUID(),
+          }));
+        }),
+      )
+    ).flat();
+    const claimed = await Promise.allSettled(
+      peers.map((p, i) =>
+        f.stores[i % 2]!.updateParticipantMeter(p.code, {
+          ...p,
+          action: "claim",
+        }),
+      ),
+    );
+    assert.equal(claimed.filter((r) => r.status === "fulfilled").length, 3);
+    const before = await f.stores[1].hostedUsage(owner);
+    assert.equal(before.metering, "meeting");
+    assert.deepEqual(before.participantSeconds, {
+      limit: 45,
+      used: 0,
+      reserved: 45,
+      available: 0,
+    });
+    for (const p of peers)
+      await f.stores[0].updateParticipantMeter(p.code, {
+        ...p,
+        action: "connected",
+      });
+    for (const { code } of [first, second])
+      await f.stores[0].change(code, (m) => {
+        for (const p of m.participants) p.meter!.presenceUntil = Date.now() - 1;
+      });
+    const restarted = new PgStore(databaseUrl!);
+    t.after(() => restarted.close());
+    for (const { code } of [first, second])
+      await restarted.reconcileParticipantMeters(code);
+    const held = await restarted.hostedUsage(owner);
+    assert.equal(held.blocked, true);
+    assert.ok(held.participantSeconds.reserved > 0);
+    for (const { code } of [first, second]) {
+      const m = (await restarted.get(code))!;
+      for (const p of m.participants)
+        await restarted.settleParticipantMeter(
+          code,
+          p.id,
+          p.mediaVersion,
+          p.meter,
+        );
+      assert.equal((await restarted.get(code))!.meetingMeter, undefined);
+    }
+    const released = await f.stores[1].hostedUsage(owner);
+    assert.equal(released.blocked, false);
+    assert.equal(released.participantSeconds.reserved, 0);
+    const ledger = (
+      await f.stores[0].pool.query(
+        "SELECT data FROM hosted_usage WHERE billing_owner_id=$1",
+        [owner],
+      )
+    ).rows[0].data;
+    assert.ok(
+      ledger.windows.every(
+        (w: { usedMs: number; meetingUsedMs?: number }) =>
+          w.usedMs === 0 && (w.meetingUsedMs ?? 0) <= 45000,
+      ),
+    );
+  },
+);
+
+test(
   "PostgreSQL duplicate hosted creation returns one unused capability across pools",
   { skip: !databaseUrl, timeout: 30000 },
   async (t) => {

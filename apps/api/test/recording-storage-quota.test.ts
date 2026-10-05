@@ -138,7 +138,7 @@ test("capture reserves both encrypted copies atomically and rejected starts pers
     available: 0,
   });
   assert.equal(
-    (await f.store.hostedUsage(f.owner)).recordingSeconds.reserved,
+    (await f.store.hostedUsage(f.owner)).recordingSeconds!.reserved,
     30,
   );
   assert.equal(
@@ -397,7 +397,7 @@ test("missing storage allowance or plan rejects paid capture and leaves existing
   });
   assert.equal((await f.store.get(f.m.code))!.recordings.length, 0);
   assert.equal(
-    (await f.store.hostedUsage(f.owner)).recordingSeconds.reserved,
+    (await f.store.hostedUsage(f.owner)).recordingSeconds!.reserved,
     0,
   );
 });
@@ -461,7 +461,7 @@ test("prepared evidence and completed byte counts cannot be replaced or exceed t
 
 test("storage grants are bounded and same-revision allowance changes conflict", async (t) => {
   const f = await fixture(t);
-  for (const limit of [-1, 0.5, 300_000_000_001])
+  for (const limit of [-1, 0.5, 1_000_000_000_001])
     assert.equal(
       entitlementSchema.safeParse({
         ...f.grant,
@@ -472,7 +472,7 @@ test("storage grants are bounded and same-revision allowance changes conflict", 
   assert.equal(
     entitlementSchema.safeParse({
       ...f.grant,
-      quota: { ...f.grant.quota!, storageBytes: 300_000_000_000 },
+      quota: { ...f.grant.quota!, storageBytes: 1_000_000_000_000 },
     }).success,
     true,
   );

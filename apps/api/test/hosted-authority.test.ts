@@ -1127,6 +1127,106 @@ test("hosted webinar uses 100 total places including host, pending removal and p
   );
 });
 
+test("Teams grants preserve 100-person meetings, 1000 webinar viewers and an eight-hour fixed deadline", async (t) => {
+  const f = await fixture(t);
+  const grant = {
+    ...f.grant,
+    revision: 2,
+    quota: {
+      ...f.grant.quota,
+      metering: "meeting",
+      recordingSecondsPerMonth: null,
+      storageBytes: 1_000_000_000_000,
+      downloadBytesPerMonth: 2_000_000_000_000,
+    },
+    limits: {
+      participants: 100,
+      webinarParticipants: 1010,
+      durationSeconds: 28800,
+      concurrentMeetings: 100,
+    },
+  };
+  assert.equal((await f.internal("entitlements", grant)).statusCode, 200);
+  const made = (
+    await f.create({ meeting: { ...settings, mode: "webinar" } })
+  ).json();
+  const cookie = await f.exchange(made.code, made.hostToken);
+  const m = (await f.store.get(made.code))!;
+  assert.equal(m.lifecycle!.deadlineAt! - m.lifecycle!.startedAt, 28800000);
+  const state = (
+    await f.browser(`/api/meetings/${made.code}/state`, undefined, cookie)
+  ).json();
+  assert.equal(state.meeting.participantLimit, 1010);
+  const phone = (
+    await f.browser(`/api/meetings/${made.code}/phone`, {}, cookie)
+  ).json();
+  await f.store.change(made.code, (current) => {
+    for (let i = 0; i < 1000; i++)
+      current.participants.push({
+        ...current.participants[0]!,
+        id: randomUUID(),
+        role: "viewer",
+        tokenHash: "",
+        status: "admitted",
+      });
+  });
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/join`, {
+        name: "Extra",
+        password: settings.password,
+      })
+    ).statusCode,
+    409,
+  );
+  assert.equal(
+    (
+      await f.gateway("calls", {
+        callId: randomUUID(),
+        trunkId: "fixture",
+        locator: phone.locator,
+        pin: phone.pin,
+      })
+    ).statusCode,
+    409,
+  );
+  const other = (
+    await f.create({ accountId: f.foreignAccountId, operationId: randomUUID() })
+  ).json();
+  const otherCookie = await f.exchange(other.code, other.hostToken);
+  assert.equal(
+    (
+      await f.browser(
+        `/api/meetings/${other.code}/state`,
+        undefined,
+        otherCookie,
+      )
+    ).json().meeting.participantLimit,
+    100,
+  );
+  for (const changed of [
+    { limits: { ...grant.limits, concurrentMeetings: 101 } },
+    { limits: { ...grant.limits, durationSeconds: 28801 } },
+    { limits: { ...grant.limits, webinarParticipants: 1011 } },
+    { quota: { ...grant.quota, storageBytes: 1_000_000_000_001 } },
+    { quota: { ...grant.quota, downloadBytesPerMonth: 2_000_000_000_001 } },
+  ])
+    assert.equal(
+      (await f.internal("entitlements", { ...grant, ...changed, revision: 3 }))
+        .statusCode,
+      400,
+    );
+  assert.equal(
+    (
+      await f.internal("entitlements", {
+        ...grant,
+        quota: { ...grant.quota, recordingSecondsPerMonth: 0 },
+      })
+    ).statusCode,
+    409,
+  );
+});
+
 test("ordinary completion retains finished recording credentials and cannot release a busy recorder slot", async (t) => {
   const f = await fixture(t);
   const made = (await f.create()).json();

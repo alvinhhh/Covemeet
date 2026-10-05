@@ -30,11 +30,13 @@ import {
   requireUsage,
   reserveRecordingTime,
   settleMeter,
+  setMetering,
   sweepParticipantMeters,
   sweepRecordingTimes,
   updateMeter,
   usageView,
   type MeterInput,
+  type MeetingMeter,
   type ParticipantMeter,
   type RecordingTimeObservation,
   type RecordingTimeReservation,
@@ -120,6 +122,7 @@ export type Recording = {
   error?: string;
 };
 export type Meeting = {
+  meetingMeter?: MeetingMeter;
   hosted?: {
     accountId: string;
     billingOwnerId?: string;
@@ -754,6 +757,7 @@ export class PgStore implements Store {
           meetings,
           now,
           m.participants.find((p) => p.id === participantId),
+          m,
         ),
       async () => {},
     );
@@ -798,7 +802,7 @@ export class PgStore implements Store {
           p.meter.mediaVersion === expected.mediaVersion &&
           canSettleMeter(m, p, now)
         )
-          settleMeter(ledger, p, now);
+          settleMeter(ledger, m, p, now);
       },
       async () => {},
     );
@@ -815,7 +819,7 @@ export class PgStore implements Store {
             !p.enforcementPending &&
             canSettleMeter(m, p, now)
           )
-            settleMeter(ledger, p, now);
+            settleMeter(ledger, m, p, now);
       },
       async () => {},
     );
@@ -876,6 +880,14 @@ export class PgStore implements Store {
             [input.billingOwnerId],
           )
         ).rows.map((row) => row.data as Meeting);
+        if (ledger)
+          setMetering(
+            ledger,
+            grant,
+            meetings.filter(
+              (m) => m.hosted?.billingOwnerId === grant.billingOwnerId,
+            ),
+          );
         applyEntitlement(grant, meetings);
         if (ledger) {
           sweepParticipantMeters(ledger, meetings, Date.now());
@@ -1824,6 +1836,7 @@ export class MemoryStore implements Store {
           meetings,
           now,
           m.participants.find((p) => p.id === participantId),
+          m,
         ),
       async () => {},
     );
@@ -1868,7 +1881,7 @@ export class MemoryStore implements Store {
           p.meter.mediaVersion === expected.mediaVersion &&
           canSettleMeter(m, p, now)
         )
-          settleMeter(ledger, p, now);
+          settleMeter(ledger, m, p, now);
       },
       async () => {},
     );
@@ -1885,7 +1898,7 @@ export class MemoryStore implements Store {
             !p.enforcementPending &&
             canSettleMeter(m, p, now)
           )
-            settleMeter(ledger, p, now);
+            settleMeter(ledger, m, p, now);
       },
       async () => {},
     );
@@ -1905,6 +1918,14 @@ export class MemoryStore implements Store {
           ledger ??= { anchorAt: grant.quota.anchorAt, windows: [] };
         }
         const meetings = structuredClone([...this.data.values()]);
+        if (ledger)
+          setMetering(
+            ledger,
+            grant,
+            meetings.filter(
+              (m) => m.hosted?.billingOwnerId === grant.billingOwnerId,
+            ),
+          );
         applyEntitlement(grant, meetings);
         if (ledger) {
           const bound = meetings.filter(

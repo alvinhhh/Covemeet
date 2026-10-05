@@ -232,7 +232,7 @@ test("unbound rooms still authorize but do not need a hosted quota", async (t) =
 
 test("download grants reject invalid limits and a changed same-revision allowance", async (t) => {
   const f = await fixture(t);
-  for (const value of [-1, 0.5, 1e12 + 1])
+  for (const value of [-1, 0.5, 2e12 + 1])
     assert.equal(
       entitlementSchema.safeParse({
         ...f.grant,
@@ -243,7 +243,7 @@ test("download grants reject invalid limits and a changed same-revision allowanc
   assert.equal(
     entitlementSchema.safeParse({
       ...f.grant,
-      quota: { ...f.grant.quota!, downloadBytesPerMonth: 1e12 },
+      quota: { ...f.grant.quota!, downloadBytesPerMonth: 2e12 },
     }).success,
     true,
   );

@@ -32,12 +32,18 @@ export type ParticipantMeter = {
   presenceUntil: number;
   connectedAt?: number;
 };
+export type MeetingMeter = Pick<
+  ParticipantMeter,
+  "phase" | "accountedAt" | "fundedUntil" | "connectedAt"
+>;
 export type UsageLedger = {
   anchorAt: number;
+  metering?: "meeting";
   windows: {
     start: number;
     end: number;
     usedMs: number;
+    meetingUsedMs?: number;
     recordingDownloadBytesUsed?: number;
     recordingUsedMs?: number;
   }[];
@@ -94,28 +100,72 @@ function windowRow(ledger: UsageLedger, start: number, end: number) {
 
 function account(
   ledger: UsageLedger,
-  meter: ParticipantMeter,
+  meter: MeetingMeter,
   through: number,
+  mode: "participant" | "meeting" = "participant",
 ) {
   if (meter.connectedAt === undefined) return;
   const to = Math.min(through, meter.fundedUntil);
-  for (const part of intervals(ledger.anchorAt, meter.accountedAt, to))
-    windowRow(ledger, part.start, part.end).usedMs += part.ms;
+  for (const part of intervals(ledger.anchorAt, meter.accountedAt, to)) {
+    const row = windowRow(ledger, part.start, part.end);
+    if (mode === "meeting")
+      row.meetingUsedMs = (row.meetingUsedMs ?? 0) + part.ms;
+    else row.usedMs += part.ms;
+  }
   meter.accountedAt = Math.max(meter.accountedAt, to);
 }
 
-function held(ledger: UsageLedger, meetings: Meeting[], start: number) {
+function held(
+  ledger: UsageLedger,
+  meetings: Meeting[],
+  start: number,
+  mode: "participant" | "meeting" = ledger.metering ?? "participant",
+) {
   let ms = 0;
-  for (const m of meetings)
-    for (const p of m.participants)
-      if (p.meter)
+  for (const m of meetings) {
+    const meters =
+      mode === "meeting"
+        ? [m.meetingMeter]
+        : m.meetingMeter
+          ? []
+          : m.participants.map((p) => p.meter);
+    for (const meter of meters)
+      if (meter)
         for (const part of intervals(
           ledger.anchorAt,
-          p.meter.accountedAt,
-          p.meter.fundedUntil,
+          meter.accountedAt,
+          meter.fundedUntil,
         ))
           if (part.start === start) ms += part.ms;
+  }
   return ms;
+}
+
+function usedTime(ledger: UsageLedger, start: number) {
+  const row = ledger.windows.find((w) => w.start === start);
+  return ledger.metering === "meeting"
+    ? (row?.meetingUsedMs ?? 0)
+    : (row?.usedMs ?? 0);
+}
+
+export function setMetering(
+  ledger: UsageLedger,
+  grant: HostedEntitlement,
+  meetings: Meeting[],
+) {
+  if (!grant.quota) return;
+  if (ledger.metering === "meeting" && grant.quota.metering !== "meeting")
+    throw new HttpError(
+      409,
+      "Meeting metering cannot revert to participant metering",
+    );
+  if (grant.quota.metering === "meeting" && ledger.metering !== "meeting") {
+    // One-way upgrade: retain historical participant usage and every uncertain
+    // reservation. Drain old paid sessions; never relabel them as meeting time.
+    for (const m of meetings)
+      if (!m.meetingMeter && m.participants.some((p) => p.meter)) endMeeting(m);
+    ledger.metering = "meeting";
+  }
 }
 
 export function usageBlocked(
@@ -127,8 +177,10 @@ export function usageBlocked(
     !grant?.enabled ||
     !grant.quota ||
     grant.validUntil <= now ||
-    meetings.some((m) =>
-      m.participants.some((p) => p.meter?.phase === "closing"),
+    meetings.some(
+      (m) =>
+        m.meetingMeter?.phase === "closing" ||
+        m.participants.some((p) => p.meter?.phase === "closing"),
     )
   );
 }
@@ -138,7 +190,30 @@ export function sweepParticipantMeters(
   meetings: Meeting[],
   now: number,
 ) {
-  for (const m of meetings)
+  for (const m of meetings) {
+    if (m.meetingMeter) {
+      const shared = m.meetingMeter;
+      if (shared.fundedUntil <= now && !m.ended) endMeeting(m);
+      for (const p of m.participants) {
+        const meter = p.meter;
+        if (!meter || meter.phase === "closing") continue;
+        if (
+          !meetingAllowed(m, now) ||
+          p.status !== "admitted" ||
+          p.enforcementPending ||
+          shared.fundedUntil <= now ||
+          meter.presenceUntil <= now
+        ) {
+          meter.phase = "closing";
+          if (!p.enforcementPending) fenceParticipantMedia(m, p);
+        }
+      }
+      if (!m.participants.some((p) => p.meter && p.meter.phase !== "closing"))
+        shared.phase = "closing";
+      else if (shared.phase === "active")
+        account(ledger, shared, now, "meeting");
+      continue;
+    }
     for (const p of m.participants) {
       const meter = p.meter;
       if (!meter || meter.phase === "closing") continue;
@@ -158,6 +233,7 @@ export function sweepParticipantMeters(
         }
       } else if (meter.phase === "active") account(ledger, meter, now);
     }
+  }
 }
 
 export function usageView(
@@ -167,8 +243,7 @@ export function usageView(
   now: number,
 ) {
   const window = usageWindow(ledger.anchorAt, now);
-  const used =
-    ledger.windows.find((w) => w.start === window.start)?.usedMs ?? 0;
+  const used = usedTime(ledger, window.start);
   const reserved = held(ledger, meetings, window.start);
   const limit = (grant?.quota?.participantSecondsPerMonth ?? 0) * 1000;
   const downloadLimit = grant?.quota?.downloadBytesPerMonth ?? 0;
@@ -177,6 +252,7 @@ export function usageView(
       ?.recordingDownloadBytesUsed ?? 0;
   return {
     ok: true as const,
+    metering: ledger.metering ?? "participant",
     window,
     participantSeconds: {
       limit: limit / 1000,
@@ -228,8 +304,7 @@ export function quotaOverdrawn(
   now: number,
 ) {
   const window = usageWindow(ledger.anchorAt, now);
-  const used =
-    ledger.windows.find((w) => w.start === window.start)?.usedMs ?? 0;
+  const used = usedTime(ledger, window.start);
   return (
     used + held(ledger, meetings, window.start) >
     (grant.quota?.participantSecondsPerMonth ?? 0) * 1000
@@ -242,13 +317,13 @@ export function requireUsage(
   meetings: Meeting[],
   now: number,
   participant?: Participant,
+  meeting?: Meeting,
 ) {
   const view = usageView(ledger, grant, meetings, now);
-  const prepaid =
-    participant?.meter &&
-    participant.meter.phase !== "closing" &&
-    participant.meter.fundedUntil > now;
-  const continuing = prepaid && participant.meter!.phase === "active";
+  const meter =
+    ledger.metering === "meeting" ? meeting?.meetingMeter : participant?.meter;
+  const prepaid = meter && meter.phase !== "closing" && meter.fundedUntil > now;
+  const continuing = prepaid && meter.phase === "active";
   if (
     !grant?.enabled ||
     !grant.quota ||
@@ -259,7 +334,7 @@ export function requireUsage(
   )
     throw new HttpError(
       409,
-      "Participant-minute allowance is unavailable",
+      "Meeting access allowance is unavailable",
       "PARTICIPANT_QUOTA_UNAVAILABLE",
     );
 }
@@ -268,13 +343,12 @@ function fund(
   ledger: UsageLedger,
   grant: HostedEntitlement,
   meetings: Meeting[],
-  meter: ParticipantMeter,
+  meter: MeetingMeter,
   to: number,
 ) {
   const limit = grant.quota!.participantSecondsPerMonth * 1000;
   for (const part of intervals(ledger.anchorAt, meter.fundedUntil, to)) {
-    const used =
-      ledger.windows.find((w) => w.start === part.start)?.usedMs ?? 0;
+    const used = usedTime(ledger, part.start);
     const available = Math.max(
       0,
       limit - used - held(ledger, meetings, part.start),
@@ -317,7 +391,59 @@ export function updateMeter(
       "Participant-minute allowance is unavailable",
       "PARTICIPANT_QUOTA_UNAVAILABLE",
     );
-  requireUsage(ledger, grant, meetings, now, p);
+  requireUsage(ledger, grant, meetings, now, p, meeting);
+  if (ledger.metering === "meeting") {
+    const shared = (meeting.meetingMeter ??= {
+      phase: "connecting",
+      accountedAt: now,
+      fundedUntil: now,
+    });
+    if (input.action === "claim") {
+      meter = p.meter ??= {
+        connectionId: input.connectionId,
+        mediaVersion: input.mediaVersion,
+        phase: "connecting",
+        accountedAt: now,
+        fundedUntil: shared.fundedUntil,
+        presenceUntil: now + PARTICIPANT_PRESENCE_MS,
+      };
+      meter.connectionId = input.connectionId;
+      meter.mediaVersion = input.mediaVersion;
+    }
+    if (meter!.phase === "closing" || shared.phase === "closing")
+      throw new HttpError(409, "Media cleanup is pending");
+    if (input.action === "connected") {
+      if (shared.connectedAt === undefined) {
+        shared.connectedAt = now;
+        shared.accountedAt = now;
+        shared.phase = "active";
+      }
+      meter!.connectedAt ??= now;
+      meter!.phase = "active";
+    }
+    // One logical meeting interval covers all peers, phone legs and breakouts.
+    // Successful signaling opens allowance, including setup and presence grace.
+    if (shared.phase === "active") account(ledger, shared, now, "meeting");
+    meter!.presenceUntil = now + PARTICIPANT_PRESENCE_MS;
+    if (!blocked && shared.fundedUntil - now <= 10_000)
+      fund(
+        ledger,
+        grant,
+        meetings,
+        shared,
+        Math.min(now + PARTICIPANT_PREPAY_MS, meetingDeadline(meeting)),
+      );
+    for (const member of meeting.participants)
+      if (member.meter && member.meter.phase !== "closing")
+        member.meter.fundedUntil = shared.fundedUntil;
+    if (shared.fundedUntil <= now)
+      throw new HttpError(
+        409,
+        "Meeting allowance is exhausted",
+        "PARTICIPANT_QUOTA_UNAVAILABLE",
+      );
+    return;
+  }
   if (input.action === "claim") {
     meter = p.meter ??= {
       connectionId: input.connectionId,
@@ -357,10 +483,18 @@ export function updateMeter(
     );
 }
 
-export function settleMeter(ledger: UsageLedger, p: Participant, now: number) {
+export function settleMeter(
+  ledger: UsageLedger,
+  m: Meeting,
+  p: Participant,
+  now: number,
+) {
   if (!p.meter) return;
-  account(ledger, p.meter, now);
+  if (m.meetingMeter) account(ledger, m.meetingMeter, now, "meeting");
+  else account(ledger, p.meter, now);
   delete p.meter;
+  if (m.meetingMeter && !m.participants.some((member) => member.meter))
+    delete m.meetingMeter;
 }
 
 export function canSettleMeter(m: Meeting, p: Participant, now: number) {
@@ -409,6 +543,7 @@ function recordingTimeView(
   meetings: Meeting[],
   now: number,
 ) {
+  if (grant?.quota?.recordingSecondsPerMonth === null) return null;
   const window = usageWindow(ledger.anchorAt, now);
   const used =
     ledger.windows.find((w) => w.start === window.start)?.recordingUsedMs ?? 0;
@@ -428,6 +563,7 @@ function recordingOverdrawn(
   meetings: Meeting[],
   now: number,
 ) {
+  if (grant?.quota?.recordingSecondsPerMonth === null) return false;
   const window = usageWindow(ledger.anchorAt, now);
   return (
     (ledger.windows.find((w) => w.start === window.start)?.recordingUsedMs ??
@@ -456,7 +592,8 @@ function recordingEligible(
   return (
     !!grant?.enabled &&
     grant.validUntil > now &&
-    !!grant.quota?.recordingSecondsPerMonth &&
+    (grant.quota?.recordingSecondsPerMonth === null ||
+      (grant.quota?.recordingSecondsPerMonth ?? 0) > 0) &&
     !m.hosted?.revoked &&
     grant.hostAccountIds.includes(m.hosted!.accountId) &&
     meetingAllowed(m, now) &&
@@ -527,6 +664,12 @@ function fundRecordingTime(
   to: number,
   now: number,
 ) {
+  // Uncapped monthly recording still needs a short control lease, paid access,
+  // storage reservation and exact terminal proof before releasing an old job.
+  if (grant.quota?.recordingSecondsPerMonth === null) {
+    reservation.fundedUntil = Math.max(reservation.fundedUntil, to);
+    return;
+  }
   const limit = (grant.quota?.recordingSecondsPerMonth ?? 0) * 1000;
   for (const part of intervals(ledger.anchorAt, reservation.fundedUntil, to)) {
     const used =

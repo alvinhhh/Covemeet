@@ -16,7 +16,9 @@ import type { Transporter } from "nodemailer";
 import {
   EgressInfo,
   EgressStatus,
+  EncodingOptions,
   RoomCompositeEgressRequest,
+  type RoomCompositeOptions,
   type EncodedFileOutput,
 } from "livekit-server-sdk";
 import {
@@ -73,6 +75,7 @@ async function fixture(t: TestContext, timestamped = false) {
   await store.create(meeting);
   const jobs: EgressInfo[] = [];
   const stops: string[] = [];
+  const startOptions: (RoomCompositeOptions | undefined)[] = [];
   const controls = {
     startTimeout: false,
     stopFailures: 0,
@@ -80,7 +83,12 @@ async function fixture(t: TestContext, timestamped = false) {
     listOverride: undefined as EgressInfo[] | undefined,
   };
   const client = {
-    async startRoomCompositeEgress(room: string, output: EncodedFileOutput) {
+    async startRoomCompositeEgress(
+      room: string,
+      output: EncodedFileOutput,
+      options?: RoomCompositeOptions,
+    ) {
+      startOptions.push(options);
       const info = new EgressInfo({
         egressId: `EG_${randomUUID()}`,
         roomName: room,
@@ -139,6 +147,7 @@ async function fixture(t: TestContext, timestamped = false) {
     meeting,
     jobs,
     stops,
+    startOptions,
     controls,
     service,
     client,
@@ -149,7 +158,7 @@ async function fixture(t: TestContext, timestamped = false) {
 
 async function hostedFixture(
   t: TestContext,
-  seconds = 90,
+  seconds: number | null = 90,
   storageBytes = 3_000_000_000,
 ) {
   const now = Date.UTC(2026, 9, 5, 12);
@@ -177,7 +186,14 @@ async function hostedFixture(
     m.lifecycle = { startedAt: now, deadlineAt: now + 7_200_000 };
   });
   const current = () => f.store.get(f.meeting.code) as Promise<Meeting>;
-  const usage = async () => (await f.store.hostedUsage(owner)).recordingSeconds;
+  const usage = async () => {
+    const usage = (await f.store.hostedUsage(owner)).recordingSeconds;
+    assert.ok(
+      usage,
+      "This legacy fixture expects a numeric recording allowance",
+    );
+    return usage;
+  };
   const another = async () => {
     const m = structuredClone(await current());
     m.id = randomUUID();
@@ -189,6 +205,26 @@ async function hostedFixture(
   };
   return { ...f, now, owner, current, usage, another };
 }
+
+test("hosted capture requests explicit 720p24 while self-hosted keeps recorder defaults", async (t) => {
+  const selfHosted = await fixture(t);
+  await selfHosted.service.start(selfHosted.meeting);
+  assert.deepEqual(selfHosted.startOptions, [{ layout: "grid" }]);
+  const hosted = await hostedFixture(t, null);
+  hosted.config.edition = "hosted";
+  await hosted.service.start(await hosted.current());
+  const options = hosted.startOptions[0]!;
+  assert.equal(options.layout, "grid");
+  assert.ok(options.encodingOptions instanceof EncodingOptions);
+  assert.equal(options.encodingOptions.width, 1280);
+  assert.equal(options.encodingOptions.height, 720);
+  assert.equal(options.encodingOptions.framerate, 24);
+  assert.equal((await hosted.row()).status, "recording");
+  assert.equal(
+    (await hosted.store.hostedUsage(hosted.owner)).recordingSeconds,
+    null,
+  );
+});
 
 test("hosted ciphertext is accounted through key rotation and failed retention cleanup", async (t) => {
   const f = await hostedFixture(t, 90, 2000);

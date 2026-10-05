@@ -10,6 +10,7 @@ import {
   EgressStatus,
   EncodedFileOutput,
   EncodedFileType,
+  EncodingOptions,
   type EgressInfo,
 } from "livekit-server-sdk";
 import {
@@ -739,7 +740,18 @@ export class RecordingService {
             fileType: EncodedFileType.MP4,
             filepath: `${this.config.egressFileRoot}/raw/${r.id}.mp4`,
           }),
-          { layout: "grid" },
+          {
+            layout: "grid",
+            ...(this.config.edition === "hosted"
+              ? {
+                  encodingOptions: new EncodingOptions({
+                    width: 1280,
+                    height: 720,
+                    framerate: 24,
+                  }),
+                }
+              : {}),
+          },
         );
         if (!info.egressId || !this.belongsToRecording(info, meeting, r))
           throw new Error(
