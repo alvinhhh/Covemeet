@@ -5,6 +5,7 @@ import { loadConfig } from "../src/config.js";
 import { createApp } from "../src/server.js";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import type { Media } from "../src/media.js";
+import { digest } from "../src/security.js";
 import {
   PhoneDialogService,
   type PhoneCleanupProof,
@@ -455,4 +456,76 @@ test("journal routes require private credentials, exact query shape, and bounded
     headers,
   });
   assert.equal(denied.statusCode, 400);
+});
+
+test("shared gateway traffic cannot consume the quota needed for verified cleanup", async (t) => {
+  const f = await fixture();
+  const data = input();
+  let dialog = await f.answered(data);
+  const { participantId } = await f.join(dialog.callId, dialog.ownerId);
+  const sessionToken = "phone-session-for-rate-limit-test-over-32-characters";
+  await f.store.change(f.m.code, (meeting) => {
+    meeting.participants[0]!.tokenHash = digest(sessionToken);
+  });
+  const app = await createApp(f.config, f.store, f.media);
+  await app.ready();
+  t.after(() => app.close());
+  const headers = {
+    authorization: `Bearer ${gatewayKey}`,
+    "x-requested-with": "CovemeetPhone",
+  };
+  const request = (url: string, payload: object) =>
+    app.inject({ method: "POST", url, payload, headers });
+  const control = async (url: string, payload: object) => {
+    const response = await request(url, payload);
+    assert.equal(response.statusCode, 200, response.body);
+    return response.json();
+  };
+
+  // Exact retries do not consume another reservation, but admission still has
+  // its HTTP limit. Exhausting it must not prevent existing-call cleanup.
+  for (let i = 0; i < 61; i++) {
+    const response = await request("/api/internal/phone/dialogs", data);
+    assert.equal(response.statusCode, i < 60 ? 200 : 429, response.body);
+  }
+  for (let i = 0; i < 3001; i++) {
+    const result = await control("/api/internal/phone/dialogs/query", {
+      callId: dialog.callId,
+    });
+    dialog = result.dialogs[0];
+  }
+  const denied = await app.inject({
+    method: "POST",
+    url: "/api/internal/phone/dialogs/query",
+    payload: { callId: dialog.callId },
+  });
+  assert.equal(denied.statusCode, 403);
+
+  const path = `/api/internal/phone/dialogs/${dialog.callId}`;
+  for (const change of [
+    { type: "begin", operation: "play" },
+    { type: "settle", operation: "play", outcome: "rejected" },
+  ])
+    dialog = await control(path, {
+      ownerId: dialog.ownerId,
+      revision: dialog.revision,
+      change,
+    });
+  const left = await control(
+    `/api/internal/phone/calls/${f.m.code}/${participantId}`,
+    { callId: dialog.callId, sessionToken, action: "leave" },
+  );
+  assert.equal(left.state, "ended");
+  assert.equal(f.store.phoneCalls.get(dialog.callId)!.released, false);
+  dialog = await control(`${path}/stop`, {
+    ownerId: dialog.ownerId,
+    revision: dialog.revision,
+  });
+  dialog = await control(`${path}/finish`, {
+    ownerId: dialog.ownerId,
+    revision: dialog.revision,
+    proof,
+  });
+  assert.equal(dialog.state, "closed");
+  assert.equal(f.store.phoneCalls.get(dialog.callId)!.released, true);
 });

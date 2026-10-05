@@ -281,9 +281,12 @@ export async function createApp(config: Config, store: Store, media: Media) {
       return phone.create(req.body);
     },
   );
+  // All active calls share the gateway IP. Caller-driven controls must not
+  // exhaust a shared HTTP quota needed for journal settlement or teardown.
+  // Gateway authentication, admission limits and supervisor bounds still apply.
   app.post(
     "/api/internal/phone/calls/:code/:id",
-    { config: { rateLimit: { max: 3000, timeWindow: "1 minute" } } },
+    { config: { rateLimit: false } },
     async (req) => {
       phone.authenticate(req.headers);
       return phone.update(codeOf(req), (req.params as any).id, req.body);
@@ -299,7 +302,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
   );
   app.post(
     "/api/internal/phone/dialogs/query",
-    { config: { rateLimit: { max: 3000, timeWindow: "1 minute" } } },
+    { config: { rateLimit: false } },
     async (req) => {
       phone.authenticate(req.headers);
       return phoneDialogs.query(req.body);
@@ -309,7 +312,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const suffix = action === "change" ? "" : `/${action}`;
     app.post(
       `/api/internal/phone/dialogs/:callId${suffix}`,
-      { config: { rateLimit: { max: 3000, timeWindow: "1 minute" } } },
+      { config: { rateLimit: false } },
       async (req) => {
         phone.authenticate(req.headers);
         return phoneDialogs[action](
