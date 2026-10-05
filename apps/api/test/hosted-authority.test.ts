@@ -149,6 +149,38 @@ async function fixture(
   };
 }
 
+test("scheduled codes are machine-assigned and replay only their unchanged unused host bootstrap", async (t) => {
+  const f = await fixture(t),
+    scheduledCode = randomUUID().replaceAll("-", "").toUpperCase() + "AB";
+  const denied = await f.app.inject({
+    method: "POST",
+    url: "/api/internal/hosted/meetings",
+    headers: { origin, "x-requested-with": "MeetingPlatform" },
+    payload: { ...f.input, scheduledCode },
+  });
+  assert.equal(denied.statusCode, 403);
+  const publicCode = await f.browser("/api/meetings", {
+    ...settings,
+    creationKey,
+    scheduledCode,
+  });
+  assert.equal(publicCode.statusCode, 400);
+  const first = await f.create({ scheduledCode });
+  assert.equal(first.statusCode, 200, first.body);
+  assert.equal(first.json().code, scheduledCode);
+  const row = (await f.store.get(scheduledCode))!;
+  assert(row.hostTokenExpiresAt <= Date.now() + 30 * 60000);
+  assert.deepEqual((await f.create({ scheduledCode })).json(), first.json());
+  assert.equal(
+    (await f.create({ scheduledCode: "F".repeat(34) })).statusCode,
+    409,
+  );
+  await f.exchange(scheduledCode, first.json().hostToken);
+  const consumed = await f.create({ scheduledCode });
+  assert.equal(consumed.statusCode, 409);
+  assert.equal(consumed.json().code, "MEETING_OPERATION_UNAVAILABLE");
+});
+
 test("usage remains machine-only and only the owning meeting host sees aggregate allowance", async (t) => {
   const f = await fixture(t);
   for (const url of [

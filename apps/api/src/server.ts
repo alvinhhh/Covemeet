@@ -173,7 +173,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     if (config.production)
       reply.header(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' wss:; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'",
+        `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' wss:${config.edition === "hosted" ? ` ${config.portalOrigin}` : ""}; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'`,
       );
     // Security dispatch must use the matched route, including decoded static segments.
     const route = req.routeOptions.url;
@@ -537,6 +537,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
   async function buildMeeting(
     body: z.infer<typeof meetingInput> & { customCode?: string },
     hostToken: string,
+    assignedCode = false,
   ): Promise<Meeting> {
     const code = body.customCode
       ? normalizeCode(
@@ -551,7 +552,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         400,
         "Meeting code must contain 6 to 48 letters or digits",
       );
-    if (await store.get(code))
+    if (!assignedCode && (await store.get(code)))
       throw new HttpError(409, "Meeting code unavailable");
     const m: Meeting = {
       id: randomUUID(),
@@ -604,6 +605,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
         billingOwnerId: hostedUuid,
         version: hostedVersion,
         operationId: hostedUuid,
+        scheduledCode: z
+          .string()
+          .regex(/^[A-F0-9]{34}$/)
+          .optional(),
         meeting: meetingInput,
       })
       .strict()
@@ -629,9 +634,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
         body.meeting.hostName,
         body.meeting.password,
         body.meeting.mode,
+        ...(body.scheduledCode ? [body.scheduledCode] : []),
       ]),
     );
-    const candidate = await buildMeeting(body.meeting, hostToken);
+    // Only this machine-authenticated route accepts a preassigned scheduled
+    // code. createHosted still atomically checks operation replay and uniqueness.
+    const candidate = await buildMeeting(
+      { ...body.meeting, customCode: body.scheduledCode },
+      hostToken,
+      Boolean(body.scheduledCode),
+    );
     candidate.hosted = {
       accountId: body.accountId,
       billingOwnerId: body.billingOwnerId,

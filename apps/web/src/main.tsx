@@ -39,6 +39,7 @@ import {
 import { Icon } from "./icons";
 import "./styles.css";
 import { brandLogo } from "./brand";
+import { scheduledMeetingPending } from "./scheduled-status";
 import { BrandingEditor } from "./branding";
 import { selectStage } from "./stage-policy";
 import { observeAudioSignals, type AudioSignal } from "./audio-signal";
@@ -644,7 +645,16 @@ function Meeting({
         if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
           setNeedsJoin(true);
           setState(undefined);
-        } else setError(messageOf(e));
+        } else {
+          const pending = await scheduledMeetingPending(
+            config,
+            code,
+            e instanceof ApiError ? e.status : 0,
+            controller.signal,
+          );
+          if (controller.signal.aborted) return;
+          setError(pending ? "Meeting has not started" : messageOf(e));
+        }
       }
       if (!controller.signal.aborted) timeout = setTimeout(poll, 2000);
     }
