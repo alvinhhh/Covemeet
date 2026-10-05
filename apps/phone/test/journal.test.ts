@@ -33,6 +33,11 @@ async function fixture() {
   let dialog: PhoneDialog | undefined;
   const log: string[] = [];
   const authority: JournalAuthority = {
+    async journalClaim(input) {
+      if (input.ownerId !== config.ownerId)
+        throw new PhoneAuthorityRejected(409);
+      return { ...input, state: "active", revision: 1 };
+    },
     async journalCreate(input) {
       log.push("create");
       dialog = {

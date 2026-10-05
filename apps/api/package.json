@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "phone:manage": "node dist/phone-manager.js",
     "dev": "tsx watch --env-file=../../.env src/index.ts",
     "start": "node dist/index.js",
     "build": "tsc",

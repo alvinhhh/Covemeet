@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -272,6 +272,7 @@ async function inputCredentials(client, access) {
     sequenceMatchesExpected: true,
   };
   keypadProof.push(keypadObservation);
+  report.pendingOperation = `${keypadObservation.field} DTMF transmission`;
   await client.dtmf(expectedKeypad);
   await until("PIN prompt ready", () => promptNames.at(-1) === "covemeet-pin");
   expectedKeypad = `${access.pin}#`;
@@ -284,6 +285,7 @@ async function inputCredentials(client, access) {
     sequenceMatchesExpected: true,
   };
   keypadProof.push(keypadObservation);
+  report.pendingOperation = `${keypadObservation.field} DTMF transmission`;
   await client.dtmf(expectedKeypad);
   await until(
     "PIN terminator received",
@@ -551,11 +553,15 @@ async function run() {
         value === "1";
     return value;
   };
+  const managed = process.env.PHONE_RUNTIME_FILE
+    ? JSON.parse(await readFile(process.env.PHONE_RUNTIME_FILE, "utf8"))
+    : {
+        ownerId: randomUUID(),
+        pbxId: "native-fixture",
+        pbxEpoch: report.runId,
+      };
   const registry = new JournalRegistry(authority, {
-    ownerId: randomUUID(),
-    pbxId: "native-fixture",
-    // Identifies this disposable fixture only; not a production fencing proof.
-    pbxEpoch: report.runId,
+    ...managed,
     outboundEndpoint: "covemeet-livekit",
     sipTrunkId: trunk.sipTrunkId,
     sipRuleId: rule.sipDispatchRuleId,
@@ -743,6 +749,14 @@ async function run() {
     "unadmitted native caller hears no meeting audio after IVR",
     await quietCaller(client),
   );
+  if (process.env.SIP_RECOVERY_PROBE === "true") {
+    access.pin = "";
+    report.result = "passed";
+    await check(
+      "replacement supervisor accepts a fresh native call after orphan recovery",
+    );
+    return;
+  }
   await client.tone(true);
   await hostAction("admit");
   await until(
@@ -895,7 +909,6 @@ async function run() {
   assert.equal(joinedCount, count);
   assert.equal((await ari.listChannels()).length, 0);
   await invalid.close();
-  access.pin = "";
   await check("wrong meeting PIN yields generic IVR failure and no admission");
   for (const [index, locator] of [
     "000000000000",
@@ -938,6 +951,37 @@ async function run() {
     0,
   );
   report.result = "passed";
+  if (process.env.SIP_MANAGED_RECOVERY === "true") {
+    const orphan = await startClient();
+    await connected(orphan);
+    await inputCredentials(orphan, access);
+    access.pin = "";
+    await until("orphan caller waiting", () => lastPolicy?.state === "waiting");
+    await hostAction("admit");
+    await until("orphan native dialog fully settled", async () => {
+      const dialogs = await store.queryPhoneDialogs({
+        pbxId: "native-fixture",
+      });
+      return (
+        lastPolicy?.state === "admitted" &&
+        playbacks.size === 0 &&
+        dialogs.length === 1 &&
+        dialogs[0].operations["attach-caller"] === "confirmed" &&
+        dialogs[0].holding &&
+        dialogs[0].binding &&
+        !dialogs[0].uncertain &&
+        !Object.values(dialogs[0].operations).some((state) =>
+          ["pending", "unknown"].includes(state),
+        )
+      );
+    });
+    report.orphanReady = true;
+    await save();
+    // The independent manager must kill this process and both native processors.
+    // No finally handler, voluntary leave or locally supplied cleanup proof runs.
+    await new Promise(() => {});
+  }
+  access.pin = "";
 }
 const watchdog = setTimeout(() => {
   report.result = "failed";

@@ -68,6 +68,10 @@ services:
         condition: service_healthy
 
   asterisk:
+    labels:
+      io.covemeet.phone.pbx: native-fixture
+      io.covemeet.phone.owner: ${SIP_TEST_PHONE_OWNER:?}
+      io.covemeet.phone.role: pbx
     image: covemeet-asterisk:local
     build:
       context: ..
@@ -98,6 +102,10 @@ services:
       retries: 30
 
   sip:
+    labels:
+      io.covemeet.phone.pbx: native-fixture
+      io.covemeet.phone.owner: ${SIP_TEST_PHONE_OWNER:?}
+      io.covemeet.phone.role: sip
     image: covemeet-sip:local
     build:
       context: ..
@@ -119,6 +127,10 @@ services:
         condition: service_started
 
   sip-runner:
+    labels:
+      io.covemeet.phone.pbx: native-fixture
+      io.covemeet.phone.owner: ${SIP_TEST_PHONE_OWNER:?}
+      io.covemeet.phone.role: supervisor
     image: covemeet-sip-validation:local
     build:
       context: ..
@@ -136,12 +148,16 @@ services:
       SIP_PASSWORD_FILE: /client-secret/password
       SIP_CA_FILE: /certs/ca.crt
       SIP_BAD_CA_FILE: /certs/bad-ca.crt
-      SIP_VALIDATION_REPORT: /results/sip-media.json
+      SIP_VALIDATION_REPORT: ${SIP_TEST_REPORT:-/results/sip-media.json}
+      PHONE_RUNTIME_FILE: /phone-runtime.json
+      SIP_MANAGED_RECOVERY: "true"
+      SIP_RECOVERY_PROBE: ${SIP_RECOVERY_PROBE:-false}
       RUST_LOG: error
     volumes:
       - fixture-certs:/certs:ro
       - client-secret:/client-secret:ro
       - ../test-results/sip:/results
+      - ../runtime/sip-test/phone-runtime.json:/phone-runtime.json:ro
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
@@ -159,6 +175,28 @@ services:
     networks:
       default:
         aliases: [core]
+
+  # CI management plane only. The ordinary supervisor never receives this socket.
+  sip-manager:
+    image: covemeet-sip-validation:local
+    user: "0:0"
+    command: [node, scripts/validation/sip-recovery.mjs, fence]
+    environment:
+      NODE_ENV: test
+      SIP_TEST_DATABASE_URL: postgresql://sip:${SIP_TEST_DB_PASSWORD}@sip-postgres:5432/covemeet_sip_test
+      LIVEKIT_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${SIP_TEST_LIVEKIT_KEY}
+      LIVEKIT_API_SECRET: ${SIP_TEST_LIVEKIT_SECRET}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../runtime/sip-test/phone-old-runtime.json:/phone-old-runtime.json:ro
+      - ../runtime/sip-test/phone-runtime.json:/phone-runtime.json:ro
+      - ../test-results/sip:/results
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
 
 volumes:
   asterisk-config:

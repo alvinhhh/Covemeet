@@ -1,5 +1,8 @@
 import { z } from "zod";
 import {
+  phoneSupervisorInputSchema,
+  phoneSupervisorSchema,
+  type PhoneSupervisorInput,
   phoneDialogInputSchema,
   phoneDialogSchema,
   phoneDialogsSchema,
@@ -153,6 +156,14 @@ export class HttpAuthority implements Authority, JournalAuthority {
       throw new PhoneAuthorityRejected(response.status);
     }
     return JSON.parse(text);
+  }
+  async journalClaim(input: PhoneSupervisorInput) {
+    return phoneSupervisorSchema.parse(
+      await this.request(
+        "/api/internal/phone/supervisors/claim",
+        phoneSupervisorInputSchema.parse(input),
+      ),
+    );
   }
   async journalCreate(input: PhoneDialogInput) {
     return phoneDialogSchema.parse(

@@ -6,6 +6,10 @@ import {
   editPhoneDialog,
   newPhoneDialog,
   ownPhoneDialog,
+  ownPhoneSupervisor,
+  phoneSupervisorInputSchema,
+  type PhoneSupervisor,
+  type PhoneSupervisorInput,
   samePhoneDialog,
   type PhoneCleanupProof,
   type PhoneDialog,
@@ -124,6 +128,8 @@ export interface Store {
     fn: (m: Meeting) => T,
     ownerId?: string,
   ): Promise<T>;
+  claimPhoneSupervisor(input: PhoneSupervisorInput): Promise<PhoneSupervisor>;
+  getPhoneSupervisor(pbxId: string): Promise<PhoneSupervisor | undefined>;
   createPhoneDialog(
     input: PhoneDialogInput,
     limit: number,
@@ -232,6 +238,7 @@ export class PgStore implements Store {
       .query(`CREATE UNIQUE INDEX IF NOT EXISTS meetings_phone_locator ON meetings ((data->'phoneAccess'->>'locator')) WHERE data->'phoneAccess'->>'locator' IS NOT NULL;
       CREATE TABLE IF NOT EXISTS phone_calls(call_id uuid PRIMARY KEY, meeting_code text NOT NULL REFERENCES meetings(code), participant_id text NOT NULL, released boolean NOT NULL DEFAULT false);
       CREATE TABLE IF NOT EXISTS phone_dialogs(call_id uuid PRIMARY KEY, data jsonb NOT NULL);
+      CREATE TABLE IF NOT EXISTS phone_supervisors(pbx_id text PRIMARY KEY, data jsonb NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS phone_dialogs_caller ON phone_dialogs ((data->>'pbxId'), (data->>'pbxEpoch'), (data->>'callerChannelId'));
       CREATE TABLE IF NOT EXISTS phone_attempts(key text PRIMARY KEY, bucket bigint NOT NULL, attempts integer NOT NULL);
       CREATE INDEX IF NOT EXISTS phone_attempts_bucket ON phone_attempts(bucket);`);
@@ -299,6 +306,16 @@ export class PgStore implements Store {
     return this.phoneTransaction(async (c) => {
       const dialog = await this.lockPhoneDialog(c, callId);
       requirePhoneJoin(dialog, ownerId);
+      if (dialog)
+        ownPhoneSupervisor(
+          (
+            await c.query(
+              "SELECT data FROM phone_supervisors WHERE pbx_id=$1",
+              [dialog.pbxId],
+            )
+          ).rows[0]?.data,
+          dialog,
+        );
       if (
         (await c.query("SELECT 1 FROM phone_calls WHERE call_id=$1", [callId]))
           .rowCount
@@ -373,12 +390,143 @@ export class PgStore implements Store {
       JSON.stringify(dialog),
     ]);
   }
+  async getPhoneSupervisor(
+    pbxId: string,
+  ): Promise<PhoneSupervisor | undefined> {
+    return (
+      await this.pool.query(
+        "SELECT data FROM phone_supervisors WHERE pbx_id=$1",
+        [pbxId],
+      )
+    ).rows[0]?.data;
+  }
+  async claimPhoneSupervisor(
+    raw: PhoneSupervisorInput,
+  ): Promise<PhoneSupervisor> {
+    const input = phoneSupervisorInputSchema.parse(raw);
+    return this.phoneTransaction(async (c) => {
+      const previous = (
+        await c.query(
+          "SELECT data FROM phone_supervisors WHERE pbx_id=$1 FOR UPDATE",
+          [input.pbxId],
+        )
+      ).rows[0]?.data;
+      if (previous) {
+        ownPhoneSupervisor(previous, input);
+        if (
+          Boolean(previous.runtime) !== Boolean(input.runtime) ||
+          (input.runtime &&
+            Object.entries(input.runtime).some(
+              ([key, value]) =>
+                previous.runtime?.[key as keyof typeof input.runtime] !== value,
+            ))
+        )
+          throw new HttpError(409, "Phone supervisor runtime changed");
+        return previous;
+      }
+      if (
+        (
+          await c.query(
+            "SELECT 1 FROM phone_dialogs WHERE data->>'pbxId'=$1 AND data->>'state'<>'closed'",
+            [input.pbxId],
+          )
+        ).rowCount
+      )
+        throw new HttpError(409, "Phone dialogs require managed recovery");
+      const claim: PhoneSupervisor = { ...input, state: "active", revision: 1 };
+      await c.query(
+        "INSERT INTO phone_supervisors(pbx_id,data) VALUES($1,$2)",
+        [input.pbxId, JSON.stringify(claim)],
+      );
+      return claim;
+    });
+  }
+  /** Management-plane only: never exposed through the phone gateway API. */
+  async fencePhoneSupervisor(
+    expected: PhoneSupervisor,
+  ): Promise<PhoneSupervisor> {
+    return this.phoneTransaction(async (c) => {
+      const claim: PhoneSupervisor | undefined = (
+        await c.query(
+          "SELECT data FROM phone_supervisors WHERE pbx_id=$1 FOR UPDATE",
+          [expected.pbxId],
+        )
+      ).rows[0]?.data;
+      if (
+        !claim ||
+        claim.ownerId !== expected.ownerId ||
+        claim.revision !== expected.revision
+      )
+        throw new HttpError(409, "Phone supervisor revision changed");
+      if (claim.state !== "fencing") {
+        claim.state = "fencing";
+        claim.revision++;
+      }
+      await c.query("UPDATE phone_supervisors SET data=$2 WHERE pbx_id=$1", [
+        claim.pbxId,
+        JSON.stringify(claim),
+      ]);
+      return claim;
+    });
+  }
+  /** Called only by the Docker manager after physical fencing and reconciliation. */
+  async replacePhoneSupervisor(
+    expected: PhoneSupervisor,
+    raw: PhoneSupervisorInput,
+  ): Promise<PhoneSupervisor> {
+    const input = phoneSupervisorInputSchema.parse(raw);
+    return this.phoneTransaction(async (c) => {
+      const claim: PhoneSupervisor | undefined = (
+        await c.query(
+          "SELECT data FROM phone_supervisors WHERE pbx_id=$1 FOR UPDATE",
+          [expected.pbxId],
+        )
+      ).rows[0]?.data;
+      if (
+        !claim ||
+        claim.state !== "fencing" ||
+        claim.ownerId !== expected.ownerId ||
+        claim.revision !== expected.revision ||
+        input.pbxId !== claim.pbxId ||
+        input.ownerId === claim.ownerId ||
+        input.pbxEpoch === claim.pbxEpoch
+      )
+        throw new HttpError(409, "Phone supervisor replacement unavailable");
+      if (
+        (
+          await c.query(
+            "SELECT 1 FROM phone_dialogs WHERE data->>'pbxId'=$1 AND data->>'state'<>'closed'",
+            [claim.pbxId],
+          )
+        ).rowCount
+      )
+        throw new HttpError(409, "Phone dialogs remain unresolved");
+      const next: PhoneSupervisor = {
+        ...input,
+        state: "active",
+        revision: claim.revision + 1,
+      };
+      await c.query("UPDATE phone_supervisors SET data=$2 WHERE pbx_id=$1", [
+        next.pbxId,
+        JSON.stringify(next),
+      ]);
+      return next;
+    });
+  }
   async createPhoneDialog(
     input: PhoneDialogInput,
     limit: number,
   ): Promise<PhoneDialog> {
     const created = newPhoneDialog(input);
     return this.phoneTransaction(async (c) => {
+      ownPhoneSupervisor(
+        (
+          await c.query("SELECT data FROM phone_supervisors WHERE pbx_id=$1", [
+            input.pbxId,
+          ])
+        ).rows[0]?.data,
+        input,
+      );
       const previous = await this.lockPhoneDialog(c, input.callId);
       if (previous) {
         if (!samePhoneDialog(previous, input) || previous.state === "closed")
@@ -440,6 +588,16 @@ export class PgStore implements Store {
       const dialog = await this.lockPhoneDialog(c, callId);
       if (!dialog) throw new HttpError(404, "Phone dialog unavailable");
       ownPhoneDialog(dialog, ownerId, revision);
+      if (change.type === "begin" || change.type === "holding")
+        ownPhoneSupervisor(
+          (
+            await c.query(
+              "SELECT data FROM phone_supervisors WHERE pbx_id=$1",
+              [dialog.pbxId],
+            )
+          ).rows[0]?.data,
+          dialog,
+        );
       editPhoneDialog(dialog, change);
       await this.savePhoneDialog(c, dialog);
       return dialog;
@@ -645,6 +803,7 @@ export class PgStore implements Store {
 }
 // Test adapter only; production always uses PostgreSQL transactions.
 export class MemoryStore implements Store {
+  phoneSupervisors = new Map<string, PhoneSupervisor>();
   phoneDialogs = new Map<string, PhoneDialog>();
   phoneCalls = new Map<
     string,
@@ -731,6 +890,8 @@ export class MemoryStore implements Store {
     return this.change(code, (m) => {
       const dialog = structuredClone(this.phoneDialogs.get(callId));
       requirePhoneJoin(dialog, ownerId);
+      if (dialog)
+        ownPhoneSupervisor(this.phoneSupervisors.get(dialog.pbxId), dialog);
       if (this.phoneCalls.has(callId))
         throw new HttpError(409, "Call identity has already been used");
       if (this.phoneCapacity() >= limit && !dialog)
@@ -764,12 +925,96 @@ export class MemoryStore implements Store {
         .map(([id]) => id),
     ]).size;
   }
+  async getPhoneSupervisor(pbxId: string) {
+    return structuredClone(this.phoneSupervisors.get(pbxId));
+  }
+  async claimPhoneSupervisor(
+    raw: PhoneSupervisorInput,
+  ): Promise<PhoneSupervisor> {
+    const input = phoneSupervisorInputSchema.parse(raw);
+    return this.serialize(async () => {
+      const previous = this.phoneSupervisors.get(input.pbxId);
+      if (previous) {
+        ownPhoneSupervisor(previous, input);
+        if (
+          Boolean(previous.runtime) !== Boolean(input.runtime) ||
+          (input.runtime &&
+            Object.entries(input.runtime).some(
+              ([key, value]) =>
+                previous.runtime?.[key as keyof typeof input.runtime] !== value,
+            ))
+        )
+          throw new HttpError(409, "Phone supervisor runtime changed");
+        return structuredClone(previous);
+      }
+      if (
+        [...this.phoneDialogs.values()].some(
+          (d) => d.pbxId === input.pbxId && d.state !== "closed",
+        )
+      )
+        throw new HttpError(409, "Phone dialogs require managed recovery");
+      const claim: PhoneSupervisor = { ...input, state: "active", revision: 1 };
+      this.phoneSupervisors.set(input.pbxId, claim);
+      return structuredClone(claim);
+    });
+  }
+  async fencePhoneSupervisor(
+    expected: PhoneSupervisor,
+  ): Promise<PhoneSupervisor> {
+    return this.serialize(async () => {
+      const claim = this.phoneSupervisors.get(expected.pbxId);
+      if (
+        !claim ||
+        claim.ownerId !== expected.ownerId ||
+        claim.revision !== expected.revision
+      )
+        throw new HttpError(409, "Phone supervisor revision changed");
+      if (claim.state !== "fencing") {
+        claim.state = "fencing";
+        claim.revision++;
+      }
+      return structuredClone(claim);
+    });
+  }
+  async replacePhoneSupervisor(
+    expected: PhoneSupervisor,
+    raw: PhoneSupervisorInput,
+  ): Promise<PhoneSupervisor> {
+    const input = phoneSupervisorInputSchema.parse(raw);
+    return this.serialize(async () => {
+      const claim = this.phoneSupervisors.get(expected.pbxId);
+      if (
+        !claim ||
+        claim.state !== "fencing" ||
+        claim.ownerId !== expected.ownerId ||
+        claim.revision !== expected.revision ||
+        input.pbxId !== claim.pbxId ||
+        input.ownerId === claim.ownerId ||
+        input.pbxEpoch === claim.pbxEpoch
+      )
+        throw new HttpError(409, "Phone supervisor replacement unavailable");
+      if (
+        [...this.phoneDialogs.values()].some(
+          (d) => d.pbxId === claim.pbxId && d.state !== "closed",
+        )
+      )
+        throw new HttpError(409, "Phone dialogs remain unresolved");
+      const next: PhoneSupervisor = {
+        ...input,
+        state: "active",
+        revision: claim.revision + 1,
+      };
+      this.phoneSupervisors.set(input.pbxId, next);
+      return structuredClone(next);
+    });
+  }
   async createPhoneDialog(
     input: PhoneDialogInput,
     limit: number,
   ): Promise<PhoneDialog> {
     const created = newPhoneDialog(input);
     return this.serialize(async () => {
+      ownPhoneSupervisor(this.phoneSupervisors.get(input.pbxId), input);
       const previous = this.phoneDialogs.get(input.callId);
       if (previous) {
         if (!samePhoneDialog(previous, input) || previous.state === "closed")
@@ -819,6 +1064,8 @@ export class MemoryStore implements Store {
   ): Promise<PhoneDialog> {
     return this.serialize(async () => {
       const dialog = this.ownedPhoneDialog(callId, ownerId, revision);
+      if (change.type === "begin" || change.type === "holding")
+        ownPhoneSupervisor(this.phoneSupervisors.get(dialog.pbxId), dialog);
       editPhoneDialog(dialog, change);
       this.phoneDialogs.set(callId, dialog);
       return structuredClone(dialog);

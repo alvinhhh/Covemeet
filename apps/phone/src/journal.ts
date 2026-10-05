@@ -4,6 +4,33 @@ import { AriRequestError } from "./ari.js";
 import { PhoneAuthorityRejected } from "./authority.js";
 
 const label = z.string().regex(/^[A-Za-z0-9_.:-]{1,80}$/);
+
+export const phoneRuntimeSchema = z
+  .object({
+    daemonId: z.string().regex(/^[A-Za-z0-9:._-]{1,128}$/),
+    project: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,62}$/),
+    supervisor: z.string().regex(/^[0-9a-f]{64}$/),
+    pbx: z.string().regex(/^[0-9a-f]{64}$/),
+    sip: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict()
+  .refine((r) => new Set([r.supervisor, r.pbx, r.sip]).size === 3);
+export const phoneSupervisorInputSchema = z
+  .object({
+    pbxId: label,
+    ownerId: z.string().uuid(),
+    pbxEpoch: label,
+    runtime: phoneRuntimeSchema.optional(),
+  })
+  .strict();
+export type PhoneSupervisorInput = z.infer<typeof phoneSupervisorInputSchema>;
+export const phoneSupervisorSchema = phoneSupervisorInputSchema
+  .extend({
+    state: z.enum(["active", "fencing"]),
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+export type PhoneSupervisor = z.infer<typeof phoneSupervisorSchema>;
 export const phoneDialogInputSchema = z
   .object({
     callId: z.string().uuid(),
@@ -122,6 +149,7 @@ export const phoneDialogsSchema = z
   .object({ dialogs: z.array(phoneDialogSchema).max(20) })
   .strict();
 export interface JournalAuthority {
+  journalClaim(input: PhoneSupervisorInput): Promise<PhoneSupervisor>;
   journalCreate(input: PhoneDialogInput): Promise<PhoneDialog>;
   journalQuery(query: PhoneDialogQuery): Promise<{ dialogs: PhoneDialog[] }>;
   journalChange(
@@ -358,9 +386,9 @@ class OwnedCallJournal implements CallJournal {
 export type JournalRegistryConfig = Omit<
   PhoneDialogInput,
   "callId" | "callerChannelId" | "trunkId" | "inboundEndpoint"
->;
-/** The process may stop only records it created. PBX epoch is an operator label,
- * not proof that a previous owner or an in-flight PBX mutation has stopped. */
+> & { runtime?: PhoneSupervisorInput["runtime"] };
+/** Atomic non-expiring ownership. Replacement requires the managed runtime
+ * fence; a changed epoch or elapsed time never transfers the claim. */
 export class JournalRegistry {
   private ready = false;
   constructor(
@@ -374,11 +402,27 @@ export class JournalRegistry {
         trunkId: true,
         inboundEndpoint: true,
       })
+      .extend({ runtime: phoneRuntimeSchema.optional() })
       .parse(config);
     this.config = { ...config };
   }
   async initialize(): Promise<void> {
     this.ready = false;
+    const claim = phoneSupervisorSchema.parse(
+      await this.authority.journalClaim({
+        pbxId: this.config.pbxId,
+        ownerId: this.config.ownerId,
+        pbxEpoch: this.config.pbxEpoch,
+        ...(this.config.runtime ? { runtime: this.config.runtime } : {}),
+      }),
+    );
+    if (
+      claim.state !== "active" ||
+      claim.ownerId !== this.config.ownerId ||
+      claim.pbxId !== this.config.pbxId ||
+      claim.pbxEpoch !== this.config.pbxEpoch
+    )
+      throw unavailable();
     const result = phoneDialogsSchema.parse(
       await this.authority.journalQuery({ pbxId: this.config.pbxId }),
     );
@@ -401,7 +445,9 @@ export class JournalRegistry {
     return new OwnedCallJournal(
       this.authority,
       phoneDialogInputSchema.parse({
-        ...this.config,
+        ...Object.fromEntries(
+          Object.entries(this.config).filter(([key]) => key !== "runtime"),
+        ),
         callId,
         callerChannelId,
         inboundEndpoint,

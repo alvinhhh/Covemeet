@@ -201,9 +201,34 @@ test(
       });
       assert.equal(leave.statusCode, 200, leave.body);
     }
+    const owners = [randomUUID(), randomUUID()];
+    const starts = await Promise.allSettled(
+      stores.map((store, index) =>
+        store.claimPhoneSupervisor({
+          pbxId: "postgres-fixture",
+          ownerId: owners[index]!,
+          pbxEpoch: "boot-1",
+        }),
+      ),
+    );
+    assert.equal(
+      starts.filter((result) => result.status === "fulfilled").length,
+      1,
+      "Exactly one PBX owner must win across independent PostgreSQL pools",
+    );
+    const ownerId =
+      owners[starts.findIndex((result) => result.status === "fulfilled")]!;
+    await assert.rejects(
+      stores[1]!.claimPhoneSupervisor({
+        pbxId: "postgres-fixture",
+        ownerId: randomUUID(),
+        pbxEpoch: "new-label",
+      }),
+      /ownership/,
+    );
     const dialogInput = (): PhoneDialogInput => ({
       callId: randomUUID(),
-      ownerId: randomUUID(),
+      ownerId,
       pbxId: "postgres-fixture",
       pbxEpoch: "boot-1",
       callerChannelId: `caller-${randomUUID()}`,

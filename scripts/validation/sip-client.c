@@ -156,6 +156,19 @@ static void media_state(pjsua_call_id id) {
         }
     }
 }
+static void stream_created(pjsua_call_id id, pjsua_on_stream_created_param *param) {
+    (void)id;
+    pjmedia_stream_info info;
+    pj_status_t status = pjmedia_stream_get_info(param->stream, &info);
+    /* pjproject 2.17 defaults to zero inter-digit pause. Configure the stream
+     * before its clock starts so duration, RTP timestamps and the release gap
+     * agree, including repeated identical digits. Never deduplicate at the IVR. */
+    if (status == PJ_SUCCESS && info.tx_event_pt >= 0)
+        status = pjmedia_stream_set_tx_dtmf_options(param->stream, 120, 100,
+                                                   (pj_uint8_t)info.tx_event_pt, -10, 2);
+    else if (status == PJ_SUCCESS) status = PJ_EINVAL;
+    if (status != PJ_SUCCESS) { failure("dtmf-options", status); stopping = 1; }
+}
 static void incoming_call(pjsua_acc_id account, pjsua_call_id id, pjsip_rx_data *data) {
     (void)account; (void)data;
     pjsua_call_answer(id, 486, NULL, NULL);
@@ -187,7 +200,7 @@ static void command(char *line) {
             pjsua_call_send_dtmf_param param;
             pjsua_call_send_dtmf_param_default(&param);
             param.method = PJSUA_DTMF_METHOD_RFC2833;
-            param.duration = 120;
+            param.duration = 0; /* Use the stream duration configured above. */
             param.digits = pj_str(digits);
             const pj_status_t status = pjsua_call_send_dtmf(call_id, &param);
             if (status == PJ_SUCCESS) {
@@ -250,6 +263,7 @@ int main(void) {
     config.thread_cnt = 0;
     config.cb.on_call_state = call_state;
     config.cb.on_call_media_state = media_state;
+    config.cb.on_stream_created2 = stream_created;
     config.cb.on_transport_state = transport_state;
     config.cb.on_incoming_call = incoming_call;
     logging.level = logging.console_level = 0;

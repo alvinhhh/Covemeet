@@ -6,6 +6,33 @@ import type { Meeting, Participant, Store } from "./store.js";
 import { HttpError, keyedDigest } from "./security.js";
 
 const label = z.string().regex(/^[A-Za-z0-9_.:-]{1,80}$/);
+
+export const phoneRuntimeSchema = z
+  .object({
+    daemonId: z.string().regex(/^[A-Za-z0-9:._-]{1,128}$/),
+    project: z.string().regex(/^[a-z0-9][a-z0-9_-]{0,62}$/),
+    supervisor: z.string().regex(/^[0-9a-f]{64}$/),
+    pbx: z.string().regex(/^[0-9a-f]{64}$/),
+    sip: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict()
+  .refine((r) => new Set([r.supervisor, r.pbx, r.sip]).size === 3);
+export const phoneSupervisorInputSchema = z
+  .object({
+    pbxId: label,
+    ownerId: z.string().uuid(),
+    pbxEpoch: label,
+    runtime: phoneRuntimeSchema.optional(),
+  })
+  .strict();
+export type PhoneSupervisorInput = z.infer<typeof phoneSupervisorInputSchema>;
+export const phoneSupervisorSchema = phoneSupervisorInputSchema
+  .extend({
+    state: z.enum(["active", "fencing"]),
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+export type PhoneSupervisor = z.infer<typeof phoneSupervisorSchema>;
 const channel = z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/);
 export const phoneDialogInputSchema = z
   .object({
@@ -120,6 +147,20 @@ export function ownPhoneDialog(
   )
     throw new HttpError(409, "Phone dialog ownership or revision changed");
 }
+export function ownPhoneSupervisor(
+  claim: PhoneSupervisor | undefined,
+  input: Pick<PhoneDialogInput, "pbxId" | "ownerId" | "pbxEpoch">,
+) {
+  if (
+    !claim ||
+    claim.state !== "active" ||
+    claim.pbxId !== input.pbxId ||
+    claim.ownerId !== input.ownerId ||
+    claim.pbxEpoch !== input.pbxEpoch
+  )
+    throw new HttpError(409, "Phone supervisor ownership unavailable");
+}
+
 export function bumpPhoneDialog(dialog: PhoneDialog) {
   if (
     !Number.isSafeInteger(dialog.revision) ||
@@ -214,6 +255,13 @@ export class PhoneDialogService {
     readonly store: Store,
     readonly media: Media,
   ) {}
+  async claim(raw: unknown) {
+    if (!this.config.phoneEnabled)
+      throw new HttpError(503, "Phone access is disabled");
+    return this.store.claimPhoneSupervisor(
+      phoneSupervisorInputSchema.parse(raw),
+    );
+  }
   async create(raw: unknown) {
     if (!this.config.phoneEnabled)
       throw new HttpError(503, "Phone access is disabled");

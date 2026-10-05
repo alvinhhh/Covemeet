@@ -24,10 +24,11 @@ const proof: PhoneCleanupProof = {
   holdingRelayAbsent: true,
   rtcClosed: true,
 };
+const ownerId = randomUUID();
 function input(): PhoneDialogInput {
   return {
     callId: randomUUID(),
-    ownerId: randomUUID(),
+    ownerId,
     pbxId: "test-pbx",
     pbxEpoch: "boot-1",
     callerChannelId: `caller-${randomUUID()}`,
@@ -84,6 +85,7 @@ async function fixture() {
     close() {},
   };
   const service = new PhoneDialogService(config, store, media);
+  await service.claim({ pbxId: "test-pbx", ownerId, pbxEpoch: "boot-1" });
   const change = (d: PhoneDialog, change: PhoneDialogChange) =>
     service.change(d.callId, {
       ownerId: d.ownerId,
@@ -213,7 +215,7 @@ test("ownership and revisions cannot be bypassed; caller and call tombstones per
   assert.deepEqual(await f.service.create(original), d);
   await assert.rejects(
     f.service.create({ ...original, ownerId: randomUUID() }),
-    /identity/,
+    /ownership/,
   );
   await assert.rejects(
     f.service.create({ ...original, callId: randomUUID() }),
@@ -416,6 +418,17 @@ test("journal routes require private credentials, exact query shape, and bounded
   };
   const data = input();
   for (const h of [{}, { ...headers, origin: "https://untrusted.example" }]) {
+    const claim = await app.inject({
+      method: "POST",
+      url: "/api/internal/phone/supervisors/claim",
+      payload: {
+        pbxId: data.pbxId,
+        ownerId: data.ownerId,
+        pbxEpoch: data.pbxEpoch,
+      },
+      headers: h,
+    });
+    assert.equal(claim.statusCode, 403);
     const response = await app.inject({
       method: "POST",
       url: "/api/internal/phone/dialogs",
@@ -424,6 +437,17 @@ test("journal routes require private credentials, exact query shape, and bounded
     });
     assert.equal(response.statusCode, 403);
   }
+  const duplicateOwner = await app.inject({
+    method: "POST",
+    url: "/api/internal/phone/supervisors/claim",
+    payload: {
+      pbxId: data.pbxId,
+      ownerId: randomUUID(),
+      pbxEpoch: data.pbxEpoch,
+    },
+    headers,
+  });
+  assert.equal(duplicateOwner.statusCode, 409);
   const created = await app.inject({
     method: "POST",
     url: "/api/internal/phone/dialogs",

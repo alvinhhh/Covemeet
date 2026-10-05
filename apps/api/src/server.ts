@@ -293,6 +293,14 @@ export async function createApp(config: Config, store: Store, media: Media) {
     },
   );
   app.post(
+    "/api/internal/phone/supervisors/claim",
+    { config: { rateLimit: false } },
+    async (req) => {
+      phone.authenticate(req.headers);
+      return phoneDialogs.claim(req.body);
+    },
+  );
+  app.post(
     "/api/internal/phone/dialogs",
     { config: { rateLimit: { max: 60, timeWindow: "1 minute" } } },
     async (req) => {

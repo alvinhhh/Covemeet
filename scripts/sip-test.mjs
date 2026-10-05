@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID, createHash } from "node:crypto";
 import {
   mkdir,
   writeFile,
@@ -10,6 +10,7 @@ import {
 } from "node:fs/promises";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -85,6 +86,65 @@ async function command(
 async function compose(commandArgs, options) {
   return command([...args, ...commandArgs], options);
 }
+async function managedRuntime(ownerId) {
+  const runtime = {
+    daemonId: (
+      await quiet("docker", ["info", "--format", "{{.ID}}"])
+    ).stdout.trim(),
+    project: "covemeet-sip-test",
+  };
+  let pbxEpoch;
+  for (const [role, service] of [
+    ["supervisor", "sip-runner"],
+    ["pbx", "asterisk"],
+    ["sip", "sip"],
+  ]) {
+    const id = (
+      await quiet("docker", [...args, "ps", "--all", "--quiet", service])
+    ).stdout.trim();
+    if (!/^[0-9a-f]{64}$/.test(id))
+      throw new Error("Managed SIP container identity unavailable");
+    const info = JSON.parse(
+      (
+        await quiet("docker", [
+          "inspect",
+          id,
+          "--format",
+          '{"id":{{json .Id}},"startedAt":{{json .State.StartedAt}}}',
+        ])
+      ).stdout,
+    );
+    runtime[role] = info.id;
+    if (role === "pbx")
+      pbxEpoch = createHash("sha256")
+        .update(`${info.id}:${info.startedAt}`)
+        .digest("hex");
+  }
+  return { ownerId, pbxId: "native-fixture", pbxEpoch, runtime };
+}
+async function waitForNativeOrphan(id) {
+  for (let attempt = 0; attempt < 480; attempt++) {
+    if (interrupted) throw new Error("SIP fixture interrupted");
+    try {
+      const report = JSON.parse(
+        await readFile(path.join(results, "sip-media.json"), "utf8"),
+      );
+      if (report.result === "failed")
+        throw new Error("Native SIP validation failed");
+      if (report.result === "passed" && report.orphanReady === true) return;
+    } catch (error) {
+      if (error.code !== "ENOENT" && !(error instanceof SyntaxError))
+        throw error;
+    }
+    const state = (
+      await quiet("docker", ["inspect", id, "--format", "{{.State.Running}}"])
+    ).stdout.trim();
+    if (state !== "true")
+      throw new Error("Native SIP runner stopped before its orphan checkpoint");
+    await delay(500);
+  }
+  throw new Error("Native SIP orphan checkpoint timed out");
+}
 async function waitForServices() {
   for (let attempt = 0; attempt < 90; attempt++) {
     let ready = true;
@@ -113,10 +173,10 @@ async function waitForServices() {
   }
   throw new Error("SIP fixture service readiness timed out");
 }
-async function quiet(command, commandArgs) {
+async function quiet(command, commandArgs, { timeout = 30000 } = {}) {
   return exec(command, commandArgs, {
     cwd: root,
-    timeout: 30000,
+    timeout,
     maxBuffer: 1024 * 1024,
   });
 }
@@ -339,6 +399,7 @@ async function certificates() {
 try {
   await evidence.save();
   const subnet = await unusedSubnet();
+  const phoneOwner = randomUUID();
   const secrets = {
     db: randomBytes(24).toString("hex"),
     key: randomBytes(12).toString("hex"),
@@ -350,6 +411,7 @@ try {
   await secretFile(
     "fixture.env",
     [
+      `SIP_TEST_PHONE_OWNER=${phoneOwner}`,
       `SIP_TEST_DB_PASSWORD=${secrets.db}`,
       `SIP_TEST_LIVEKIT_KEY=${secrets.key}`,
       `SIP_TEST_LIVEKIT_SECRET=${secrets.api}`,
@@ -363,6 +425,15 @@ try {
     ].join("\n"),
   );
   await secretFile("client-password", `${secrets.client}\n`);
+  await secretFile("phone-runtime.json", "{}\n");
+  await secretFile("phone-old-runtime.json", "{}\n");
+  for (const name of [
+    "sip-media.json",
+    "sip-restart.json",
+    "sip-fence.json",
+    "sip-recover.json",
+  ])
+    await rm(path.join(results, name), { force: true });
   await secretFile(
     "livekit.yaml",
     [
@@ -447,16 +518,72 @@ try {
   await waitForServices();
   await evidence.phase("tls-preflight");
   await verifySipTls();
+  await compose(["up", "--no-start", "--no-deps", "sip-runner"]);
+  const oldRuntime = await managedRuntime(phoneOwner);
+  await secretFile("phone-runtime.json", `${JSON.stringify(oldRuntime)}\n`);
+  await secretFile("phone-old-runtime.json", `${JSON.stringify(oldRuntime)}\n`);
   await evidence.phase("native-validation");
-  const runnerExit = await compose(
-    ["run", "--rm", "--no-deps", "--use-aliases", "sip-runner"],
-    { allowFailure: true },
+  await quiet("docker", ["start", oldRuntime.runtime.supervisor]);
+  await waitForNativeOrphan(oldRuntime.runtime.supervisor);
+  await evidence.phase("managed-recovery");
+  await compose([
+    "run",
+    "--rm",
+    "--no-deps",
+    "sip-manager",
+    "node",
+    "scripts/validation/sip-recovery.mjs",
+    "fence",
+  ]);
+  const nextOwner = randomUUID();
+  const environment = (
+    await readFile(path.join(runtime, "fixture.env"), "utf8")
+  ).replace(
+    `SIP_TEST_PHONE_OWNER=${phoneOwner}`,
+    `SIP_TEST_PHONE_OWNER=${nextOwner}`,
   );
-  if (runnerExit !== 0) evidence.fail();
+  await secretFile(
+    "fixture.env",
+    `${environment}SIP_RECOVERY_PROBE=true\nSIP_TEST_REPORT=/results/sip-restart.json\n`,
+  );
+  await compose(["up", "-d", "asterisk", "sip"]);
+  await waitForServices();
+  await compose(["up", "--no-start", "--no-deps", "sip-runner"]);
+  const nextRuntime = await managedRuntime(nextOwner);
+  await secretFile("phone-runtime.json", `${JSON.stringify(nextRuntime)}\n`);
+  await compose([
+    "run",
+    "--rm",
+    "--no-deps",
+    "sip-manager",
+    "node",
+    "scripts/validation/sip-recovery.mjs",
+    "recover",
+  ]);
+  await evidence.phase("native-validation");
+  await quiet("docker", ["start", nextRuntime.runtime.supervisor]);
+  const waited = await quiet(
+    "docker",
+    ["wait", nextRuntime.runtime.supervisor],
+    { timeout: 90000 },
+  );
+  const runnerExit = Number(waited.stdout.trim());
+  evidence.command(runnerExit, null);
   await evidence.phase("diagnostics");
   await diagnostics();
-  if (runnerExit !== 0)
-    throw new Error("Native SIP validation failed; sanitized reports retained");
+  if (runnerExit !== 0) throw new Error("Replacement native SIP probe failed");
+  const recovered = JSON.parse(
+    await readFile(path.join(results, "sip-recover.json"), "utf8"),
+  );
+  const restarted = JSON.parse(
+    await readFile(path.join(results, "sip-restart.json"), "utf8"),
+  );
+  if (recovered.result !== "passed" || restarted.result !== "passed")
+    throw new Error("Managed recovery did not complete");
+  evidence.report.managedRecovery = {
+    orphanReconciled: true,
+    replacementNativeCallPassed: true,
+  };
   evidence.report.validationPassed = true;
   console.log(
     `Native SIP validation report: ${path.join(results, "sip-media.json")}`,

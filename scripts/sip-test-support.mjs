@@ -4,6 +4,8 @@ import path from "node:path";
 export const PROJECT = "covemeet-sip-test";
 export const GENERATED_INPUTS = [
   "fixture.env",
+  "phone-runtime.json",
+  "phone-old-runtime.json",
   "client-password",
   "livekit.yaml",
   "sip.yaml",
@@ -24,6 +26,7 @@ const phases = new Set([
   "readiness",
   "tls-preflight",
   "native-validation",
+  "managed-recovery",
   "diagnostics",
   "cleanup",
   "complete",
