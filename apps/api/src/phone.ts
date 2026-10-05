@@ -222,6 +222,8 @@ export class PhoneService {
         body.action === "leave" ||
         !this.config.phoneEnabled ||
         !meetingAllowed(m) ||
+        p.meter?.phase === "closing" ||
+        (p.meter && p.meter.fundedUntil <= now) ||
         !m.phoneAccess?.enabled ||
         p.expiresAt <= now ||
         p.phone.leaseExpiresAt <= now ||
@@ -238,6 +240,7 @@ export class PhoneService {
         p.phone.leaseExpiresAt = Math.min(
           p.expiresAt,
           meetingDeadline(m),
+          p.meter?.fundedUntil ?? Infinity,
           now + PHONE_LEASE_MS,
         );
         if (
@@ -262,7 +265,15 @@ export class PhoneService {
     });
     const { meeting: m, participant: p, ended } = snapshot;
     if (p.enforcementPending) {
+      if (p.meter && !this.media.available)
+        throw new HttpError(503, "Media cleanup is unavailable");
       await this.media.remove(m, p);
+      await this.store.settleParticipantMeter(
+        code,
+        id,
+        p.mediaVersion,
+        p.meter,
+      );
       await this.store.change(code, (state) => {
         const current = state.participants.find((x) => x.id === id);
         if (current?.mediaVersion === p.mediaVersion) {
@@ -278,6 +289,7 @@ export class PhoneService {
       await this.store.releasePhone(body.callId, code, id);
     }
     const admitted = !ended && p.status === "admitted";
+    if (admitted) await this.store.checkUsage(code, id);
     const grant = admitted
       ? {
           token: await this.media.token(m, p),

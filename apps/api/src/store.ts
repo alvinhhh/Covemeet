@@ -1,7 +1,20 @@
 import pg from "pg";
+import {
+  canSettleMeter,
+  quotaOverdrawn,
+  requireUsage,
+  settleMeter,
+  sweepParticipantMeters,
+  updateMeter,
+  usageView,
+  type MeterInput,
+  type ParticipantMeter,
+  type UsageLedger,
+} from "./participant-meter.js";
 import { HttpError } from "./security.js";
 import {
   applyEntitlement,
+  endMeeting,
   entitlementFor,
   entitlementSchema,
   nextEntitlement,
@@ -29,6 +42,7 @@ import {
   type PhoneDialogStop,
 } from "./phone-dialogs.js";
 export type Participant = {
+  meter?: ParticipantMeter;
   transport?: "browser" | "phone";
   phone?: {
     callId: string;
@@ -134,6 +148,19 @@ export interface RecordingLock {
   audit(actor: string, action: string, target?: string): Promise<void>;
 }
 export interface Store {
+  hostedUsage(billingOwnerId: string): Promise<ReturnType<typeof usageView>>;
+  checkUsage(code: string, participantId?: string): Promise<void>;
+  updateParticipantMeter(
+    code: string,
+    input: MeterInput,
+  ): Promise<{ meeting: Meeting; participant: Participant }>;
+  settleParticipantMeter(
+    code: string,
+    participantId: string,
+    mediaVersion: number,
+    expected?: Pick<ParticipantMeter, "connectionId" | "mediaVersion">,
+  ): Promise<void>;
+  reconcileParticipantMeters(code: string): Promise<void>;
   createHosted(m: Meeting): Promise<Meeting>;
   setHostedEntitlement(input: HostedEntitlement): Promise<HostedEntitlement>;
   startMeeting<T>(code: string, fn: (m: Meeting) => Promise<T> | T): Promise<T>;
@@ -379,9 +406,175 @@ export class PgStore implements Store {
       CREATE UNIQUE INDEX IF NOT EXISTS meetings_hosted_operation ON meetings ((data->'hosted'->>'accountId'), (data->'hosted'->>'operationId')) WHERE data->'hosted'->>'operationId' IS NOT NULL;
       ALTER TABLE hosted_authorities ADD COLUMN IF NOT EXISTS billing_owner_id uuid;
       CREATE TABLE IF NOT EXISTS hosted_entitlements(billing_owner_id uuid PRIMARY KEY, data jsonb NOT NULL);
+      CREATE TABLE IF NOT EXISTS hosted_usage(billing_owner_id uuid PRIMARY KEY, data jsonb NOT NULL);
       CREATE INDEX IF NOT EXISTS meetings_billing_owner ON meetings ((data->'hosted'->>'billingOwnerId'));
       CREATE INDEX IF NOT EXISTS meetings_hosted_account ON meetings ((data->'hosted'->>'accountId'));
     `);
+  }
+  private async usageTransaction<T>(
+    billingOwnerId: string,
+    fn: (
+      ledger: UsageLedger,
+      grant: HostedEntitlement | undefined,
+      meetings: Meeting[],
+      now: number,
+    ) => T,
+  ) {
+    let failure: unknown;
+    const result = await this.hostedTransaction(
+      `pool:${billingOwnerId}`,
+      async (c) => {
+        const grant = (
+          await c.query(
+            "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+            [billingOwnerId],
+          )
+        ).rows[0]?.data as HostedEntitlement | undefined;
+        const ledger = (
+          await c.query(
+            "SELECT data FROM hosted_usage WHERE billing_owner_id=$1",
+            [billingOwnerId],
+          )
+        ).rows[0]?.data as UsageLedger | undefined;
+        if (!ledger)
+          throw new HttpError(404, "Usage unavailable", "USAGE_UNAVAILABLE");
+        // ponytail: scan retained owner meetings under one pool lock. Large meeting
+        // histories will need an unsettled-meter index; do not prune recovery state.
+        const meetings = (
+          await c.query(
+            "SELECT data FROM meetings WHERE data->'hosted'->>'billingOwnerId'=$1 ORDER BY code FOR UPDATE",
+            [billingOwnerId],
+          )
+        ).rows.map((row) => row.data as Meeting);
+        const now = Date.now();
+        const before = new Map(
+          meetings.map((m) => [m.code, JSON.stringify(m)]),
+        );
+        sweepParticipantMeters(ledger, meetings, now);
+        let value: T | undefined;
+        try {
+          value = fn(ledger, grant, meetings, now);
+        } catch (error) {
+          failure = error;
+        }
+        await c.query(
+          "UPDATE hosted_usage SET data=$2 WHERE billing_owner_id=$1",
+          [billingOwnerId, JSON.stringify(ledger)],
+        );
+        for (const m of meetings) {
+          if (before.get(m.code) === JSON.stringify(m)) continue;
+          m.revision++;
+          await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+            m.code,
+            JSON.stringify(m),
+          ]);
+        }
+        return value;
+      },
+      billingOwnerId,
+    );
+    if (failure) throw failure;
+    return result as T;
+  }
+  async hostedUsage(billingOwnerId: string) {
+    return this.usageTransaction(billingOwnerId.toLowerCase(), usageView);
+  }
+  private async meetingUsage<T>(
+    code: string,
+    fn: (
+      ledger: UsageLedger,
+      grant: HostedEntitlement,
+      meetings: Meeting[],
+      m: Meeting,
+      now: number,
+    ) => T,
+    fallback: () => Promise<T>,
+  ) {
+    const snapshot = await this.get(code);
+    if (!snapshot) throw new HttpError(404, "Meeting unavailable");
+    const owner = snapshot.hosted?.billingOwnerId;
+    if (!owner) return fallback();
+    return this.usageTransaction(owner, (ledger, grant, meetings, now) => {
+      const m = meetings.find((row) => row.code === code);
+      if (!m || !grant) throw new HttpError(403, "Hosting plan is unavailable");
+      return fn(ledger, grant, meetings, m, now);
+    });
+  }
+  async checkUsage(code: string, participantId?: string) {
+    await this.meetingUsage(
+      code,
+      (ledger, grant, meetings, m, now) =>
+        requireUsage(
+          ledger,
+          grant,
+          meetings,
+          now,
+          m.participants.find((p) => p.id === participantId),
+        ),
+      async () => {},
+    );
+  }
+  async updateParticipantMeter(code: string, input: MeterInput) {
+    return this.meetingUsage(
+      code,
+      (ledger, grant, meetings, m, now) => {
+        updateMeter(ledger, grant, meetings, m, input, now);
+        return {
+          meeting: structuredClone(m),
+          participant: structuredClone(
+            m.participants.find((p) => p.id === input.participantId)!,
+          ),
+        };
+      },
+      async () => {
+        const m = (await this.get(code))! as Meeting;
+        const p = m.participants.find((p) => p.id === input.participantId);
+        if (!p) throw new HttpError(403, "Media access denied");
+        return { meeting: m, participant: p };
+      },
+    );
+  }
+  async settleParticipantMeter(
+    code: string,
+    participantId: string,
+    mediaVersion: number,
+    expected?: Pick<ParticipantMeter, "connectionId" | "mediaVersion">,
+  ) {
+    const snapshot = (await this.get(code)) as Meeting | null;
+    if (!snapshot?.participants.some((p) => p.id === participantId && p.meter))
+      return;
+    await this.meetingUsage(
+      code,
+      (ledger, _grant, _meetings, m, now) => {
+        const p = m.participants.find((p) => p.id === participantId);
+        if (
+          p?.mediaVersion === mediaVersion &&
+          expected !== undefined &&
+          p.meter?.connectionId === expected.connectionId &&
+          p.meter.mediaVersion === expected.mediaVersion &&
+          canSettleMeter(m, p, now)
+        )
+          settleMeter(ledger, p, now);
+      },
+      async () => {},
+    );
+  }
+  async reconcileParticipantMeters(code: string) {
+    const snapshot = (await this.get(code)) as Meeting | null;
+    if (!snapshot?.participants.some((p) => p.meter)) return;
+    await this.meetingUsage(
+      code,
+      (ledger, _grant, _meetings, m, now) => {
+        for (const p of m.participants)
+          if (
+            p.meter?.phase === "closing" &&
+            !p.enforcementPending &&
+            canSettleMeter(m, p, now)
+          )
+            settleMeter(ledger, p, now);
+      },
+      async () => {},
+    );
   }
   private async hostedTransaction<T>(
     accountId: string,
@@ -421,6 +614,17 @@ export class PgStore implements Store {
         ).rows[0]?.data as HostedEntitlement | undefined;
         const grant = nextEntitlement(previous, input);
         if (grant === previous) return grant;
+        let ledger = (
+          await c.query(
+            "SELECT data FROM hosted_usage WHERE billing_owner_id=$1",
+            [input.billingOwnerId],
+          )
+        ).rows[0]?.data as UsageLedger | undefined;
+        if (grant.quota) {
+          if (ledger && ledger.anchorAt !== grant.quota.anchorAt)
+            throw new HttpError(409, "Usage anniversary cannot change");
+          ledger ??= { anchorAt: grant.quota.anchorAt, windows: [] };
+        }
         const meetings = (
           await c.query(
             "SELECT data FROM meetings WHERE data->'hosted'->>'billingOwnerId'=$1 ORDER BY code FOR UPDATE",
@@ -428,6 +632,18 @@ export class PgStore implements Store {
           )
         ).rows.map((row) => row.data as Meeting);
         applyEntitlement(grant, meetings);
+        if (ledger) {
+          sweepParticipantMeters(ledger, meetings, Date.now());
+          if (
+            grant.enabled &&
+            quotaOverdrawn(ledger, grant, meetings, Date.now())
+          )
+            for (const m of meetings) if (m.lifecycle) endMeeting(m);
+          await c.query(
+            "INSERT INTO hosted_usage(billing_owner_id,data) VALUES($1,$2) ON CONFLICT(billing_owner_id) DO UPDATE SET data=$2",
+            [input.billingOwnerId, JSON.stringify(ledger)],
+          );
+        }
         await c.query(
           "INSERT INTO hosted_entitlements(billing_owner_id,data) VALUES($1,$2) ON CONFLICT(billing_owner_id) DO UPDATE SET data=$2",
           [input.billingOwnerId, JSON.stringify(grant)],
@@ -1216,14 +1432,170 @@ export class PgStore implements Store {
 export class MemoryStore implements Store {
   hostedAuthorities = new Map<string, HostedAuthority>();
   hostedEntitlements = new Map<string, HostedEntitlement>();
+  usageLedgers = new Map<string, UsageLedger>();
+  private async usageTransaction<T>(
+    owner: string,
+    fn: (
+      ledger: UsageLedger,
+      grant: HostedEntitlement | undefined,
+      meetings: Meeting[],
+      now: number,
+    ) => T,
+  ) {
+    let failure: unknown;
+    const result = await this.serialize(async () => {
+      const ledger = structuredClone(this.usageLedgers.get(owner));
+      if (!ledger)
+        throw new HttpError(404, "Usage unavailable", "USAGE_UNAVAILABLE");
+      const grant = this.hostedEntitlements.get(owner);
+      const meetings = structuredClone(
+        [...this.data.values()].filter(
+          (m) => m.hosted?.billingOwnerId === owner,
+        ),
+      );
+      const now = Date.now();
+      sweepParticipantMeters(ledger, meetings, now);
+      let value: T | undefined;
+      try {
+        value = fn(ledger, grant, meetings, now);
+      } catch (error) {
+        failure = error;
+      }
+      this.usageLedgers.set(owner, ledger);
+      for (const m of meetings) {
+        m.revision++;
+        this.data.set(m.code, m);
+      }
+      return value;
+    });
+    if (failure) throw failure;
+    return result as T;
+  }
+  async hostedUsage(owner: string) {
+    return this.usageTransaction(owner.toLowerCase(), usageView);
+  }
+  private async meetingUsage<T>(
+    code: string,
+    fn: (
+      ledger: UsageLedger,
+      grant: HostedEntitlement,
+      meetings: Meeting[],
+      m: Meeting,
+      now: number,
+    ) => T,
+    fallback: () => Promise<T>,
+  ) {
+    const snapshot = await this.get(code);
+    if (!snapshot) throw new HttpError(404, "Meeting unavailable");
+    const owner = snapshot.hosted?.billingOwnerId;
+    if (!owner) return fallback();
+    return this.usageTransaction(owner, (ledger, grant, meetings, now) => {
+      const m = meetings.find((row) => row.code === code);
+      if (!m || !grant) throw new HttpError(403, "Hosting plan is unavailable");
+      return fn(ledger, grant, meetings, m, now);
+    });
+  }
+  async checkUsage(code: string, participantId?: string) {
+    await this.meetingUsage(
+      code,
+      (ledger, grant, meetings, m, now) =>
+        requireUsage(
+          ledger,
+          grant,
+          meetings,
+          now,
+          m.participants.find((p) => p.id === participantId),
+        ),
+      async () => {},
+    );
+  }
+  async updateParticipantMeter(code: string, input: MeterInput) {
+    return this.meetingUsage(
+      code,
+      (ledger, grant, meetings, m, now) => {
+        updateMeter(ledger, grant, meetings, m, input, now);
+        return {
+          meeting: structuredClone(m),
+          participant: structuredClone(
+            m.participants.find((p) => p.id === input.participantId)!,
+          ),
+        };
+      },
+      async () => {
+        const m = (await this.get(code))! as Meeting;
+        const p = m.participants.find((p) => p.id === input.participantId);
+        if (!p) throw new HttpError(403, "Media access denied");
+        return { meeting: m, participant: p };
+      },
+    );
+  }
+  async settleParticipantMeter(
+    code: string,
+    participantId: string,
+    mediaVersion: number,
+    expected?: Pick<ParticipantMeter, "connectionId" | "mediaVersion">,
+  ) {
+    const snapshot = (await this.get(code)) as Meeting | null;
+    if (!snapshot?.participants.some((p) => p.id === participantId && p.meter))
+      return;
+    await this.meetingUsage(
+      code,
+      (ledger, _grant, _meetings, m, now) => {
+        const p = m.participants.find((p) => p.id === participantId);
+        if (
+          p?.mediaVersion === mediaVersion &&
+          expected !== undefined &&
+          p.meter?.connectionId === expected.connectionId &&
+          p.meter.mediaVersion === expected.mediaVersion &&
+          canSettleMeter(m, p, now)
+        )
+          settleMeter(ledger, p, now);
+      },
+      async () => {},
+    );
+  }
+  async reconcileParticipantMeters(code: string) {
+    const snapshot = (await this.get(code)) as Meeting | null;
+    if (!snapshot?.participants.some((p) => p.meter)) return;
+    await this.meetingUsage(
+      code,
+      (ledger, _grant, _meetings, m, now) => {
+        for (const p of m.participants)
+          if (
+            p.meter?.phase === "closing" &&
+            !p.enforcementPending &&
+            canSettleMeter(m, p, now)
+          )
+            settleMeter(ledger, p, now);
+      },
+      async () => {},
+    );
+  }
   async setHostedEntitlement(raw: HostedEntitlement) {
     const input = entitlementSchema.parse(raw);
     return this.serialize(async () => {
       const previous = this.hostedEntitlements.get(input.billingOwnerId);
       const grant = nextEntitlement(previous, input);
       if (grant !== previous) {
+        let ledger = structuredClone(
+          this.usageLedgers.get(input.billingOwnerId),
+        );
+        if (grant.quota) {
+          if (ledger && ledger.anchorAt !== grant.quota.anchorAt)
+            throw new HttpError(409, "Usage anniversary cannot change");
+          ledger ??= { anchorAt: grant.quota.anchorAt, windows: [] };
+        }
         const meetings = structuredClone([...this.data.values()]);
         applyEntitlement(grant, meetings);
+        if (ledger) {
+          const bound = meetings.filter(
+            (m) => m.hosted?.billingOwnerId === input.billingOwnerId,
+          );
+          sweepParticipantMeters(ledger, bound, Date.now());
+          if (grant.enabled && quotaOverdrawn(ledger, grant, bound, Date.now()))
+            for (const m of bound) if (m.lifecycle) endMeeting(m);
+          this.usageLedgers.set(input.billingOwnerId, ledger);
+        }
         for (const m of meetings)
           if (m.hosted?.billingOwnerId === grant.billingOwnerId) {
             m.revision++;

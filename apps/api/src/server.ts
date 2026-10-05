@@ -277,7 +277,15 @@ export async function createApp(config: Config, store: Store, media: Media) {
     let failed = false;
     for (const p of ps) {
       try {
+        if (p.meter && !media.available)
+          throw new Error("Media cleanup is unavailable");
         await media.remove(m, p);
+        await store.settleParticipantMeter(
+          m.code,
+          p.id,
+          p.mediaVersion,
+          p.meter,
+        );
         await store.change(m.code, (state) => {
           const live = state.participants.find((x) => x.id === p.id);
           if (live && live.mediaVersion === p.mediaVersion) {
@@ -611,6 +619,13 @@ export async function createApp(config: Config, store: Store, media: Media) {
     try {
       if (!media.available) throw new Error("Media cleanup is unavailable");
       await media.end(m);
+      for (const p of m.participants)
+        await store.settleParticipantMeter(
+          m.code,
+          p.id,
+          p.mediaVersion,
+          p.meter,
+        );
       await store.change(m.code, (state) => {
         if (!state.ended) throw new Error("Meeting completion changed");
         for (const p of state.participants) {
@@ -645,6 +660,13 @@ export async function createApp(config: Config, store: Store, media: Media) {
       entitlementSchema.parse(req.body),
     );
     return { ok: true, revision: grant.revision };
+  });
+  app.post("/api/internal/hosted/usage", async (req) => {
+    const { billingOwnerId } = z
+      .object({ billingOwnerId: hostedUuid })
+      .strict()
+      .parse(req.body);
+    return store.hostedUsage(billingOwnerId);
   });
   app.post("/api/internal/hosted/authority", async (req, reply) => {
     const body = z
@@ -703,6 +725,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
   );
   app.post("/api/meetings/:code/host", async (req, reply) => {
     const { token } = z.object({ token: z.string().max(256) }).parse(req.body);
+    await store.checkUsage(codeOf(req));
     const session = randomToken();
     const id = await store.startMeeting(codeOf(req), (m) => {
       active(m);
@@ -800,6 +823,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
         enforcementPending: !!x.enforcementPending,
       });
       const canSee = p.status === "admitted";
+      const usage =
+        p.role === "host" && m.hosted?.billingOwnerId
+          ? await store.hostedUsage(m.hosted.billingOwnerId).catch(() => null)
+          : undefined;
       return {
         meeting: {
           code: m.code,
@@ -827,6 +854,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           participantLimit: participantLimit(m),
           startedAt: m.lifecycle?.startedAt,
           deadlineAt: m.lifecycle?.deadlineAt,
+          usage,
           recordingAllowed: m.recordingAllowed,
           createdAt: m.createdAt,
           hostEmailVerified:
@@ -891,6 +919,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       .strict()
       .parse(req.body);
     const target = (req.params as any).id;
+    if (body.action === "admit") await store.checkUsage(codeOf(req));
     let changed!: Participant;
     const m = await store.change(codeOf(req), (m) => {
       active(m);
@@ -1049,6 +1078,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const p = actor(req, m);
     if (p.status !== "admitted" || p.enforcementPending)
       throw new HttpError(403, "Admission required");
+    await store.checkUsage(m.code, p.id);
     return {
       token: await media.token(m, p),
       url: config.origin.replace(/^http/, "ws"),
@@ -1207,6 +1237,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const m = await find(req);
     active(m);
     actor(req, m, true);
+    await store.checkUsage(m.code);
     await recordings.start(m);
     return { ok: true };
   });
@@ -1277,6 +1308,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
     ticking = true;
     try {
       for (let m of await store.all()) {
+        if (m.hosted?.billingOwnerId) {
+          await store.reconcileParticipantMeters(m.code).catch(() => {});
+          m = (await store.get(m.code))!;
+        }
         if (!m.ended && !meetingAllowed(m)) {
           m = await store.change(m.code, (state) => {
             if (!meetingAllowed(state)) endMeeting(state);

@@ -889,6 +889,17 @@ function Conference({
   const [mediaError, setMediaError] = useState("");
   const [attempt, setAttempt] = useState(0);
   const host = state.me.role === "host";
+  const usage = host ? state.meeting.usage : undefined;
+  const quotaNotice =
+    usage === null
+      ? "Usage is unavailable. Check the portal for status."
+      : usage?.blocked
+        ? "New connections are paused. Check usage in the portal."
+        : usage &&
+            usage.participantSeconds.used >=
+              usage.participantSeconds.limit * 0.8
+          ? `At least 80% of the monthly allowance has been used. ${(usage.participantSeconds.available / 60).toLocaleString(undefined, { maximumFractionDigits: 1 })} participant-minutes available. Resets ${new Date(usage.window.end).toLocaleDateString()}.`
+          : "";
   const code = state.meeting.code;
   const admitted = state.participants.filter((p) => p.status === "admitted");
   const waiting = state.participants.filter((p) => p.status === "waiting");
@@ -1284,10 +1295,11 @@ function Conference({
           )}
         </div>
       </header>
-      {(error || networkError || notice) && (
+      {(error || networkError || notice || quotaNotice) && (
         <div className="room-notices">
           {(error || networkError) && <Notice>{error || networkError}</Notice>}
           {notice && <Notice kind="info">{notice}</Notice>}
+          {quotaNotice && <Notice kind="info">{quotaNotice}</Notice>}
         </div>
       )}
       <div className="meeting-session">{roomContent}</div>

@@ -62,6 +62,10 @@ async function fixture(
     revision: 1,
     validUntil: Date.now() + 300000,
     enabled: true,
+    quota: {
+      anchorAt: Date.UTC(2026, 0, 31),
+      participantSecondsPerMonth: 360000,
+    },
     hostAccountIds: [accountId, foreignAccountId],
     limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 2 },
   };
@@ -144,6 +148,67 @@ async function fixture(
     tick,
   };
 }
+
+test("usage remains machine-only and only the owning meeting host sees aggregate allowance", async (t) => {
+  const f = await fixture(t);
+  for (const url of [
+    "/api/internal/hosted/usage",
+    "/%61pi/internal/hosted/usage",
+  ])
+    for (const headers of [
+      {},
+      { origin, "x-requested-with": "MeetingPlatform" },
+    ]) {
+      const denied = await f.app.inject({
+        method: "POST",
+        url,
+        headers,
+        payload: { billingOwnerId: f.billingOwnerId },
+      });
+      assert.equal(denied.statusCode, 403);
+    }
+  const usage = await f.internal("usage", { billingOwnerId: f.billingOwnerId });
+  assert.equal(usage.statusCode, 200, usage.body);
+  assert.equal(usage.json().participantSeconds.limit, 360000);
+  assert.equal(usage.json().billingOwnerId, undefined);
+  const unavailable = await f.internal("usage", {
+    billingOwnerId: randomUUID(),
+  });
+  assert.equal(unavailable.statusCode, 404);
+  assert.equal(unavailable.json().code, "USAGE_UNAVAILABLE");
+  const { code, hostToken } = (await f.create()).json();
+  const cookie = await f.exchange(code, hostToken);
+  const hostState = (
+    await f.browser(`/api/meetings/${code}/state`, undefined, cookie)
+  ).json();
+  assert.equal(hostState.meeting.usage.participantSeconds.used, 0);
+  const joined = await f.browser(`/api/meetings/${code}/join`, {
+    name: "Guest",
+    password: settings.password,
+  });
+  const guestCookie = joined.cookies
+    .map((c) => `${c.name}=${c.value}`)
+    .join("; ");
+  const guestState = (
+    await f.browser(`/api/meetings/${code}/state`, undefined, guestCookie)
+  ).json();
+  assert.equal(guestState.meeting.usage, undefined);
+  const unmetered = await f.browser("/api/meetings", {
+    ...settings,
+    creationKey,
+  });
+  assert.equal(unmetered.statusCode, 200, unmetered.body);
+  const legacy = unmetered.json();
+  const legacyCookie = await f.exchange(legacy.code, legacy.hostToken);
+  const legacyState = (
+    await f.browser(
+      `/api/meetings/${legacy.code}/state`,
+      undefined,
+      legacyCookie,
+    )
+  ).json();
+  assert.equal(legacyState.meeting.usage, undefined);
+});
 
 test("hosted internal mutations require the exact server credential and reject browser/cookie authority", async (t) => {
   const f = await fixture(t);

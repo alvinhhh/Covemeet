@@ -294,6 +294,10 @@ test("hosted deadline and stale plan snapshots prevent recorder startup using an
     revision: 1,
     validUntil: Date.now() + 300000,
     enabled: true,
+    quota: {
+      anchorAt: Date.UTC(2026, 0, 31),
+      participantSecondsPerMonth: 360000,
+    },
     allowed: true,
     limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 1 },
   };

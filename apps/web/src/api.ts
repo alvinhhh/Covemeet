@@ -68,6 +68,16 @@ export type MeetingState = {
     participantLimit?: number;
     startedAt?: number;
     deadlineAt?: number;
+    usage?: null | {
+      window: { start: number; end: number };
+      participantSeconds: {
+        limit: number;
+        used: number;
+        reserved: number;
+        available: number;
+      };
+      blocked: boolean;
+    };
     recordingAllowed: boolean;
     recordingActive?: boolean;
     createdAt: string;

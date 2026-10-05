@@ -12,6 +12,7 @@ import {
   TrackSource,
 } from "livekit-server-sdk";
 import { WebSocket, WebSocketServer } from "ws";
+import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { Config } from "./config.js";
 import type { Meeting, Participant, Store } from "./store.js";
@@ -93,6 +94,8 @@ export class LiveMedia implements Media {
       !p ||
       p.status !== "admitted" ||
       p.enforcementPending ||
+      (p.meter &&
+        (p.meter.phase === "closing" || p.meter.fundedUntil <= Date.now())) ||
       p.expiresAt < Date.now() ||
       (p.phone && p.phone.leaseExpiresAt <= Date.now()) ||
       (p.transport === "phone" && !this.config.phoneEnabled) ||
@@ -145,11 +148,26 @@ export class LiveMedia implements Media {
       }
       const token = url.searchParams.get("access_token") ?? "";
       try {
-        const { m, p } = await this.authorize(token);
+        let { m, p } = await this.authorize(token);
         const cookie =
           app.parseCookie(req.headers.cookie ?? "")[`mp_${m.code}`] ?? "";
         if (!safeEqual(p.tokenHash, digest(cookie)))
           throw new HttpError(403, "Media session required");
+        const metered = !!m.hosted?.billingOwnerId;
+        const connectionId = randomUUID();
+        const meterInput = {
+          participantId: p.id,
+          mediaVersion: p.mediaVersion,
+          connectionId,
+        };
+        if (metered) {
+          const claimed = await this.store.updateParticipantMeter(m.code, {
+            ...meterInput,
+            action: "claim",
+          });
+          m = claimed.meeting;
+          p = claimed.participant;
+        }
         wss.handleUpgrade(req, socket, head, (client) => {
           let closed = false;
           let expiryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -157,10 +175,22 @@ export class LiveMedia implements Media {
           target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
           target.pathname = url.pathname;
           target.search = url.search;
-          const upstream = new WebSocket(target, { maxPayload: 1024 * 1024 });
+          const upstream = new WebSocket(target, {
+            maxPayload: 1024 * 1024,
+            handshakeTimeout: 4000,
+          });
           const set = this.sockets.get(p.id) ?? new Set<WebSocket>();
           set.add(client);
           this.sockets.set(p.id, set);
+          let authorized = false;
+          let clientPongAt = Date.now(),
+            upstreamPongAt = Date.now();
+          client.on("pong", () => {
+            clientPongAt = Date.now();
+          });
+          upstream.on("pong", () => {
+            upstreamPongAt = Date.now();
+          });
           const stop = () => {
             if (closed) return;
             closed = true;
@@ -169,9 +199,49 @@ export class LiveMedia implements Media {
             client.terminate();
             set.delete(client);
             if (!set.size) this.sockets.delete(p.id);
+            // The durable last-pong deadline survives socket/process loss.
           };
           const checkExpiry = async () => {
             try {
+              if (metered) {
+                if (closed) return;
+                if (
+                  Date.now() - Math.min(clientPongAt, upstreamPongAt) >=
+                  15000
+                )
+                  return stop();
+                if (authorized) {
+                  await this.store.updateParticipantMeter(m.code, {
+                    ...meterInput,
+                    action: "heartbeat",
+                  });
+                  if (closed) return;
+                }
+                if (client.readyState === WebSocket.OPEN) client.ping();
+                if (upstream.readyState === WebSocket.OPEN) upstream.ping();
+                const current = await this.store.get(m.code);
+                const member = current?.participants.find((x) => x.id === p.id);
+                if (
+                  !current ||
+                  !meetingAllowed(current) ||
+                  member?.meter?.connectionId !== connectionId ||
+                  member.meter.phase === "closing"
+                )
+                  return stop();
+                expiryTimer = setTimeout(
+                  () => void checkExpiry(),
+                  Math.max(
+                    1,
+                    Math.min(
+                      5000,
+                      member.meter.fundedUntil - Date.now(),
+                      member.meter.presenceUntil - Date.now(),
+                    ),
+                  ),
+                );
+                expiryTimer.unref();
+                return;
+              }
               const state = await this.store.get(m.code);
               const member = state?.participants.find((x) => x.id === p.id);
               const deadline = member
@@ -202,7 +272,8 @@ export class LiveMedia implements Media {
               expiryTimer.unref();
             } catch {
               stop();
-              await this.remove(m, p).catch(() => {});
+              // A replaced metered socket never removes its successor by identity.
+              if (!metered) await this.remove(m, p).catch(() => {});
             }
           };
           void checkExpiry();
@@ -210,7 +281,7 @@ export class LiveMedia implements Media {
           client.on("error", stop);
           upstream.on("close", stop);
           upstream.on("error", stop);
-          let authorized = false;
+          let opening = Promise.resolve();
           const pending: { data: Buffer; binary: boolean }[] = [];
           client.on("message", (data, binary) => {
             if (!authorized || upstream.readyState !== WebSocket.OPEN) {
@@ -220,23 +291,33 @@ export class LiveMedia implements Media {
             }
             upstream.send(data, { binary });
           });
-          upstream.on("open", async () => {
-            try {
-              await this.authorize(token);
-              if (closed) return;
-              authorized = true;
-              for (const item of pending)
-                upstream.send(item.data, { binary: item.binary });
-              pending.length = 0;
-            } catch {
-              stop();
-              await this.remove(m, p).catch(() => {});
-            }
+          upstream.on("open", () => {
+            opening = (async () => {
+              try {
+                await this.authorize(token);
+                if (closed) return;
+                if (metered)
+                  await this.store.updateParticipantMeter(m.code, {
+                    ...meterInput,
+                    action: "connected",
+                  });
+                if (closed) return;
+                authorized = true;
+                for (const item of pending)
+                  upstream.send(item.data, { binary: item.binary });
+                pending.length = 0;
+              } catch {
+                stop();
+                if (!metered) await this.remove(m, p).catch(() => {});
+              }
+            })();
           });
           let forwarding = Promise.resolve();
           upstream.on("message", (data, binary) => {
             forwarding = forwarding.then(async () => {
               try {
+                await opening;
+                if (closed || !authorized) return;
                 const fresh = await this.store.get(m.code);
                 const current = fresh?.participants.find((x) => x.id === p.id);
                 if (
@@ -247,10 +328,14 @@ export class LiveMedia implements Media {
                   (current.phone &&
                     current.phone.leaseExpiresAt <= Date.now()) ||
                   current.enforcementPending ||
+                  (metered &&
+                    (current.meter?.connectionId !== connectionId ||
+                      current.meter.phase !== "active" ||
+                      current.meter.fundedUntil <= Date.now())) ||
                   current.mediaVersion !== p.mediaVersion
                 ) {
                   stop();
-                  await this.remove(m, p).catch(() => {});
+                  if (!metered) await this.remove(m, p).catch(() => {});
                   return;
                 }
                 if (client.readyState === WebSocket.OPEN)

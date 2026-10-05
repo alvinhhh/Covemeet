@@ -83,6 +83,10 @@ async function fixture(t: TestContext) {
         [accounts],
       );
       await cleanup.query(
+        "DELETE FROM hosted_usage WHERE billing_owner_id=ANY($1::uuid[])",
+        [accounts],
+      );
+      await cleanup.query(
         "DELETE FROM hosted_entitlements WHERE billing_owner_id=ANY($1::uuid[])",
         [accounts],
       );
@@ -116,6 +120,10 @@ async function fixture(t: TestContext) {
           revision: 1,
           validUntil: Date.now() + 300000,
           enabled: true,
+          quota: {
+            anchorAt: Date.UTC(2026, 0, 31),
+            participantSecondsPerMonth: 360000,
+          },
           hostAccountIds: [owner],
           limits: {
             participants: 100,
@@ -152,6 +160,108 @@ async function fixture(t: TestContext) {
     });
   return { stores, media, apps, account, create, authority, config };
 }
+
+test(
+  "PostgreSQL pooled participant claims serialize across APIs and retain unknown media after process restart",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account();
+    const created = await f.create(0, owner, randomUUID());
+    assert.equal(created.statusCode, 200, created.body);
+    const { code, hostToken } = created.json();
+    const grant = (
+      await f.stores[0].pool.query(
+        "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+        [owner],
+      )
+    ).rows[0].data;
+    await f.stores[0].setHostedEntitlement({
+      ...grant,
+      revision: 2,
+      quota: { ...grant.quota, participantSecondsPerMonth: 30 },
+    });
+    const started = await f.apps[0].inject({
+      method: "POST",
+      url: `/api/meetings/${code}/host`,
+      headers: browserHeaders,
+      payload: { token: hostToken },
+    });
+    assert.equal(started.statusCode, 200, started.body);
+    const guestId = randomUUID();
+    await f.stores[0].change(code, (m) => {
+      m.participants.push({
+        ...m.participants[0]!,
+        id: guestId,
+        name: "Guest",
+        role: "participant",
+      });
+    });
+    const hostId = started.json().participantId;
+    const claims = await Promise.allSettled(
+      [hostId, guestId].map((participantId, i) =>
+        f.stores[i]!.updateParticipantMeter(code, {
+          participantId,
+          mediaVersion: 1,
+          connectionId: `fixture-${i}`,
+          action: "claim",
+        }),
+      ),
+    );
+    assert.equal(claims.filter((r) => r.status === "fulfilled").length, 1);
+    assert.deepEqual(
+      (await f.stores[0].hostedUsage(owner)).participantSeconds,
+      { limit: 30, used: 0, reserved: 30, available: 0 },
+    );
+    const current = (await f.stores[0].get(code)) as Meeting;
+    const winner = current.participants.find((p) => p.meter)!;
+    await f.stores[0].updateParticipantMeter(code, {
+      participantId: winner.id,
+      mediaVersion: 1,
+      connectionId: winner.meter!.connectionId,
+      action: "connected",
+    });
+    await f.stores[0].change(code, (m) => {
+      m.participants.find((p) => p.id === winner.id)!.meter!.presenceUntil =
+        Date.now() - 1;
+    });
+    const restarted = new PgStore(databaseUrl!);
+    t.after(() => restarted.close());
+    await restarted.reconcileParticipantMeters(code);
+    const pending = await restarted.hostedUsage(owner);
+    assert.equal(pending.blocked, true);
+    assert.ok(pending.participantSeconds.reserved > 0);
+    await assert.rejects(
+      f.stores[1].updateParticipantMeter(code, {
+        participantId: winner.id === hostId ? guestId : hostId,
+        mediaVersion: 1,
+        connectionId: "late",
+        action: "claim",
+      }),
+      /allowance is unavailable/,
+    );
+    const fenced = ((await restarted.get(code)) as Meeting).participants.find(
+      (p) => p.id === winner.id,
+    )!;
+    await restarted.settleParticipantMeter(
+      code,
+      fenced.id,
+      fenced.mediaVersion,
+      fenced.meter,
+    );
+    const released = await f.stores[1].hostedUsage(owner);
+    assert.equal(released.participantSeconds.reserved, 0);
+    assert.equal(released.blocked, false);
+    await assert.rejects(
+      restarted.setHostedEntitlement({
+        ...grant,
+        revision: 3,
+        quota: { ...grant.quota, anchorAt: grant.quota.anchorAt + 1 },
+      }),
+      /anniversary cannot change/,
+    );
+  },
+);
 
 test(
   "PostgreSQL duplicate hosted creation returns one unused capability across pools",
@@ -395,6 +505,10 @@ test(
       revision: 1,
       validUntil: Date.now() + 300000,
       enabled: true,
+      quota: {
+        anchorAt: Date.UTC(2026, 0, 31),
+        participantSecondsPerMonth: 360000,
+      },
       hostAccountIds: [firstHost, secondHost],
       limits: {
         participants: 100,
@@ -475,6 +589,10 @@ test(
       revision: 2,
       validUntil: Date.now() + 300000,
       enabled: true,
+      quota: {
+        anchorAt: Date.UTC(2026, 0, 31),
+        participantSecondsPerMonth: 360000,
+      },
       hostAccountIds: [firstHost, secondHost],
       limits: {
         participants: 100,
@@ -499,6 +617,10 @@ test(
       revision: 1,
       validUntil: Date.now() + 300000,
       enabled: true,
+      quota: {
+        anchorAt: Date.UTC(2026, 0, 31),
+        participantSecondsPerMonth: 360000,
+      },
       hostAccountIds: [accountId],
       limits: {
         participants: 100,

@@ -7,6 +7,7 @@ export type HostedEntitlement = {
   revision: number;
   validUntil: number;
   enabled: boolean;
+  quota: { anchorAt: number; participantSecondsPerMonth: number } | null;
   hostAccountIds: string[];
   limits: {
     participants: number;
@@ -30,6 +31,13 @@ export const entitlementSchema = z
     revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     validUntil: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     enabled: z.boolean(),
+    quota: z
+      .object({
+        anchorAt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        participantSecondsPerMonth: z.number().int().positive().max(36000000),
+      })
+      .strict()
+      .nullable(),
     hostAccountIds: z
       .array(uuid)
       .max(100)
@@ -48,6 +56,16 @@ export const entitlementSchema = z
   })
   .strict()
   .refine(
+    (grant) => grant.quota === null || grant.quota.anchorAt <= Date.now(),
+    "Usage anniversary cannot be in the future",
+  )
+  .refine(
+    (grant) =>
+      !grant.enabled ||
+      (grant.quota !== null && grant.quota.anchorAt <= Date.now()),
+    "Enabled hosting requires a current usage allowance",
+  )
+  .refine(
     (grant) => !grant.enabled || grant.validUntil <= Date.now() + 360000,
     "Hosting grant exceeds its maximum lifetime",
   );
@@ -62,6 +80,8 @@ export function nextEntitlement(
       grant.revision,
       grant.validUntil,
       grant.enabled,
+      grant.quota?.anchorAt ?? null,
+      grant.quota?.participantSecondsPerMonth ?? null,
       [...grant.hostAccountIds].sort(),
       grant.limits.participants,
       grant.limits.durationSeconds,
@@ -112,6 +132,7 @@ export function requireEntitlement(
 ) {
   if (
     !grant?.enabled ||
+    !grant.quota ||
     grant.validUntil <= now ||
     !grant.hostAccountIds.includes(accountId)
   )
@@ -133,7 +154,11 @@ export function meetingAllowed(m: Meeting, now = Date.now()) {
     !m.ended &&
     meetingDeadline(m) > now &&
     (!m.hosted?.billingOwnerId ||
-      !!(m.hosted.entitlement?.enabled && m.hosted.entitlement.allowed))
+      !!(
+        m.hosted.entitlement?.enabled &&
+        m.hosted.entitlement.allowed &&
+        m.hosted.entitlement.quota
+      ))
   );
 }
 
