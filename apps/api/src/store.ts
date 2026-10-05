@@ -551,8 +551,48 @@ function finishedPhoneParticipant(dialog: PhoneDialog, meeting?: Meeting) {
 }
 export class PgStore implements Store {
   pool: pg.Pool;
-  constructor(url: string) {
-    this.pool = new pg.Pool({ connectionString: url, max: 10 });
+  constructor(url: string, transport: { tls?: boolean; ca?: string } = {}) {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error("Invalid database URL");
+    }
+    if (
+      !["postgres:", "postgresql:"].includes(parsed.protocol) ||
+      !parsed.hostname ||
+      parsed.pathname.length < 2
+    )
+      throw new Error("Invalid database URL");
+    if (
+      [...parsed.searchParams].some(
+        ([name, value]) => name !== "sslmode" || value !== "verify-full",
+      )
+    )
+      throw new Error("Database URL options may not override verified TLS");
+    if (transport.ca !== undefined && !transport.ca.trim())
+      throw new Error("Database CA must not be empty");
+    const ssl =
+      transport.tls ||
+      transport.ca !== undefined ||
+      parsed.searchParams.has("sslmode")
+        ? {
+            rejectUnauthorized: true,
+            minVersion: "TLSv1.2" as const,
+            ...(transport.ca ? { ca: transport.ca } : {}),
+          }
+        : false;
+    // pg connection-string SSL options otherwise replace this explicit object.
+    parsed.search = "";
+    this.pool = new pg.Pool({
+      connectionString: parsed.toString(),
+      ssl,
+      max: 10,
+      connectionTimeoutMillis: 5000,
+    });
+    // Idle driver errors may contain connection details; active operations fail
+    // through their own promise without exposing those details in a pool log.
+    this.pool.on("error", () => {});
   }
   async init() {
     await this.pool.query(

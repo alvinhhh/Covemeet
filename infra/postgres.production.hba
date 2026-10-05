@@ -1,0 +1,5 @@
+# Local socket access stays inside the database container for initialization.
+local all all trust
+# Never accept a plaintext TCP connection, including from another container.
+hostnossl all all all reject
+hostssl all all all scram-sha-256

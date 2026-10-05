@@ -1,7 +1,17 @@
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import { loadMailConfig, mailbox } from "@meeting-platform/mail";
 export type Config = ReturnType<typeof loadConfig>;
 export function loadConfig(env = process.env) {
+  let databaseCa: string | undefined;
+  if (env.DATABASE_CA_FILE) {
+    try {
+      databaseCa = readFileSync(env.DATABASE_CA_FILE, "utf8");
+      if (!databaseCa.trim()) throw new Error();
+    } catch {
+      throw new Error("DATABASE_CA_FILE could not be read or is empty");
+    }
+  }
   const secret = env.SESSION_SECRET ?? "";
   if (secret.length < 32)
     throw new Error(
@@ -180,6 +190,7 @@ export function loadConfig(env = process.env) {
     brandName: env.BRAND_NAME ?? "Covemeet",
     databaseUrl:
       env.DATABASE_URL ?? "postgres://meeting:meeting@127.0.0.1:55432/meeting",
+    databaseCa,
     host: env.HOST ?? "127.0.0.1",
     port: Number(env.PORT ?? 4100),
     creationKey: env.CREATION_KEY ?? "",

@@ -22,9 +22,9 @@ Do not change the dev bindings to `0.0.0.0` to invite remote users. The local ra
 | `PORTAL_ORIGIN`                          | Optional separate self-hosted portal origin. Omit it for a single-origin installation.                             |
 | `SESSION_SECRET`                         | Random secret for session-related cryptography. Rotating it may invalidate active sessions.                        |
 | `CREATION_KEY`                           | Server-controlled creation credential in hosted mode. Never embed it in a browser bundle.                          |
-| `MEETING_PARTICIPANT_LIMIT` | Self-hosted total meeting seats, including the host and waiting guests; defaults to 100, maximum 1,000. |
-| `WEBINAR_PARTICIPANT_LIMIT` | Self-hosted total webinar seats; defaults to 1,010, with at most 1,000 viewers and ten stage members. |
-| `MEETING_DURATION_SECONDS` | Self-hosted session length from first host entry; 0 is unlimited, otherwise up to 86,400 seconds. |
+| `MEETING_PARTICIPANT_LIMIT`              | Self-hosted total meeting seats, including the host and waiting guests; defaults to 100, maximum 1,000.            |
+| `WEBINAR_PARTICIPANT_LIMIT`              | Self-hosted total webinar seats; defaults to 1,010, with at most 1,000 viewers and ten stage members.              |
+| `MEETING_DURATION_SECONDS`               | Self-hosted session length from first host entry; 0 is unlimited, otherwise up to 86,400 seconds.                  |
 | `LIVEKIT_URL`                            | Private API/signaling destination: localhost in development, `http://livekit:7880` inside Compose.                 |
 | `LIVEKIT_PUBLIC_URL`                     | Browser gateway origin, such as `ws://localhost:4100`; the SDK appends `/rtc`. It must never point at raw LiveKit. |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Server-only credentials shared with LiveKit/Egress.                                                                |
@@ -34,6 +34,7 @@ Do not change the dev bindings to `0.0.0.0` to invite remote users. The local ra
 | `RECORDING_DIR`                          | API-visible recording root, containing `raw/` and `encrypted/`.                                                    |
 | `EGRESS_FILE_ROOT`                       | Same directory as Egress sees it; `/recordings` in Compose.                                                        |
 | `SMTP_*`                                 | Test capture or real SMTP provider configuration.                                                                  |
+| `DATABASE_URL` / `DATABASE_CA_FILE`      | PostgreSQL connection and optional trusted CA file. Production verifies TLS and the server hostname.               |
 
 The script uses atomic exclusive creation for `.env`, generates secrets with the operating system random generator, and gives runtime directories mode `0700` and secret files mode `0600`. It never prints credentials. Existing `.env` values are preserved. Keep an encrypted backup of the recording key separately from database and recording backups; losing it makes existing recordings unrecoverable. The recording package now includes a local keyring, AWS KMS adapter, operator-driven metadata rewrap and private S3-compatible ciphertext storage. See [recording storage configuration and limitations](recording-storage.md); real cloud IAM/KMS behavior and key-loss/restore drills remain separate deployment gates.
 
@@ -60,13 +61,17 @@ Issuing a link emails its password automatically to the verified host. The link 
 `infra/compose.production.yaml` is a single-host staging template. It does not establish a high-availability service. Start with a private staging network and synthetic data.
 
 1. Set the real `SITE_ORIGIN=https://…`, `LIVEKIT_PUBLIC_URL=wss://…` (origin only), and reachable `LIVEKIT_NODE_IP` in a protected environment file. Supply SMTP credentials separately from source control.
-2. Render configuration with `node scripts/bootstrap.mjs --production`.
+2. Render configuration with `node scripts/bootstrap.mjs --production`. Supply PostgreSQL TLS files as described below.
 3. Validate with `docker compose --env-file .env -f infra/compose.production.yaml config --quiet`.
 4. Review and build with `docker compose --env-file .env -f infra/compose.production.yaml build`.
 5. Configure the host TLS proxy from `infra/Caddyfile.example`, an explicit trusted-proxy policy, and firewall rules before starting external access.
 6. Complete every release gate in `security-controls.md`; keep recordings disabled until their separate gate passes.
 
 The app container listens internally on port 4100 and publishes only to host loopback. LiveKit signaling/API port 7880, PostgreSQL, and Redis have no host mapping. Only media ports 7881/TCP and 7882/UDP are public in the template. Open these at the perimeter only for the dedicated media host. Production clients need a real reachable media address and a TURN/TLS deployment for networks that block direct media. TURN is not included in this starter template. [LiveKit port requirements](https://docs.livekit.io/transport/self-hosting/ports-firewall/)
+
+The staging PostgreSQL service requires `POSTGRES_TLS_CERT_FILE`, `POSTGRES_TLS_KEY_FILE` and `POSTGRES_TLS_CA_FILE` as absolute host paths. The server certificate must include `postgres` in its DNS subject alternative names. Mount only the server key, server certificate chain and public CA certificate; keep the CA signing key elsewhere. The server key must be owned by the container's PostgreSQL user with mode `0600`, or root-owned with its PostgreSQL group and mode `0640`. Obtain the image's numeric group with `docker run --rm --entrypoint id postgres:17.11-alpine3.23 -g postgres`; do not make the private key world-readable. Existing database volumes remain intact. Replace/reload certificates before expiry and verify new connections.
+
+Production API and phone-administration connections require certificate-verified PostgreSQL TLS. `DATABASE_CA_FILE` is a path inside the application container; omit it to use the platform trust store. An explicit CA or `sslmode=verify-full` also enables TLS outside production. Other connection-string options are rejected so they cannot replace certificate verification. The staging database requires TLS 1.2 or later and rejects plaintext TCP clients. Its local socket is trusted only inside the database container; no socket is shared with the application. Run `node scripts/database-tls-test.mjs` to exercise an isolated PostgreSQL server with valid, untrusted and mismatched certificates and no-TLS refusal. This test uses its own temporary CA and never changes system trust.
 
 Forwarded client addresses must be accepted only from the exact trusted proxy, which must replace incoming forwarding headers. An overly broad proxy trust setting makes IP bans and rate limits bypassable. The public ingress must preserve WebSocket upgrades and route `/rtc` through the application gateway. Do not publish the LiveKit management APIs through a general reverse proxy.
 

@@ -3,7 +3,10 @@ import { PgStore } from "./store.js";
 import { LiveMedia } from "./media.js";
 import { createApp } from "./server.js";
 const config = loadConfig();
-const store = new PgStore(config.databaseUrl);
+const store = new PgStore(config.databaseUrl, {
+  tls: config.production,
+  ca: config.databaseCa,
+});
 await store.init();
 const app = await createApp(config, store, new LiveMedia(config, store));
 await app.listen({ host: config.host, port: config.port });

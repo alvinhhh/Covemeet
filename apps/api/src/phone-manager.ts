@@ -19,7 +19,10 @@ import {
 // Run outside the supervisor container. Only this management process receives
 // the local Docker socket and private database credentials.
 const config = loadConfig(process.env);
-const store = new PgStore(config.databaseUrl);
+const store = new PgStore(config.databaseUrl, {
+  tls: config.production,
+  ca: config.databaseCa,
+});
 const media = new LiveMedia(config, store);
 try {
   const mode = z.enum(["claim", "fence", "recover"]).parse(process.argv[2]);
