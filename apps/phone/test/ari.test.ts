@@ -63,19 +63,14 @@ async function fixture(
     if (
       req.method === "DELETE" ||
       url.pathname.endsWith("/answer") ||
-      url.pathname.endsWith("/addChannel") ||
-      url.pathname.endsWith("/removeChannel")
+      url.pathname.endsWith("/addChannel")
     ) {
       res.writeHead(204).end();
       return;
     }
     if (url.pathname === "/ari/channels") return json(res, [channel]);
     if (url.pathname.endsWith("/variable")) return json(res, { value: "1" });
-    if (
-      url.pathname.includes("/play/") ||
-      url.pathname.startsWith("/ari/playbacks/")
-    )
-      return json(res, playback);
+    if (url.pathname.includes("/play/")) return json(res, playback);
     if (url.pathname.startsWith("/ari/bridges/")) return json(res, bridge);
     return json(res, channel);
   });
@@ -192,7 +187,6 @@ test("ARI authenticates HTTP and WS only in headers and exposes exact scoped ope
       channelId: channel.id,
       endpoint: "PJSIP/room-1@livekit-holding",
       appArgs: ["holding", "call-1"],
-      variables: { COVEMEET_ROOM: "room-1" },
     }),
     channel,
   );
@@ -200,10 +194,8 @@ test("ARI authenticates HTTP and WS only in headers and exposes exact scoped ope
     await f.client.play(channel.id, playback.id, "covemeet/waiting"),
     playback,
   );
-  assert.deepEqual(await f.client.getPlayback(playback.id), playback);
   assert.deepEqual(await f.client.createBridge(bridge.id), bridge);
   await f.client.addChannel(bridge.id, channel.id);
-  await f.client.removeChannel(bridge.id, channel.id);
   await f.client.stopPlayback(playback.id);
   await f.client.destroyBridge(bridge.id);
   await f.client.hangup(channel.id);
@@ -220,7 +212,6 @@ test("ARI authenticates HTTP and WS only in headers and exposes exact scoped ope
     app: "covemeet",
     appArgs: "holding,call-1",
     timeout: 30,
-    variables: { COVEMEET_ROOM: "room-1" },
   });
   assert.ok(
     f.requests.some(
@@ -331,7 +322,6 @@ test("ARI treats only confirmed 404 as absent or idempotent deletion", async (t)
   );
   await f.client.connect();
   assert.equal(await f.client.getChannel(channel.id), undefined);
-  assert.equal(await f.client.getPlayback(playback.id), undefined);
   await f.client.hangup(channel.id);
   await f.client.stopPlayback(playback.id);
   await f.client.destroyBridge(bridge.id);

@@ -114,7 +114,6 @@ export interface AriOriginate {
   endpoint: string;
   appArgs?: string[];
   timeoutSeconds?: number;
-  variables?: Record<string, string>;
 }
 function parameter<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
@@ -421,18 +420,6 @@ export class AriClient {
       z.array(z.string().regex(/^[A-Za-z0-9_.:-]{1,128}$/)).max(8),
       input.appArgs ?? [],
     );
-    const values = parameter(
-      z
-        .record(
-          z.string().regex(/^[A-Z_][A-Z0-9_]{0,63}$/),
-          z
-            .string()
-            .max(256)
-            .regex(/^[^\x00-\x1f\x7f]*$/),
-        )
-        .refine((v) => Object.keys(v).length <= 16),
-      input.variables ?? {},
-    );
     const body = {
       endpoint,
       app: this.config.app,
@@ -441,7 +428,6 @@ export class AriClient {
         z.number().int().min(1).max(60),
         input.timeoutSeconds ?? 30,
       ),
-      variables: values,
     };
     return this.result(
       channelSchema.extend({ id: z.literal(input.channelId) }),
@@ -478,21 +464,6 @@ export class AriClient {
       ),
     );
   }
-  async getPlayback(playbackId: string): Promise<AriPlayback | undefined> {
-    const result = await this.request(
-      "GET",
-      `/playbacks/${parameter(id, playbackId)}`,
-      undefined,
-      undefined,
-      true,
-    );
-    return result === absentResource
-      ? undefined
-      : this.result(
-          playbackSchema.extend({ id: z.literal(playbackId) }),
-          result,
-        );
-  }
   async stopPlayback(playbackId: string): Promise<void> {
     await this.request(
       "DELETE",
@@ -516,13 +487,6 @@ export class AriClient {
     await this.request(
       "POST",
       `/bridges/${parameter(id, bridgeId)}/addChannel`,
-      { channel: parameter(id, channelId) },
-    );
-  }
-  async removeChannel(bridgeId: string, channelId: string): Promise<void> {
-    await this.request(
-      "POST",
-      `/bridges/${parameter(id, bridgeId)}/removeChannel`,
       { channel: parameter(id, channelId) },
     );
   }

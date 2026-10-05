@@ -38,10 +38,9 @@ export function observe(room, identity) {
     void reader?.cancel().catch(() => {});
   };
   const subscribed = (track, publication, participant) => {
-    const expected = typeof identity === "function" ? identity() : identity;
     if (
       stopped ||
-      participant.identity !== expected ||
+      participant.identity !== identity() ||
       track.kind !== TrackKind.KIND_AUDIO ||
       !publication.sid
     )
