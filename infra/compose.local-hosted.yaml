@@ -23,7 +23,7 @@ services:
       STATIC_DIR: /app/apps/web/dist
       SITE_ORIGIN: https://portal.localhost:8443
       CORE_PUBLIC_URL: https://meet.localhost:8443
-      CORE_BASE_URL: https://meet.localhost:8443
+      CORE_BASE_URL: https://meet.localhost:9443
       NODE_EXTRA_CA_CERTS: /local-trust/root.crt
       CORE_CREATION_KEY: ${CREATION_KEY:?Run local setup}
       HOSTED_ADMIN_KEY: ${HOSTED_ADMIN_KEY:?Run local setup}

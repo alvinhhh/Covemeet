@@ -619,6 +619,8 @@ export class RecordingService {
     const credentials = await createDownloadCredentials();
     const expiresAt = Date.now() + 86400000;
     const email = await this.store.change(m.code, (state) => {
+      if (state.hosted?.revoked)
+        throw new HttpError(403, "Recording unavailable");
       const r = state.recordings.find((x) => x.id === id);
       if (!r || r.status !== "ready")
         throw new HttpError(409, "Recording is not ready");
@@ -671,7 +673,7 @@ export class RecordingService {
       return null;
     }
     const m = await this.store.get(code);
-    if (m) {
+    if (m && !m.hosted?.revoked) {
       const r = m.recordings.find(
         (r) =>
           r.status === "ready" &&

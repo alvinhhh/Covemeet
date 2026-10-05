@@ -208,7 +208,13 @@ export class PhoneService {
         p.transport !== "phone" ||
         p.phone.callId !== body.callId ||
         p.phone.trunkId !== this.config.phoneTrunkId ||
-        !safeEqual(p.tokenHash, digest(body.sessionToken))
+        !(
+          safeEqual(p.tokenHash, digest(body.sessionToken)) ||
+          (m.hosted?.revoked &&
+            m.ended &&
+            p.phone.cleanupTokenHash &&
+            safeEqual(p.phone.cleanupTokenHash, digest(body.sessionToken)))
+        )
       )
         throw new HttpError(403, "Phone session unavailable");
       const now = Date.now();

@@ -30,6 +30,19 @@ import { PhoneDialogService } from "./phone-dialogs.js";
 
 const name = z.string().trim().min(1).max(80),
   password = z.string().min(8).max(256);
+const meetingInput = z
+  .object({
+    title: name,
+    hostName: name,
+    password,
+    mode: z.enum(["meeting", "webinar"]),
+  })
+  .strict();
+const hostedUuid = z
+  .string()
+  .uuid()
+  .transform((value) => value.toLowerCase());
+const hostedVersion = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 const meetingLimit = 100,
   webinarViewerLimit = 1000,
   webinarPresenterLimit = 10;
@@ -120,8 +133,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
         "Content-Security-Policy",
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' wss:; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'",
       );
+    // Security dispatch must use the matched route, including decoded static segments.
+    const route = req.routeOptions.url;
     if (["POST", "PATCH", "DELETE", "PUT"].includes(req.method)) {
-      if (req.url.startsWith("/api/internal/phone/")) {
+      if (route?.startsWith("/api/internal/phone/")) {
         phone.authenticate(req.headers);
         if (
           !String(req.headers["content-type"] ?? "").startsWith(
@@ -139,11 +154,18 @@ export async function createApp(config: Config, store: Store, media: Media) {
           `Bearer ${config.creationKey}`,
         ) &&
         !req.headers.origin;
+      if (
+        route?.startsWith("/api/internal/hosted/") &&
+        (!machine ||
+          config.edition !== "hosted" ||
+          req.headers.origin !== undefined)
+      )
+        throw new HttpError(403, "Hosted service authentication required");
       if (!machine && req.headers["x-requested-with"] !== "MeetingPlatform")
         throw new HttpError(403, "Request verification failed");
       const portalAction =
         config.edition === "self-hosted" &&
-        (req.url === "/api/meetings" || req.url.startsWith("/api/admin/"));
+        (route === "/api/meetings" || route?.startsWith("/api/admin/"));
       if (
         req.headers.origin &&
         req.headers.origin !== config.origin &&
@@ -164,7 +186,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
         .code(400)
         .send({ error: error.issues[0]?.message ?? "Invalid request" });
     if (error instanceof HttpError)
-      return reply.code(error.status).send({ error: error.message });
+      return reply.code(error.status).send({
+        error: error.message,
+        ...(error.code ? { code: error.code } : {}),
+      });
     const status = (error as any).statusCode;
     if (status === 429)
       return reply
@@ -449,6 +474,173 @@ export async function createApp(config: Config, store: Store, media: Media) {
       .header("Cache-Control", "public, max-age=86400, immutable")
       .send(Buffer.from(asset.data, "base64"));
   });
+  async function buildMeeting(
+    body: z.infer<typeof meetingInput> & { customCode?: string },
+    hostToken: string,
+  ): Promise<Meeting> {
+    const code = body.customCode
+      ? normalizeCode(
+          z
+            .string()
+            .regex(/^[a-zA-Z0-9-]{6,48}$/)
+            .parse(body.customCode),
+        )
+      : meetingCode();
+    if (!/^[A-Z0-9]{6,48}$/.test(code))
+      throw new HttpError(
+        400,
+        "Meeting code must contain 6 to 48 letters or digits",
+      );
+    if (await store.get(code))
+      throw new HttpError(409, "Meeting code unavailable");
+    const m: Meeting = {
+      id: randomUUID(),
+      code,
+      room: `m_${randomUUID()}`,
+      title: body.title,
+      mode: body.mode,
+      locked: false,
+      ended: false,
+      recordingAllowed: false,
+      createdAt: Date.now(),
+      revision: 1,
+      passwordHash: await passwordHash(body.password),
+      hostTokenHash: digest(hostToken),
+      hostTokenExpiresAt: Date.now() + 30 * 60000,
+      participants: [],
+      bans: { ip: [], device: [] },
+      breakouts: [],
+      messages: [],
+      recordings: [],
+    };
+    // Host display name is bound to the one-use invitation without making it an authority token.
+    m.participants.push({
+      id: randomUUID(),
+      name: body.hostName,
+      role: "host",
+      status: "waiting",
+      audioAllowed: true,
+      videoAllowed: true,
+      mediaVersion: 1,
+      tokenHash: "",
+      expiresAt: Date.now() + 43200000,
+      ipHash: "",
+      deviceHash: "",
+      breakoutId: null,
+    });
+    return m;
+  }
+  app.post("/api/internal/hosted/meetings", async (req) => {
+    const body = z
+      .object({
+        accountId: hostedUuid,
+        version: hostedVersion,
+        operationId: hostedUuid,
+        meeting: meetingInput,
+      })
+      .strict()
+      .parse(req.body);
+    const hostToken = keyedDigest(
+      config.secret,
+      JSON.stringify([
+        "hosted-host-invitation-v1",
+        body.accountId,
+        body.version,
+        body.operationId,
+      ]),
+    );
+    const requestHash = keyedDigest(
+      config.secret,
+      JSON.stringify([
+        "hosted-create-request-v1",
+        body.accountId,
+        body.version,
+        body.operationId,
+        body.meeting.title,
+        body.meeting.hostName,
+        body.meeting.password,
+        body.meeting.mode,
+      ]),
+    );
+    const candidate = await buildMeeting(body.meeting, hostToken);
+    candidate.hosted = {
+      accountId: body.accountId,
+      version: body.version,
+      operationId: body.operationId,
+      requestHash,
+    };
+    const m = await store.createHosted(candidate);
+    if (!safeEqual(m.hostTokenHash ?? "", digest(hostToken)))
+      throw new HttpError(
+        409,
+        "Meeting invitation is no longer available",
+        "MEETING_OPERATION_UNAVAILABLE",
+      );
+    return {
+      code: m.code,
+      hostToken,
+      guestUrl: `${config.origin}/join/${m.code}`,
+    };
+  });
+  async function cleanupHosted(m: Meeting) {
+    let failed = false;
+    try {
+      await recordings.stopAll(m);
+    } catch {
+      failed = true;
+    }
+    try {
+      if (!media.available) throw new Error("Media cleanup is unavailable");
+      await media.end(m);
+      await store.change(m.code, (state) => {
+        if (!state.hosted?.revoked)
+          throw new Error("Hosted revocation changed");
+        for (const p of state.participants) {
+          p.enforcementPending = false;
+          delete p.previousRoom;
+        }
+      });
+    } catch {
+      failed = true;
+    }
+    await recordings.reconcile(m);
+    const current = await store.get(m.code);
+    if (
+      !current ||
+      current.recordings.some((r) =>
+        ["starting", "recording", "stopping"].includes(r.status),
+      ) ||
+      (await store.hasPhoneReservations(m.code))
+    )
+      failed = true;
+    if (!failed)
+      await store.change(m.code, (state) => {
+        if (!state.hosted?.revoked)
+          throw new Error("Hosted revocation changed");
+        state.hosted.cleanupConfirmed = true;
+      });
+  }
+  app.post("/api/internal/hosted/authority", async (req, reply) => {
+    const body = z
+      .object({
+        accountId: hostedUuid,
+        version: hostedVersion,
+        enabled: z.boolean(),
+        legacyCodes: z
+          .array(z.string().regex(/^[A-Z0-9]{6,48}$/))
+          .max(100)
+          .optional(),
+      })
+      .strict()
+      .parse(req.body);
+    const result = await store.setHostedAuthority(body);
+    const complete = result.meetings.length === 0;
+    return reply.code(complete ? 200 : 202).send({
+      ok: true,
+      version: result.authority.version,
+      cleanupPending: !complete,
+    });
+  });
   app.post(
     "/api/meetings",
     { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
@@ -474,57 +666,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
           400,
           "Hosted meeting codes are generated automatically",
         );
-      const code = body.customCode
-        ? normalizeCode(
-            z
-              .string()
-              .regex(/^[a-zA-Z0-9-]{6,48}$/)
-              .parse(body.customCode),
-          )
-        : meetingCode();
-      if (!/^[A-Z0-9]{6,48}$/.test(code))
-        throw new HttpError(
-          400,
-          "Meeting code must contain 6 to 48 letters or digits",
-        );
-      if (await store.get(code))
-        throw new HttpError(409, "Meeting code unavailable");
       const hostToken = randomToken();
-      const m: Meeting = {
-        id: randomUUID(),
-        code,
-        room: `m_${randomUUID()}`,
-        title: body.title,
-        mode: body.mode,
-        locked: false,
-        ended: false,
-        recordingAllowed: false,
-        createdAt: Date.now(),
-        revision: 1,
-        passwordHash: await passwordHash(body.password),
-        hostTokenHash: digest(hostToken),
-        hostTokenExpiresAt: Date.now() + 30 * 60000,
-        participants: [],
-        bans: { ip: [], device: [] },
-        breakouts: [],
-        messages: [],
-        recordings: [],
-      };
-      // Host display name is bound to the one-use invitation without making it an authority token.
-      m.participants.push({
-        id: randomUUID(),
-        name: body.hostName,
-        role: "host",
-        status: "waiting",
-        audioAllowed: true,
-        videoAllowed: true,
-        mediaVersion: 1,
-        tokenHash: "",
-        expiresAt: Date.now() + 43200000,
-        ipHash: "",
-        deviceHash: "",
-        breakoutId: null,
-      });
+      const m = await buildMeeting(body, hostToken);
+      const code = m.code;
       await store.create(m);
       await store.audit(code, "creator", "meeting.create");
       return { code, hostToken, guestUrl: `${config.origin}/join/${code}` };
@@ -1123,6 +1267,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
     ticking = true;
     try {
       for (let m of await store.all()) {
+        if (m.hosted?.revoked && !m.hosted.cleanupConfirmed) {
+          await cleanupHosted(m).catch(() => {});
+          continue;
+        }
         if (
           m.participants.some(
             (p) =>

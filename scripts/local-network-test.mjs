@@ -20,6 +20,7 @@ const ports = {
   mailpit: { "8025/tcp": "18025" },
 };
 const listeners = {
+  edge: 9443,
   core: 4100,
   portal: 4200,
   "portal-postgres": 5432,

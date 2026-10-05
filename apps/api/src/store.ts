@@ -28,6 +28,7 @@ export type Participant = {
     handRaised: boolean;
     leaseExpiresAt: number;
     callExpiresAt: number;
+    cleanupTokenHash?: string;
   };
   id: string;
   name: string;
@@ -57,6 +58,14 @@ export type Recording = {
   error?: string;
 };
 export type Meeting = {
+  hosted?: {
+    accountId: string;
+    version: number;
+    operationId?: string;
+    requestHash?: string;
+    revoked?: boolean;
+    cleanupConfirmed?: boolean;
+  };
   phoneAccess?: {
     enabled: boolean;
     locator: string;
@@ -105,6 +114,14 @@ export interface RecordingLock {
   audit(actor: string, action: string, target?: string): Promise<void>;
 }
 export interface Store {
+  createHosted(m: Meeting): Promise<Meeting>;
+  setHostedAuthority(
+    input: HostedAuthority & { legacyCodes?: string[] },
+  ): Promise<{
+    authority: HostedAuthority;
+    meetings: Meeting[];
+  }>;
+  hasPhoneReservations(code: string): Promise<boolean>;
   withRecordingLock<T>(
     code: string,
     id: string,
@@ -165,6 +182,81 @@ export interface Store {
     target?: string,
   ): Promise<void>;
   close(): Promise<void>;
+}
+
+export type HostedAuthority = {
+  accountId: string;
+  version: number;
+  enabled: boolean;
+};
+
+function reusableHostedMeeting(existing: Meeting, incoming: Meeting) {
+  if (
+    existing.hosted?.requestHash !== incoming.hosted?.requestHash ||
+    existing.hosted?.version !== incoming.hosted?.version
+  )
+    throw new HttpError(
+      409,
+      "Meeting operation already has different settings",
+    );
+  if (
+    existing.ended ||
+    !existing.hostTokenHash ||
+    existing.hostTokenExpiresAt <= Date.now()
+  )
+    throw new HttpError(
+      409,
+      "Meeting invitation is no longer available",
+      "MEETING_OPERATION_UNAVAILABLE",
+    );
+  return existing;
+}
+
+function nextHostedAuthority(
+  current: HostedAuthority | undefined,
+  input: HostedAuthority,
+) {
+  if (current?.version === input.version && current.enabled !== input.enabled)
+    throw new HttpError(409, "Hosting authority version conflicts");
+  return !current || input.version > current.version
+    ? {
+        accountId: input.accountId,
+        version: input.version,
+        enabled: input.enabled,
+      }
+    : current;
+}
+
+function revokeHostedMeeting(m: Meeting) {
+  if (m.hosted!.revoked) return false;
+  m.hosted!.revoked = true;
+  m.ended = true;
+  m.locked = true;
+  m.recordingAllowed = false;
+  if (m.phoneAccess) m.phoneAccess.enabled = false;
+  delete m.hostTokenHash;
+  delete m.emailOtpHash;
+  for (const p of m.participants) {
+    // The gateway still needs a teardown credential; this never authenticates a cookie.
+    if (p.phone) {
+      p.phone.cleanupTokenHash = p.tokenHash;
+      p.phone.leaseExpiresAt = 0;
+    }
+    p.tokenHash = "";
+    p.status = "left";
+    p.previousRoom ??= participantRoom(m, p);
+    p.mediaVersion++;
+    p.enforcementPending = true;
+  }
+  for (const r of m.recordings) {
+    if (["starting", "recording", "stopping"].includes(r.status))
+      r.status = "stopping";
+    delete r.tokenHash;
+    delete r.passwordHash;
+    delete r.expiresAt;
+  }
+  m.revision++;
+  return true;
 }
 
 const phoneCapacitySql = `SELECT count(*) AS count FROM (
@@ -242,6 +334,132 @@ export class PgStore implements Store {
       CREATE UNIQUE INDEX IF NOT EXISTS phone_dialogs_caller ON phone_dialogs ((data->>'pbxId'), (data->>'pbxEpoch'), (data->>'callerChannelId'));
       CREATE TABLE IF NOT EXISTS phone_attempts(key text PRIMARY KEY, bucket bigint NOT NULL, attempts integer NOT NULL);
       CREATE INDEX IF NOT EXISTS phone_attempts_bucket ON phone_attempts(bucket);`);
+    await this.pool.query(`
+      CREATE TABLE IF NOT EXISTS hosted_authorities(account_id uuid PRIMARY KEY, version bigint NOT NULL CHECK(version > 0), enabled boolean NOT NULL);
+      CREATE UNIQUE INDEX IF NOT EXISTS meetings_hosted_operation ON meetings ((data->'hosted'->>'accountId'), (data->'hosted'->>'operationId')) WHERE data->'hosted'->>'operationId' IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS meetings_hosted_account ON meetings ((data->'hosted'->>'accountId'));
+    `);
+  }
+  private async hostedTransaction<T>(
+    accountId: string,
+    fn: (c: pg.PoolClient) => Promise<T>,
+  ): Promise<T> {
+    const c = await this.pool.connect();
+    try {
+      await c.query("BEGIN");
+      await c.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [
+        `hosted:${accountId}`,
+      ]);
+      const result = await fn(c);
+      await c.query("COMMIT");
+      return result;
+    } catch (error) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      c.release();
+    }
+  }
+  async createHosted(m: Meeting) {
+    m = structuredClone(m);
+    m.hosted!.accountId = m.hosted!.accountId.toLowerCase();
+    m.hosted!.operationId = m.hosted!.operationId?.toLowerCase();
+    const binding = m.hosted!;
+    return this.hostedTransaction(binding.accountId, async (c) => {
+      await c.query(
+        "INSERT INTO hosted_authorities(account_id,version,enabled) VALUES($1,$2,true) ON CONFLICT DO NOTHING",
+        [binding.accountId, binding.version],
+      );
+      const authority = (
+        await c.query(
+          "SELECT version,enabled FROM hosted_authorities WHERE account_id=$1",
+          [binding.accountId],
+        )
+      ).rows[0];
+      if (!authority.enabled || Number(authority.version) !== binding.version)
+        throw new HttpError(409, "Hosting authority is not current");
+      const existing = (
+        await c.query(
+          "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1 AND data->'hosted'->>'operationId'=$2 FOR UPDATE",
+          [binding.accountId, binding.operationId],
+        )
+      ).rows[0]?.data as Meeting | undefined;
+      if (existing) return reusableHostedMeeting(existing, m);
+      await c.query("INSERT INTO meetings(code,room,data) VALUES($1,$2,$3)", [
+        m.code,
+        m.room,
+        JSON.stringify(m),
+      ]);
+      await c.query(
+        "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,'meeting.create',$3)",
+        [m.code, `hosted:${binding.accountId}`, `version:${binding.version}`],
+      );
+      return m;
+    });
+  }
+  async setHostedAuthority(
+    input: HostedAuthority & { legacyCodes?: string[] },
+  ) {
+    input = { ...input, accountId: input.accountId.toLowerCase() };
+    return this.hostedTransaction(input.accountId, async (c) => {
+      const row = (
+        await c.query(
+          "SELECT version,enabled FROM hosted_authorities WHERE account_id=$1",
+          [input.accountId],
+        )
+      ).rows[0];
+      const current = row
+        ? {
+            accountId: input.accountId,
+            version: Number(row.version),
+            enabled: row.enabled as boolean,
+          }
+        : undefined;
+      const authority = nextHostedAuthority(current, input);
+      const rows = (
+        await c.query(
+          "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1 OR code=ANY($2::text[]) ORDER BY code FOR UPDATE",
+          [input.accountId, input.legacyCodes ?? []],
+        )
+      ).rows.map((r) => r.data as Meeting);
+      if (rows.some((m) => m.hosted && m.hosted.accountId !== input.accountId))
+        throw new HttpError(409, "Legacy meeting belongs to another account");
+      await c.query(
+        "INSERT INTO hosted_authorities(account_id,version,enabled) VALUES($1,$2,$3) ON CONFLICT(account_id) DO UPDATE SET version=$2,enabled=$3",
+        [authority.accountId, authority.version, authority.enabled],
+      );
+      const meetings: Meeting[] = [];
+      for (const m of rows) {
+        m.hosted ??= { accountId: input.accountId, version: 0 };
+        if (
+          (m.hosted.version < authority.version || !authority.enabled) &&
+          revokeHostedMeeting(m)
+        ) {
+          await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+            m.code,
+            JSON.stringify(m),
+          ]);
+          await c.query(
+            "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,'hosted.revoke',$3)",
+            [
+              m.code,
+              `hosted:${input.accountId}`,
+              `version:${authority.version}`,
+            ],
+          );
+        }
+        if (m.hosted.revoked && !m.hosted.cleanupConfirmed) meetings.push(m);
+      }
+      return { authority, meetings };
+    });
+  }
+  async hasPhoneReservations(code: string) {
+    return !!(
+      await this.pool.query(
+        "SELECT 1 FROM phone_calls WHERE meeting_code=$1 AND released=false UNION ALL SELECT 1 FROM phone_dialogs WHERE data->'binding'->>'code'=$1 AND data->>'state'<>'closed' LIMIT 1",
+        [code],
+      )
+    ).rowCount;
   }
   async getSettings() {
     return (
@@ -803,6 +1021,92 @@ export class PgStore implements Store {
 }
 // Test adapter only; production always uses PostgreSQL transactions.
 export class MemoryStore implements Store {
+  hostedAuthorities = new Map<string, HostedAuthority>();
+  async createHosted(m: Meeting) {
+    m = structuredClone(m);
+    m.hosted!.accountId = m.hosted!.accountId.toLowerCase();
+    m.hosted!.operationId = m.hosted!.operationId?.toLowerCase();
+    return this.serialize(async () => {
+      const binding = m.hosted!;
+      const authority = this.hostedAuthorities.get(binding.accountId);
+      if (
+        authority &&
+        (!authority.enabled || authority.version !== binding.version)
+      )
+        throw new HttpError(409, "Hosting authority is not current");
+      const existing = [...this.data.values()].find(
+        (row) =>
+          row.hosted?.accountId === binding.accountId &&
+          row.hosted.operationId === binding.operationId,
+      );
+      if (existing) return structuredClone(reusableHostedMeeting(existing, m));
+      await this.create(m);
+      this.hostedAuthorities.set(
+        binding.accountId,
+        authority ?? {
+          accountId: binding.accountId,
+          version: binding.version,
+          enabled: true,
+        },
+      );
+      await this.audit(
+        m.code,
+        `hosted:${binding.accountId}`,
+        "meeting.create",
+        `version:${binding.version}`,
+      );
+      return structuredClone(m);
+    });
+  }
+  async setHostedAuthority(
+    input: HostedAuthority & { legacyCodes?: string[] },
+  ) {
+    input = { ...input, accountId: input.accountId.toLowerCase() };
+    return this.serialize(async () => {
+      const authority = nextHostedAuthority(
+        this.hostedAuthorities.get(input.accountId),
+        input,
+      );
+      const rows = structuredClone(
+        [...this.data.values()].filter(
+          (m) =>
+            m.hosted?.accountId === input.accountId ||
+            input.legacyCodes?.includes(m.code),
+        ),
+      );
+      if (rows.some((m) => m.hosted && m.hosted.accountId !== input.accountId))
+        throw new HttpError(409, "Legacy meeting belongs to another account");
+      const meetings: Meeting[] = [];
+      for (const m of rows) {
+        m.hosted ??= { accountId: input.accountId, version: 0 };
+        if (
+          (m.hosted.version < authority.version || !authority.enabled) &&
+          revokeHostedMeeting(m)
+        ) {
+          this.data.set(m.code, m);
+          await this.audit(
+            m.code,
+            `hosted:${input.accountId}`,
+            "hosted.revoke",
+            `version:${authority.version}`,
+          );
+        }
+        if (m.hosted.revoked && !m.hosted.cleanupConfirmed) meetings.push(m);
+      }
+      this.hostedAuthorities.set(input.accountId, structuredClone(authority));
+      return { authority: structuredClone(authority), meetings };
+    });
+  }
+  async hasPhoneReservations(code: string) {
+    return (
+      [...this.phoneCalls.values()].some(
+        (call) => call.code === code && !call.released,
+      ) ||
+      [...this.phoneDialogs.values()].some(
+        (dialog) => dialog.binding?.code === code && dialog.state !== "closed",
+      )
+    );
+  }
   phoneSupervisors = new Map<string, PhoneSupervisor>();
   phoneDialogs = new Map<string, PhoneDialog>();
   phoneCalls = new Map<
@@ -1163,6 +1467,14 @@ export class MemoryStore implements Store {
       release();
     }
   }
-  async audit() {}
+  auditEvents: {
+    code: string;
+    actor: string;
+    action: string;
+    target?: string;
+  }[] = [];
+  async audit(code: string, actor: string, action: string, target?: string) {
+    this.auditEvents.push({ code, actor, action, target });
+  }
   async close() {}
 }

@@ -28,21 +28,32 @@ test("local network validation rejects published backends, broad binds and extra
     Driver: "bridge",
     Containers: Object.fromEntries(rows.map(({ id }) => [id, {}])),
   };
-  assert.equal(inspectBoundary(rows, network).length, 5);
+  assert.equal(inspectBoundary(rows, network).length, 6);
+  assert.ok(
+    inspectBoundary(rows, network).some(
+      (target) => target.service === "edge" && target.port === 9443,
+    ),
+  );
   const hosted = structuredClone(rows);
-  for (const [service, id] of [["portal", "6"], ["portal-postgres", "7"]])
+  for (const [service, id] of [
+    ["portal", "6"],
+    ["portal-postgres", "7"],
+  ])
     hosted.push({ ...structuredClone(rows[1]), service, id });
-  assert.equal(inspectBoundary(hosted, network).length, 7);
+  assert.equal(inspectBoundary(hosted, network).length, 8);
   assert.throws(() => inspectBoundary(hosted.slice(0, -1), network));
   hosted[7].ports["5432/tcp"] = [{ HostIp: "127.0.0.1", HostPort: "5432" }];
   assert.throws(() => inspectBoundary(hosted, network));
   const withTurn = structuredClone(rows);
   withTurn[2].ports["13478/udp"] = [{ HostIp: "127.0.0.1", HostPort: "13478" }];
   withTurn[2].ports["15349/tcp"] = [{ HostIp: "127.0.0.1", HostPort: "15349" }];
-  assert.equal(inspectBoundary(withTurn, network).length, 5);
+  assert.equal(inspectBoundary(withTurn, network).length, 6);
   withTurn[2].ports["13478/udp"][0].HostIp = "0.0.0.0";
   assert.throws(() => inspectBoundary(withTurn, network));
   for (const mutate of [
+    (copy) => {
+      copy[0].ports["9443/tcp"] = [{ HostIp: "127.0.0.1", HostPort: "9443" }];
+    },
     (copy) => {
       copy[1].ports["4100/tcp"] = [{ HostIp: "127.0.0.1", HostPort: "4100" }];
     },

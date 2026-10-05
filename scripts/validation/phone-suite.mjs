@@ -7,6 +7,7 @@ for (const args of [
     "--test-concurrency=1",
     "apps/api/test/phone-postgres.integration.test.ts",
     "apps/api/test/recording-postgres.integration.test.ts",
+    "apps/api/test/hosted-postgres.integration.test.ts",
   ],
   ["scripts/validation/phone-media.mjs"],
 ]) {

@@ -35,3 +35,15 @@ https://portal.localhost:8443 {
     header_up -Forwarded
   }
 }
+
+# Container network only: 9443 is deliberately absent from published ports.
+https://meet.localhost:9443 {
+  tls internal {
+    protocols tls1.3
+  }
+  respond /api/internal/phone/* 404
+  reverse_proxy core:4100 {
+    header_up X-Forwarded-For {remote_host}
+    header_up -Forwarded
+  }
+}
