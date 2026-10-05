@@ -1,57 +1,67 @@
 # Covemeet
 
-Browser meeting software with guest access, host moderation, and an independently deployable core. The intended public source is this repository, under Apache-2.0. The paid service lives in the separate private `CovemeetHosted` repository and consumes a pinned core revision.
+Covemeet is self-hosted video meeting software. Guests join in their browser with a link or a meeting code and password. No app to install, no guest account to create.
 
-This is milestone one. It is for local evaluation and controlled development. The 100-participant meeting and 1,000-viewer webinar numbers are design targets, not demonstrated capacity. Phone/SIP, end-to-end encrypted rooms, billing, and audited operational controls are not part of this release.
+Built with React, TypeScript, LiveKit, Fastify, PostgreSQL and Redis.
 
-## Local HTTPS installation
+## Features
 
-Run `node scripts/local.mjs start` for separate `https://portal.localhost:8443` and `https://meet.localhost:8443` origins, private raw signaling, and isolated local data. The [HTTPS workflow](docs/local-https.md) explains explicit browser certificate trust, optional hosted portal and recording, health checks, and stopping without deleting data. No command silently installs certificate trust.
+- **Meetings and webinars** with screen sharing, chat, and presenter/viewer roles.
+- **Host controls** for admitting guests, locking meetings, muting microphones, disabling cameras, kicking participants and banning them from a meeting.
+- **Breakout rooms** with separate chat, host announcements and return-to-main controls.
+- **Custom branding** with your own name, logo, background and landing page.
+- **Encrypted recordings** with password-protected, revocable 24-hour download links. Self-hosted installations can use their own recording keys.
+- **Flexible setup** with custom meeting codes and separate domains for the control panel and meetings.
 
-## Development setup
+## Quick start
 
-Requirements: Node.js 22.12 or later, npm, and Docker Compose. Node 24 is used in the container build.
+You'll need Node.js 22.12+, npm and Docker Compose.
 
 ```sh
 npm ci
-node scripts/bootstrap.mjs
-docker compose --profile mail up -d
+npm run setup
+docker compose --profile mail up -d --wait
 npm run dev
 ```
 
-Open `http://localhost:5173`. The API runs on port 4100. Mailpit captures test messages at `http://localhost:8025`; it does not deliver email externally. PostgreSQL uses local port 55432.
+Open [localhost:5173](http://localhost:5173), create a meeting and share the guest link and password. Join from another browser profile to try the lobby and host controls.
 
-The setup script creates fresh local secrets, restricts file permissions, and renders the private LiveKit configuration. Re-running it preserves `.env`. Never commit `.env`, `runtime/`, recordings, or host capability links.
+The setup script generates `.env` and the local service configuration. Test emails appear in [Mailpit](http://localhost:8025). To edit branding, open the control panel and use the `CREATION_KEY` from `.env`.
 
-Create a meeting, keep the host page open, and use a separate browser profile to join with the guest link and meeting password. The host admits waiting participants. Test microphone/video with synthetic media before adding real users. Local services bind to loopback and are not a remote deployment.
+For a Docker setup with HTTPS and separate portal and meeting domains, follow the [local HTTPS guide](docs/local-https.md).
 
-## Features in the first milestone
-
-- Guest links and meeting code plus password entry; one-time host capability exchange.
-- Lobby, meeting lock, admit, kick, meeting ban, microphone/video restrictions, and viewer/presenter roles.
-- Breakout rooms with room-scoped chat, return-to-main controls, and host announcements.
-- Hosted random meeting codes; custom codes only in the self-hosted edition.
-- LiveKit media behind the application signaling gateway; raw media-server access is private outside development.
-- Optional encrypted recordings, operator keyring/KMS adapters, private ciphertext object-storage adapter, verified host email, revocable 24-hour download links, and separate email passwords. Real provider configuration remains a deployment gate.
-- Operator-controlled branding, uploaded logo/background images, and configurable landing-page settings.
-
-Recordings are disabled by default. Start the optional Egress profile and complete the recording checks in [deployment.md](docs/deployment.md) before enabling them. An IP/device ban cannot identify the same person after they change networks or clear browser data. Downloaded MP4 files are plaintext on the receiving device.
-
-## Verification
+## Development
 
 ```sh
 npm run check
 npm test
 npm run build
-docker compose config --quiet
 ```
 
-Unit and API tests do not establish WebRTC interoperability, resilience, or capacity. The silent real-media harness in `scripts/validation` tests selected deployed controls. The evidence and remaining gates are tracked in [security-controls.md](docs/security-controls.md) and the [requirements ledger](docs/requirements-ledger.md).
+| Directory | Contents |
+| --- | --- |
+| `apps/web` | Meeting UI and self-hosted control panel |
+| `apps/api` | Meetings, permissions, recordings and signaling |
+| `apps/phone` | Experimental SIP gateway and audio relay |
+| `packages/recording` | Recording encryption and storage |
+| `infra` | Docker, proxy and media-server configuration |
+| `scripts/validation` | Media and integration tests |
 
-The experimental phone admission and audio-relay implementation is disabled by default. `node scripts/phone-test.mjs` builds a separate disposable PostgreSQL/SFU fixture, tests concurrent admission through independent API instances, and checks generated audio through programmatic sinks without speakers or personal devices. It does not connect to a carrier or prove SIP trunk negotiation. Read [phone-sip-design.md](docs/phone-sip-design.md) before configuring it; native SIP must never dispatch directly into meeting rooms.
+## Documentation
 
-## Deployment and scope
+- [Self-hosting and configuration](docs/deployment.md)
+- [Local HTTPS setup](docs/local-https.md)
+- [Recording storage and encryption keys](docs/recording-storage.md)
+- [Phone and SIP development](docs/phone-sip-design.md)
+- [Security](docs/security-controls.md)
+- [Roadmap and project status](docs/requirements-ledger.md)
 
-Use [deployment.md](docs/deployment.md) for configuration and [infrastructure-plan.md](docs/infrastructure-plan.md) for the complete design. The production Compose file is a staging template; it needs TLS, TURN, backup/restore, network isolation, abuse controls, and the documented security gates before public operation.
+## Contributing
 
-This repository makes no claim of SOC 2 attestation, ISO/IEC certification, FedRAMP authorization, HIPAA compliance, or GDPR compliance. The intended target is demonstrable control alignment, supported by implementation and operating evidence. The framework names do not certify this code.
+Bug reports and pull requests are welcome. Include steps to reproduce bugs, and run the checks above before submitting code changes.
+
+Covemeet Hosted is maintained separately and uses this core. Changes to meetings, media and self-hosting belong here.
+
+## License
+
+[Apache 2.0](LICENSE).
