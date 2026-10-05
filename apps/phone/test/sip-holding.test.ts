@@ -666,6 +666,62 @@ test("holding closure waits for its RTC owner and preserves an unrelated peer", 
   );
 });
 
+test("native removal rejection can finish only after observing an empty room", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  const remove = f.service.removeParticipant;
+  f.service.removeParticipant = async (name, identity) => {
+    await remove(name, identity);
+    throw new Error("Native peer left during removal");
+  };
+  await f.holding.close();
+  assert(
+    f.log.lastIndexOf(`peers:${f.room.name}`) >
+      f.log.indexOf(`remove:${f.room.name}:${f.native.identity}`),
+  );
+});
+
+test("native removal rejection cannot finish while the peer remains", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  f.service.removeParticipant = async () => {
+    throw new Error("Native removal unavailable");
+  };
+  await assert.rejects(f.holding.close(), /SIP holding participant remains/);
+});
+
+test("native removal rejection cannot hide a failed absence check", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  const remove = f.service.removeParticipant;
+  const readError = new Error("Participant verification unavailable");
+  f.service.removeParticipant = async (name, identity) => {
+    await remove(name, identity);
+    f.service.listParticipants = async () => {
+      throw readError;
+    };
+    throw new Error("Native peer left during removal");
+  };
+  await assert.rejects(f.holding.close(), (error) => error === readError);
+});
+
+test("an empty room after rejected removal cannot hide failed RTC cleanup", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  const remove = f.service.removeParticipant;
+  f.service.removeParticipant = async (name, identity) => {
+    await remove(name, identity);
+    throw new Error("Native peer left during removal");
+  };
+  f.rtc.close = async () => {
+    throw new Error("RTC cleanup unavailable");
+  };
+  await assert.rejects(
+    f.holding.close(),
+    /SIP cleanup requires reconciliation/,
+  );
+});
+
 test("unknown RTC setup is journaled and cannot acknowledge cleanup", async () => {
   const f = fixture();
   f.factory.open = async () => {

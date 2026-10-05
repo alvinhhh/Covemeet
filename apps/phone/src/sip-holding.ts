@@ -338,11 +338,13 @@ export class SipHolding implements SupervisedMedia {
             peer.attributes["sip.ruleID"] !== this.config.sipRuleId
           )
             continue;
-          await this.rooms
-            .removeParticipant(room.name, peer.identity)
-            .catch((error) => {
-              if (!absent(error)) throw error;
-            });
+          try {
+            await this.rooms.removeParticipant(room.name, peer.identity);
+          } catch {
+            // SIP departure may race this removal. Allocation has stopped, so
+            // the required empty-room read below can confirm absence instead.
+            // Uncertain allocation or failed RTC/PBX cleanup still rejects.
+          }
         }
         const remaining = await this.rooms
           .listParticipants(room.name)
