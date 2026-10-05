@@ -24,6 +24,7 @@ services:
       CORE_CREATION_KEY: ${CREATION_KEY:?Run local setup}
       HOSTED_ADMIN_KEY: ${HOSTED_ADMIN_KEY:?Run local setup}
       SESSION_SECRET: ${HOSTED_SESSION_SECRET:?Run local setup}
+      TRUST_PROXY: ${CADDY_TRUSTED_IP:-}
     volumes:
       - ../runtime/local-tls/trust:/local-trust:ro
     read_only: true
