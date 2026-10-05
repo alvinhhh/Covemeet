@@ -27,7 +27,7 @@ The core runs independently. To use the private hosted portal, place that reposi
 node scripts/local.mjs start --hosted
 ```
 
-The hosted overlay has a separate PostgreSQL database for accounts and sessions, with its own generated password and no published database port. Verification and password-reset mail goes to the local Mailpit inbox. The hosted repository documents account setup and hosting approval; the shared operator key is for administration, not customer sign-in.
+The hosted overlay has a separate PostgreSQL database for accounts and sessions, with its own generated password and no published database port. Verification and password-reset mail goes to the local Mailpit inbox. The hosted repository documents account setup and automatic hosting access after email verification and confirmed payment or an active assigned Teams seat; the shared operator key is for administration, not customer sign-in.
 
 Recording is off initially. Opt in explicitly to build and start the isolated recorder:
 
