@@ -228,12 +228,10 @@ async function relay(gatewayUrl, cookies, token) {
       wss.handleUpgrade(req, socket, head, (client) => {
         sockets.add(client);
         client.on("message", (data, binary) => {
-          observeSignal(data, binary, "client");
           if (upstream.readyState === WebSocket.OPEN)
             upstream.send(data, { binary });
         });
         upstream.on("message", (data, binary) => {
-          observeSignal(data, binary, "sfu");
           if (client.readyState === WebSocket.OPEN)
             client.send(data, { binary });
         });
