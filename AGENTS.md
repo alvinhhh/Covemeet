@@ -7,3 +7,5 @@ Use functional labels and concise UI copy. Keep hosted meeting codes random (130
 Run npm run check, npm test, and npm run build before committing substantive changes. Use separate meaningful commits and push to the existing private alvinhhh/Covemeet repository. Do not change its visibility without user instruction.
 
 Browser tests use the Yuxuan Google session. Never play generated test tones on the user's speakers. Use silent video or an isolated non-playing test sink.
+
+Use black and white for meeting interfaces, and black and neutral greys for other pages. Do not introduce green or other color accents; communicate status with text and icons.

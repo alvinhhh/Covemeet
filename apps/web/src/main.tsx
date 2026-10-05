@@ -174,7 +174,7 @@ function App() {
     if (!config?.branding) return;
     const b = config.branding;
     const style = document.documentElement.style;
-    style.setProperty("--teal", b.accentColor);
+    style.setProperty("--accent", b.accentColor);
     style.setProperty("--page-background", b.backgroundColor);
     style.setProperty(
       "--radius",

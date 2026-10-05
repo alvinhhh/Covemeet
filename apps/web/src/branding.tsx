@@ -7,8 +7,8 @@ const defaultBranding: Branding = {
   brandName: "Covemeet",
   headline: "Start or join a meeting",
   description: "",
-  accentColor: "#166e60",
-  backgroundColor: "#f5f6f2",
+  accentColor: "#171717",
+  backgroundColor: "#f5f5f5",
   font: "sans",
   borderRadius: "rounded",
   logoUrl: "",
@@ -386,7 +386,11 @@ export function BrandingEditor({
           >
             <div className="preview-brand">
               {brandLogo(draft.brandName, draft.logoUrl) ? (
-                <img src={brandLogo(draft.brandName, draft.logoUrl)} alt="" />
+                <img
+                  className={!draft.logoUrl ? "covemeet-mark" : undefined}
+                  src={brandLogo(draft.brandName, draft.logoUrl)}
+                  alt=""
+                />
               ) : (
                 <span style={{ color: draft.accentColor }}>
                   <Icon name="video" size={24} />
