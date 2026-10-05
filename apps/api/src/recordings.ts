@@ -37,6 +37,12 @@ export type RecorderClient = Pick<
   "startRoomCompositeEgress" | "stopEgress" | "listEgress"
 >;
 const retentionMs = 7 * 86400000;
+const terminalStatuses = [
+  EgressStatus.EGRESS_COMPLETE,
+  EgressStatus.EGRESS_FAILED,
+  EgressStatus.EGRESS_ABORTED,
+  EgressStatus.EGRESS_LIMIT_REACHED,
+];
 
 export class RecordingService {
   readonly available: boolean;
@@ -321,6 +327,44 @@ export class RecordingService {
       (output) => output.filename === expected || output.location === expected,
     );
   }
+  private async observeTime(
+    m: Meeting,
+    r: Recording,
+    info: EgressInfo,
+    lock: RecordingLock,
+  ) {
+    if (!m.hosted?.billingOwnerId) return { recording: r, mustStop: false };
+    // Egress timestamps are Unix nanoseconds. Convert before Number to avoid
+    // losing precision; the allowance covers recorder startup and shutdown.
+    const millis = (value: bigint, roundUp = false) => {
+      if (value === 0n) return undefined;
+      if (typeof value !== "bigint" || value < 0n)
+        throw new Error("Recorder time is invalid");
+      const result = Number((value + (roundUp ? 999_999n : 0n)) / 1_000_000n);
+      if (!Number.isSafeInteger(result) || result <= 0)
+        throw new Error("Recorder time is invalid");
+      return result;
+    };
+    const startedAt = millis(info.startedAt);
+    if (terminalStatuses.includes(info.status)) {
+      const endedAt = millis(info.endedAt, true);
+      if (startedAt === undefined || endedAt === undefined)
+        throw new Error(
+          "Recorder timing is unavailable; allowance remains reserved",
+        );
+      return lock.observeRecordingTime({
+        egressId: info.egressId,
+        terminal: true,
+        startedAt,
+        endedAt,
+      });
+    }
+    return lock.observeRecordingTime({
+      egressId: info.egressId,
+      terminal: false,
+      ...(startedAt !== undefined ? { startedAt } : {}),
+    });
+  }
   private async recoverUntracked(
     m: Meeting,
     r: Recording,
@@ -366,7 +410,7 @@ export class RecordingService {
       createdAt: Date.now(),
     };
     await this.store.withRecordingLock(meeting.code, r.id, async (lock) => {
-      await lock.change((m) => {
+      await lock.reserveRecording(r, (m) => {
         if (m.participants.some(activePhone))
           throw new HttpError(
             409,
@@ -384,7 +428,6 @@ export class RecordingService {
           )
         )
           throw new HttpError(409, "A recording is already active");
-        m.recordings.push(r);
       });
       let startedId: string | undefined;
       try {
@@ -397,15 +440,25 @@ export class RecordingService {
           }),
           { layout: "grid" },
         );
+        if (!info.egressId || !this.belongsToRecording(info, meeting, r))
+          throw new Error(
+            "Recorder response does not match the requested output",
+          );
         startedId = info.egressId;
-        if (!startedId) throw new Error("Recorder response omitted its job ID");
+        const timing = await this.observeTime(
+          (await lock.get())!,
+          r,
+          info,
+          lock,
+        );
         const mustStop = await lock.change((m) => {
           const row = m.recordings.find((x) => x.id === r.id)!;
           row.egressId = info.egressId;
           const stop =
             !meetingAllowed(m) ||
             !m.recordingAllowed ||
-            row.status === "stopping";
+            row.status === "stopping" ||
+            timing.mustStop;
           row.status = stop
             ? "stopping"
             : info.status === EgressStatus.EGRESS_ACTIVE
@@ -460,17 +513,91 @@ export class RecordingService {
     ))
       await this.stop(m, r.id);
   }
-  async reconcile(snapshot: Meeting) {
+  private async finishFiles(m: Meeting, r: Recording, lock: RecordingLock) {
+    if (r.rawCleanupPending) {
+      await lock.check();
+      await this.removeFile(this.file(r, true));
+      await lock.change((state) => {
+        delete state.recordings.find((row) => row.id === r.id)!
+          .rawCleanupPending;
+      });
+      return;
+    }
+    if (
+      r.status === "deleting" ||
+      (r.status === "ready" && r.createdAt <= Date.now() - retentionMs)
+    ) {
+      await lock.change((state) => {
+        const row = state.recordings.find((entry) => entry.id === r.id)!;
+        row.status = "deleting";
+        delete row.tokenHash;
+        delete row.passwordHash;
+        delete row.expiresAt;
+      });
+      await lock.audit("recorder", "recording.revoke", r.id);
+      await lock.check();
+      if (r.metadata?.storage) {
+        if (!this.objectStorage)
+          throw new Error("Recording object storage is required for deletion");
+        await this.objectStorage.delete(
+          r.metadata.storage,
+          r.metadata,
+          this.context(m, r),
+        );
+      }
+      await lock.check();
+      await this.removeFile(this.file(r));
+      await lock.check();
+      await this.removeFile(this.file(r, true));
+      await lock.change((state) => {
+        const row = state.recordings.find((entry) => entry.id === r.id)!;
+        row.status = "deleted";
+        delete row.metadata;
+      });
+      return;
+    }
+    if (r.status !== "encrypting") return;
+    if (!this.provider) throw new Error("Recording keys are not configured");
+    await this.directories();
+    if (!r.metadata) {
+      const raw = await lstat(this.file(r, true));
+      if (!raw.isFile() || raw.size > this.config.recordingMaxBytes)
+        throw new Error("Recording spool is not a bounded regular file");
+      await lock.check();
+      // A disconnected old worker can finish only its own immutable attempt.
+      // Never overwrite ciphertext whose database commit may have succeeded.
+      const attempt = { ...r, ciphertextId: randomUUID() };
+      const metadata = await encryptRecording(
+        this.file(r, true),
+        this.file(attempt),
+        this.context(m, r),
+        this.provider,
+      );
+      await lock.change((state) => {
+        const row = state.recordings.find((entry) => entry.id === r.id)!;
+        if (row.status !== "encrypting" || row.metadata)
+          throw new Error("Recording encryption state changed");
+        row.metadata = metadata;
+        row.ciphertextId = attempt.ciphertextId;
+      });
+    }
+    await this.finishEncryption(m, r, lock);
+  }
+  async reconcile(
+    snapshot: Meeting,
+    phase: "capture" | "files" | "all" = "all",
+  ) {
     for (const candidate of snapshot.recordings) {
+      const capture = ["starting", "recording", "stopping"].includes(
+        candidate.status,
+      );
+      const files =
+        candidate.rawCleanupPending ||
+        ["ready", "deleting", "encrypting"].includes(candidate.status);
       if (
-        ![
-          "ready",
-          "deleting",
-          "recording",
-          "starting",
-          "stopping",
-          "encrypting",
-        ].includes(candidate.status)
+        (!capture && !files) ||
+        (phase === "capture" && !capture) ||
+        (phase === "files" && !files)
       )
         continue;
       try {
@@ -478,147 +605,134 @@ export class RecordingService {
           snapshot.code,
           candidate.id,
           async (lock) => {
-            // The timer snapshot may predate another process's completed encryption or deletion.
-            const m = await lock.get();
-            const r = m?.recordings.find((row) => row.id === candidate.id);
+            // The timer snapshot may predate another process's terminal transition.
+            let m = await lock.get();
+            let r = m?.recordings.find((row) => row.id === candidate.id);
             if (!m || !r) return;
-            if (
-              r.status === "deleting" ||
-              (r.status === "ready" && r.createdAt <= Date.now() - retentionMs)
-            ) {
-              await lock.change((state) => {
-                const row = state.recordings.find(
-                  (entry) => entry.id === r.id,
-                )!;
-                row.status = "deleting";
-                delete row.tokenHash;
-                delete row.passwordHash;
-                delete row.expiresAt;
-              });
-              await lock.audit("recorder", "recording.revoke", r.id);
-              await lock.check();
-              if (r.metadata?.storage) {
-                if (!this.objectStorage)
-                  throw new Error(
-                    "Recording object storage is required for deletion",
-                  );
-                await this.objectStorage.delete(
-                  r.metadata.storage,
-                  r.metadata,
-                  this.context(m, r),
-                );
+            if (["starting", "recording", "stopping"].includes(r.status)) {
+              if (phase === "files") return;
+              // Stop intent must survive a failed status lookup or a lost response.
+              let timing;
+              try {
+                timing = await lock.checkRecordingTime();
+              } catch (error) {
+                // Lost accounting access cannot authorize continued paid capture.
+                if (r.egressId)
+                  await this.client.stopEgress(r.egressId).catch(() => {});
+                throw error;
               }
-              await lock.check();
-              await this.removeFile(this.file(r));
-              await lock.check();
-              await this.removeFile(this.file(r, true));
-              await lock.change((state) => {
-                const row = state.recordings.find(
-                  (entry) => entry.id === r.id,
-                )!;
-                row.status = "deleted";
-                delete row.metadata;
-              });
-              return;
-            }
-            if (
-              r.status === "ready" ||
-              !["recording", "starting", "stopping", "encrypting"].includes(
-                r.status,
-              )
-            )
-              return;
-            if (r.status === "encrypting" && r.metadata) {
-              await this.directories();
-              await this.finishEncryption(m, r, lock);
-              return;
-            }
-            const recovered = !r.egressId;
-            const info = recovered
-              ? await this.recoverUntracked(m, r, lock)
-              : (await this.client.listEgress({ egressId: r.egressId }))[0];
-            if (!info) return;
-            if (info.status === EgressStatus.EGRESS_COMPLETE) {
-              if (!this.provider)
-                throw new Error("Recording keys are not configured");
-              await this.directories();
-              const raw = await lstat(this.file(r, true));
-              if (!raw.isFile() || raw.size > this.config.recordingMaxBytes)
-                throw new Error(
-                  "Recording spool is not a bounded regular file",
-                );
-              await lock.check();
-              // A disconnected old worker can finish only its own immutable attempt.
-              // Never remove or overwrite ciphertext whose database commit may have succeeded.
-              const attempt = { ...r, ciphertextId: randomUUID() };
-              const metadata = await encryptRecording(
-                this.file(r, true),
-                this.file(attempt),
-                this.context(m, r),
-                this.provider,
-              );
-              await lock.change((state) => {
-                const row = state.recordings.find(
-                  (entry) => entry.id === r.id,
-                )!;
-                if (row.metadata)
-                  throw new Error("Recording encryption state changed");
-                row.metadata = metadata;
-                row.ciphertextId = attempt.ciphertextId;
-                row.status = "encrypting";
-              });
-              await this.finishEncryption(m, attempt, lock);
-            } else if (
-              [
-                EgressStatus.EGRESS_FAILED,
-                EgressStatus.EGRESS_ABORTED,
-                EgressStatus.EGRESS_LIMIT_REACHED,
-              ].includes(info.status)
-            ) {
-              await lock.check();
-              await this.removeFile(this.file(r, true));
-              await lock.change((state) => {
-                const row = state.recordings.find(
-                  (entry) => entry.id === r.id,
-                )!;
-                row.status = "failed";
-                row.error = info.error?.includes("Start signal not received")
-                  ? "No published media was available to record"
-                  : "Recording did not complete";
-              });
-            } else {
-              const current = (await lock.get())!;
-              const row = current.recordings.find(
-                (entry) => entry.id === r.id,
-              )!;
+              r = timing.recording;
+              let stopAttempted = false;
               if (
-                row.status === "stopping" ||
-                recovered ||
+                timing.mustStop ||
+                r.status === "stopping" ||
                 !this.available ||
-                !current.recordingAllowed ||
-                !meetingAllowed(current)
+                !m.recordingAllowed ||
+                !meetingAllowed(m)
               ) {
-                await lock.check();
-                await this.client.stopEgress(info.egressId);
                 await lock.change((state) => {
                   const row = state.recordings.find(
-                    (entry) => entry.id === r.id,
+                    (entry) => entry.id === r!.id,
                   )!;
                   if (["starting", "recording"].includes(row.status))
                     row.status = "stopping";
                 });
-              } else if (
-                info.status === EgressStatus.EGRESS_ACTIVE &&
-                row.status === "starting"
-              ) {
+                if (r.egressId) {
+                  await lock.check();
+                  // Listing may still prove a terminal job when the stop RPC fails.
+                  stopAttempted = true;
+                  await this.client.stopEgress(r.egressId).catch(() => {});
+                }
+              }
+              const recovered = !r.egressId;
+              let info: EgressInfo | undefined;
+              try {
+                info = recovered
+                  ? await this.recoverUntracked(m, r, lock)
+                  : (
+                      await this.client.listEgress({ egressId: r.egressId })
+                    ).find((job) => job.egressId === r!.egressId);
+              } catch {
+                // A failed lookup does not prove the recorder stopped.
+              }
+              if (!info) {
+                await lock
+                  .change((state) => {
+                    state.recordings.find((row) => row.id === r!.id)!.status =
+                      "stopping";
+                  })
+                  .catch(() => {});
+                if (r.egressId && !stopAttempted)
+                  await this.client.stopEgress(r.egressId).catch(() => {});
+                return;
+              }
+              if (info.status === EgressStatus.EGRESS_ENDING)
+                await lock.change((state) => {
+                  state.recordings.find((row) => row.id === r!.id)!.status =
+                    "stopping";
+                });
+              let observation;
+              try {
+                observation = await this.observeTime(m, r, info, lock);
+              } catch (error) {
+                await lock
+                  .change((state) => {
+                    state.recordings.find((row) => row.id === r!.id)!.status =
+                      "stopping";
+                  })
+                  .catch(() => {});
+                if (!terminalStatuses.includes(info.status))
+                  await this.client.stopEgress(info.egressId).catch(() => {});
+                throw error;
+              }
+              if (terminalStatuses.includes(info.status)) {
                 await lock.change((state) => {
                   const row = state.recordings.find(
-                    (entry) => entry.id === r.id,
+                    (entry) => entry.id === r!.id,
                   )!;
-                  if (row.status === "starting") row.status = "recording";
+                  if (info.status === EgressStatus.EGRESS_COMPLETE)
+                    row.status = "encrypting";
+                  else {
+                    row.status = "failed";
+                    row.rawCleanupPending = true;
+                    row.error = info.error?.includes(
+                      "Start signal not received",
+                    )
+                      ? "No published media was available to record"
+                      : "Recording did not complete";
+                  }
                 });
+              } else {
+                const stop = await lock.change((state) => {
+                  const row = state.recordings.find(
+                    (entry) => entry.id === r!.id,
+                  )!;
+                  const stopping =
+                    observation.mustStop ||
+                    row.status === "stopping" ||
+                    recovered ||
+                    !this.available ||
+                    !state.recordingAllowed ||
+                    !meetingAllowed(state);
+                  if (stopping) row.status = "stopping";
+                  else if (
+                    info.status === EgressStatus.EGRESS_ACTIVE &&
+                    row.status === "starting"
+                  )
+                    row.status = "recording";
+                  return stopping;
+                });
+                // The preflight above already attempted a known stopped job once.
+                if (stop && !stopAttempted && !recovered) {
+                  await lock.check();
+                  await this.client.stopEgress(info.egressId);
+                }
               }
+              if (phase === "capture") return;
+              m = (await lock.get())!;
+              r = m.recordings.find((row) => row.id === candidate.id)!;
             }
+            if (phase !== "capture") await this.finishFiles(m, r, lock);
           },
         );
       } catch {

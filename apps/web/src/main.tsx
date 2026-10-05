@@ -2448,6 +2448,7 @@ function Recordings({
   const active = state.recordings.some((r) =>
     ["starting", "recording", "active", "stopping"].includes(r.status),
   );
+  const recordingUsage = state.meeting.usage?.recordingSeconds;
   const phonePresent = state.participants.some(
     (participant) =>
       participant.transport === "phone" &&
@@ -2562,6 +2563,17 @@ function Recordings({
             Download links expire after 24 hours. A separate password is emailed
             to the verified host.
           </p>
+          {recordingUsage && (
+            <p className="panel-note" role="status">
+              {(recordingUsage.available / 60).toLocaleString(undefined, {
+                maximumFractionDigits: 1,
+              })}{" "}
+              recording minutes available this month.
+              {recordingUsage.reserved > 0 &&
+                " Active or stopping jobs reserve time until they finish."}{" "}
+              Includes recorder startup and shutdown.
+            </p>
+          )}
           {phonePresent && (
             <Notice kind="info">
               Recording is unavailable while phone callers are connected. Phone

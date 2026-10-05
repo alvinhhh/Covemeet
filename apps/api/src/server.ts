@@ -680,7 +680,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     } catch {
       failed = true;
     }
-    await recordings.reconcile(m);
+    await recordings.reconcile(m, "capture");
     const current = await store.get(m.code);
     if (
       !current ||
@@ -1365,11 +1365,12 @@ export async function createApp(config: Config, store: Store, media: Media) {
         : reply.sendFile("index.html"),
     );
   }
-  let ticking = false;
-  const timer = setInterval(async () => {
-    if (ticking) return;
-    ticking = true;
-    try {
+  let controlPass: Promise<void> | undefined;
+  let filesPass: Promise<void> | undefined;
+  let closing = false;
+  const timer = setInterval(() => {
+    if (controlPass || closing) return;
+    controlPass = (async () => {
       for (let m of await store.all()) {
         if (m.hosted?.billingOwnerId) {
           await store.reconcileParticipantMeters(m.code).catch(() => {});
@@ -1416,17 +1417,31 @@ export async function createApp(config: Config, store: Store, media: Media) {
           });
         for (const p of m.participants.filter((p) => p.enforcementPending))
           await enforce(m, [p]).catch(() => {});
-        await recordings.reconcile(m);
+        await recordings.reconcile(m, "capture");
       }
-    } catch {
-    } finally {
-      ticking = false;
-    }
+    })()
+      .catch(() => {})
+      .finally(() => {
+        controlPass = undefined;
+        // File I/O has its own single-flight pass so it cannot hold up capture
+        // deadlines in other rooms. Both use the same per-recording ownership.
+        if (!closing && !filesPass)
+          filesPass = (async () => {
+            for (const m of await store.all())
+              await recordings.reconcile(m, "files");
+          })()
+            .catch(() => {})
+            .finally(() => {
+              filesPass = undefined;
+            });
+      });
   }, 5000);
   timer.unref();
   app.addHook("onClose", async () => {
+    closing = true;
     clearInterval(timer);
     media.close();
+    await Promise.all([controlPass, filesPass]);
     await store.close();
   });
   return app;

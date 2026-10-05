@@ -1427,7 +1427,8 @@ test("a lost encryption commit acknowledgement preserves its committed immutable
   let loseCommit = true;
   f.store.change = async (...args) => {
     const result = await change(...args);
-    if (loseCommit) {
+    const row = (await f.store.get(f.meeting.code))!.recordings[0]!;
+    if (loseCommit && row.metadata && row.ciphertextId) {
       loseCommit = false;
       throw new Error("Commit acknowledgement lost");
     }

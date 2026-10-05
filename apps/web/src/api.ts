@@ -83,6 +83,12 @@ export type MeetingState = {
         reserved: number;
         available: number;
       };
+      recordingSeconds?: {
+        limit: number;
+        used: number;
+        reserved: number;
+        available: number;
+      };
       blocked: boolean;
     };
     recordingAllowed: boolean;

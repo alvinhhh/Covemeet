@@ -1,4 +1,4 @@
-import type { Meeting, Participant } from "./store.js";
+import type { Meeting, Participant, Recording } from "./store.js";
 import { fenceParticipantMedia } from "./media-identity.js";
 import {
   endMeeting,
@@ -10,6 +10,18 @@ import { HttpError } from "./security.js";
 
 export const PARTICIPANT_PREPAY_MS = 30_000;
 export const PARTICIPANT_PRESENCE_MS = 15_000;
+export const RECORDING_PREPAY_MS = 30_000;
+export type RecordingTimeReservation = {
+  billingOwnerId: string;
+  reservedFrom: number;
+  fundedUntil: number;
+  egressId?: string;
+  startedAt?: number;
+  settled?: { startedAt: number; endedAt: number };
+};
+export type RecordingTimeObservation =
+  | { egressId: string; terminal: false; startedAt?: number }
+  | { egressId: string; terminal: true; startedAt: number; endedAt: number };
 export type ParticipantMeter = {
   connectionId: string;
   mediaVersion: number;
@@ -26,6 +38,7 @@ export type UsageLedger = {
     end: number;
     usedMs: number;
     recordingDownloadBytesUsed?: number;
+    recordingUsedMs?: number;
   }[];
 };
 export type MeterAction = "claim" | "connected" | "heartbeat";
@@ -175,6 +188,7 @@ export function usageView(
       used: downloadUsed,
       available: Math.max(0, downloadLimit - downloadUsed),
     },
+    recordingSeconds: recordingTimeView(ledger, grant, meetings, now),
     asOf: now,
     blocked: usageBlocked(grant, meetings, now) || used + reserved > limit,
   };
@@ -359,4 +373,302 @@ export function canSettleMeter(m: Meeting, p: Participant, now: number) {
       !!p.meter &&
       p.meter.mediaVersion < p.mediaVersion)
   );
+}
+
+const recordingActive = (r: Recording) =>
+  ["starting", "recording", "stopping"].includes(r.status);
+
+function recordingHeld(
+  ledger: UsageLedger,
+  meetings: Meeting[],
+  start: number,
+  now: number,
+) {
+  let ms = 0;
+  for (const m of meetings)
+    for (const r of m.recordings) {
+      const reservation = r.timeReservation;
+      if (!reservation || reservation.settled) continue;
+      // An overdue recorder may still be running. Its uncertain time stays held
+      // across window changes until exact terminal evidence settles it.
+      for (const part of intervals(
+        ledger.anchorAt,
+        reservation.startedAt ?? reservation.reservedFrom,
+        Math.max(reservation.fundedUntil, now),
+      ))
+        if (part.start === start) ms += part.ms;
+    }
+  return ms;
+}
+
+function recordingTimeView(
+  ledger: UsageLedger,
+  grant: HostedEntitlement | undefined,
+  meetings: Meeting[],
+  now: number,
+) {
+  const window = usageWindow(ledger.anchorAt, now);
+  const used =
+    ledger.windows.find((w) => w.start === window.start)?.recordingUsedMs ?? 0;
+  const reserved = recordingHeld(ledger, meetings, window.start, now);
+  const limit = (grant?.quota?.recordingSecondsPerMonth ?? 0) * 1000;
+  return {
+    limit: limit / 1000,
+    used: Math.ceil(used / 1000),
+    reserved: Math.ceil(reserved / 1000),
+    available: Math.floor(Math.max(0, limit - used - reserved) / 1000),
+  };
+}
+
+function recordingOverdrawn(
+  ledger: UsageLedger,
+  grant: HostedEntitlement | undefined,
+  meetings: Meeting[],
+  now: number,
+) {
+  const window = usageWindow(ledger.anchorAt, now);
+  return (
+    (ledger.windows.find((w) => w.start === window.start)?.recordingUsedMs ??
+      0) +
+      recordingHeld(ledger, meetings, window.start, now) >
+    (grant?.quota?.recordingSecondsPerMonth ?? 0) * 1000
+  );
+}
+
+function recordingPending(meetings: Meeting[], now: number) {
+  return meetings.some((m) =>
+    m.recordings.some((r) => {
+      const held = r.timeReservation;
+      return held
+        ? !held.settled && (r.status === "stopping" || held.fundedUntil <= now)
+        : recordingActive(r);
+    }),
+  );
+}
+
+function recordingEligible(
+  grant: HostedEntitlement | undefined,
+  m: Meeting,
+  now: number,
+) {
+  return (
+    !!grant?.enabled &&
+    grant.validUntil > now &&
+    !!grant.quota?.recordingSecondsPerMonth &&
+    !m.hosted?.revoked &&
+    grant.hostAccountIds.includes(m.hosted!.accountId) &&
+    meetingAllowed(m, now) &&
+    m.recordingAllowed
+  );
+}
+
+export function checkRecordingTime(
+  ledger: UsageLedger | undefined,
+  grant: HostedEntitlement | undefined,
+  meetings: Meeting[],
+  m: Meeting,
+  r: Recording,
+  now: number,
+) {
+  if (!recordingActive(r)) return false;
+  if (r.timeReservation?.settled) {
+    // Settlement may commit before the service persists its file-processing
+    // state. Keep retrying the exact job stop; never fund it again.
+    r.status = "stopping";
+    return true;
+  }
+  if (!m.hosted?.billingOwnerId) {
+    const stop =
+      r.status === "stopping" || !meetingAllowed(m, now) || !m.recordingAllowed;
+    if (stop) r.status = "stopping";
+    return stop;
+  }
+  // Upgrading an already-running bound recording cannot grant it free capture.
+  // Hold its uncertain interval and stop; terminal proof can settle it later.
+  if (!r.timeReservation) {
+    r.timeReservation = {
+      billingOwnerId: m.hosted.billingOwnerId,
+      reservedFrom: r.createdAt,
+      fundedUntil: now,
+      ...(r.egressId ? { egressId: r.egressId } : {}),
+    };
+    r.status = "stopping";
+  }
+  if (r.timeReservation.billingOwnerId !== m.hosted.billingOwnerId)
+    throw new HttpError(409, "Recording allowance owner changed");
+  const stop =
+    r.status === "stopping" ||
+    r.timeReservation.fundedUntil <= now ||
+    !ledger ||
+    !recordingEligible(grant, m, now) ||
+    recordingOverdrawn(ledger, grant, meetings, now);
+  if (stop) r.status = "stopping";
+  return stop;
+}
+
+export function sweepRecordingTimes(
+  ledger: UsageLedger | undefined,
+  grant: HostedEntitlement | undefined,
+  meetings: Meeting[],
+  now: number,
+) {
+  for (const m of meetings)
+    for (const r of m.recordings)
+      checkRecordingTime(ledger, grant, meetings, m, r, now);
+}
+
+function fundRecordingTime(
+  ledger: UsageLedger,
+  grant: HostedEntitlement,
+  meetings: Meeting[],
+  reservation: RecordingTimeReservation,
+  to: number,
+  now: number,
+) {
+  const limit = (grant.quota?.recordingSecondsPerMonth ?? 0) * 1000;
+  for (const part of intervals(ledger.anchorAt, reservation.fundedUntil, to)) {
+    const used =
+      ledger.windows.find((w) => w.start === part.start)?.recordingUsedMs ?? 0;
+    const available = Math.max(
+      0,
+      limit - used - recordingHeld(ledger, meetings, part.start, now),
+    );
+    const add = Math.min(part.ms, available);
+    reservation.fundedUntil += add;
+    if (add < part.ms) break;
+  }
+}
+
+export function reserveRecordingTime(
+  ledger: UsageLedger,
+  grant: HostedEntitlement | undefined,
+  meetings: Meeting[],
+  m: Meeting,
+  r: Recording,
+  now: number,
+) {
+  if (
+    !recordingEligible(grant, m, now) ||
+    recordingPending(meetings, now) ||
+    recordingOverdrawn(ledger, grant, meetings, now)
+  )
+    throw new HttpError(
+      409,
+      "Recording-time allowance is unavailable",
+      "RECORDING_TIME_QUOTA_UNAVAILABLE",
+    );
+  const reservation: RecordingTimeReservation = {
+    billingOwnerId: m.hosted!.billingOwnerId!,
+    reservedFrom: now,
+    fundedUntil: now,
+  };
+  fundRecordingTime(
+    ledger,
+    grant!,
+    meetings,
+    reservation,
+    Math.min(
+      now + RECORDING_PREPAY_MS,
+      grant!.validUntil,
+      m.lifecycle?.deadlineAt ?? Infinity,
+    ),
+    now,
+  );
+  if (reservation.fundedUntil <= now)
+    throw new HttpError(
+      409,
+      "Recording-time allowance is unavailable",
+      "RECORDING_TIME_QUOTA_UNAVAILABLE",
+    );
+  r.timeReservation = reservation;
+}
+
+export function observeRecordingTime(
+  ledger: UsageLedger | undefined,
+  grant: HostedEntitlement | undefined,
+  meetings: Meeting[],
+  m: Meeting,
+  r: Recording,
+  input: RecordingTimeObservation,
+  now: number,
+) {
+  const validTime = (value: number) =>
+    Number.isSafeInteger(value) && value > 0 && value <= now;
+  if (
+    !input.egressId ||
+    input.egressId.length > 256 ||
+    /[\x00-\x1f\x7f]/.test(input.egressId) ||
+    (r.egressId && r.egressId !== input.egressId) ||
+    (r.timeReservation?.egressId &&
+      r.timeReservation.egressId !== input.egressId)
+  )
+    throw new HttpError(409, "Recording job changed");
+  if (
+    (input.startedAt !== undefined && !validTime(input.startedAt)) ||
+    (input.terminal &&
+      (!validTime(input.startedAt) ||
+        !validTime(input.endedAt) ||
+        input.endedAt < input.startedAt))
+  )
+    throw new HttpError(409, "Recording time evidence is unavailable");
+  const held = r.timeReservation;
+  if (held?.settled) {
+    if (
+      !input.terminal ||
+      held.settled.startedAt !== input.startedAt ||
+      held.settled.endedAt !== input.endedAt
+    )
+      throw new HttpError(409, "Recording settlement changed");
+    return false;
+  }
+  r.egressId = input.egressId;
+  if (!m.hosted?.billingOwnerId)
+    return input.terminal
+      ? false
+      : checkRecordingTime(ledger, grant, meetings, m, r, now);
+  if (!ledger) throw new HttpError(409, "Recording usage is unavailable");
+  checkRecordingTime(ledger, grant, meetings, m, r, now);
+  const reservation = r.timeReservation;
+  if (!reservation)
+    throw new HttpError(409, "Recording reservation is unavailable");
+  reservation.egressId = input.egressId;
+  if (input.terminal) {
+    // Egress can revise its provisional start timestamp. Only the exact job's
+    // terminal interval becomes used time; the settled proof is immutable.
+    for (const part of intervals(
+      ledger.anchorAt,
+      input.startedAt,
+      input.endedAt,
+    )) {
+      const row = windowRow(ledger, part.start, part.end);
+      row.recordingUsedMs = (row.recordingUsedMs ?? 0) + part.ms;
+    }
+    reservation.settled = {
+      startedAt: input.startedAt,
+      endedAt: input.endedAt,
+    };
+    return false;
+  }
+  if (input.startedAt !== undefined)
+    // Keep the earliest provisional observation. A later active timestamp must
+    // not release held time or move the funded deadline forward.
+    reservation.startedAt = Math.min(
+      reservation.startedAt ?? input.startedAt,
+      input.startedAt,
+    );
+  if (checkRecordingTime(ledger, grant, meetings, m, r, now)) return true;
+  if (input.startedAt !== undefined && !recordingPending(meetings, now))
+    fundRecordingTime(
+      ledger,
+      grant!,
+      meetings,
+      reservation,
+      Math.min(
+        now + RECORDING_PREPAY_MS,
+        grant!.validUntil,
+        m.lifecycle?.deadlineAt ?? Infinity,
+      ),
+      now,
+    );
+  return checkRecordingTime(ledger, grant, meetings, m, r, now);
 }

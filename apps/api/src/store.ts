@@ -2,17 +2,24 @@ import { fenceParticipantMedia } from "./media-identity.js";
 import pg from "pg";
 import {
   canSettleMeter,
+  checkRecordingTime,
   debitDownloadBytes,
+  observeRecordingTime,
   quotaOverdrawn,
   requireUsage,
+  reserveRecordingTime,
   settleMeter,
   sweepParticipantMeters,
+  sweepRecordingTimes,
   updateMeter,
   usageView,
   type MeterInput,
   type ParticipantMeter,
+  type RecordingTimeObservation,
+  type RecordingTimeReservation,
   type UsageLedger,
 } from "./participant-meter.js";
+export type { RecordingTimeObservation } from "./participant-meter.js";
 import { HttpError } from "./security.js";
 import {
   applyEntitlement,
@@ -77,6 +84,8 @@ export type Participant = {
   previousRoom?: string;
 };
 export type Recording = {
+  timeReservation?: RecordingTimeReservation;
+  rawCleanupPending?: boolean;
   id: string;
   status: string;
   createdAt: number;
@@ -152,6 +161,75 @@ export interface RecordingLock {
   check(): Promise<void>;
   change<T>(fn: (m: Meeting) => Promise<T> | T): Promise<T>;
   audit(actor: string, action: string, target?: string): Promise<void>;
+  reserveRecording(
+    recording: Recording,
+    authorize: (current: Meeting) => void,
+  ): Promise<Recording>;
+  checkRecordingTime(): Promise<{ recording: Recording; mustStop: boolean }>;
+  observeRecordingTime(
+    observation: RecordingTimeObservation,
+  ): Promise<{ recording: Recording; mustStop: boolean }>;
+}
+type RecordingUsageChange<T> = (
+  ledger: UsageLedger | undefined,
+  grant: HostedEntitlement | undefined,
+  meetings: Meeting[],
+  meeting: Meeting,
+  now: number,
+) => T;
+function recordingTimeMethods(
+  id: string,
+  transaction: <T>(
+    change: RecordingUsageChange<T>,
+    authorize?: (m: Meeting) => void,
+  ) => Promise<T>,
+) {
+  const current = (m: Meeting) => {
+    const r = m.recordings.find((row) => row.id === id);
+    if (!r) throw new HttpError(404, "Recording unavailable");
+    return r;
+  };
+  return {
+    reserveRecording: (recording: Recording, authorize: (m: Meeting) => void) =>
+      transaction((ledger, grant, meetings, m, now) => {
+        authorize(m);
+        if (
+          recording.id !== id ||
+          recording.status !== "starting" ||
+          recording.timeReservation ||
+          m.recordings.some((r) => r.id === id)
+        )
+          throw new HttpError(409, "Recording reservation changed");
+        const r = structuredClone(recording);
+        if (m.hosted?.billingOwnerId) {
+          if (!ledger)
+            throw new HttpError(404, "Usage unavailable", "USAGE_UNAVAILABLE");
+          reserveRecordingTime(ledger, grant, meetings, m, r, now);
+        }
+        m.recordings.push(r);
+        return structuredClone(r);
+      }, authorize),
+    checkRecordingTime: () =>
+      transaction((ledger, grant, meetings, m, now) => {
+        const r = current(m);
+        const mustStop = checkRecordingTime(ledger, grant, meetings, m, r, now);
+        return { recording: structuredClone(r), mustStop };
+      }),
+    observeRecordingTime: (input: RecordingTimeObservation) =>
+      transaction((ledger, grant, meetings, m, now) => {
+        const r = current(m);
+        const mustStop = observeRecordingTime(
+          ledger,
+          grant,
+          meetings,
+          m,
+          r,
+          input,
+          now,
+        );
+        return { recording: structuredClone(r), mustStop };
+      }),
+  };
 }
 export interface Store {
   hostedUsage(billingOwnerId: string): Promise<ReturnType<typeof usageView>>;
@@ -427,6 +505,12 @@ export class PgStore implements Store {
       meetings: Meeting[],
       now: number,
     ) => T,
+    client?: pg.PoolClient,
+    missingLedger?: (
+      grant: HostedEntitlement | undefined,
+      meetings: Meeting[],
+      now: number,
+    ) => T,
   ) {
     let failure: unknown;
     const result = await this.hostedTransaction(
@@ -444,7 +528,7 @@ export class PgStore implements Store {
             [billingOwnerId],
           )
         ).rows[0]?.data as UsageLedger | undefined;
-        if (!ledger)
+        if (!ledger && !missingLedger)
           throw new HttpError(404, "Usage unavailable", "USAGE_UNAVAILABLE");
         // ponytail: scan retained owner meetings under one pool lock. Large meeting
         // histories will need an unsettled-meter index; do not prune recovery state.
@@ -458,17 +542,21 @@ export class PgStore implements Store {
         const before = new Map(
           meetings.map((m) => [m.code, JSON.stringify(m)]),
         );
-        sweepParticipantMeters(ledger, meetings, now);
+        if (ledger) sweepParticipantMeters(ledger, meetings, now);
+        sweepRecordingTimes(ledger, grant, meetings, now);
         let value: T | undefined;
         try {
-          value = fn(ledger, grant, meetings, now);
+          value = ledger
+            ? fn(ledger, grant, meetings, now)
+            : missingLedger!(grant, meetings, now);
         } catch (error) {
           failure = error;
         }
-        await c.query(
-          "UPDATE hosted_usage SET data=$2 WHERE billing_owner_id=$1",
-          [billingOwnerId, JSON.stringify(ledger)],
-        );
+        if (ledger)
+          await c.query(
+            "UPDATE hosted_usage SET data=$2 WHERE billing_owner_id=$1",
+            [billingOwnerId, JSON.stringify(ledger)],
+          );
         for (const m of meetings) {
           if (before.get(m.code) === JSON.stringify(m)) continue;
           m.revision++;
@@ -480,6 +568,7 @@ export class PgStore implements Store {
         return value;
       },
       billingOwnerId,
+      client,
     );
     if (failure) throw failure;
     return result as T;
@@ -616,8 +705,9 @@ export class PgStore implements Store {
     accountId: string,
     fn: (c: pg.PoolClient) => Promise<T>,
     billingOwnerId?: string,
+    client?: pg.PoolClient,
   ): Promise<T> {
-    const c = await this.pool.connect();
+    const c = client ?? (await this.pool.connect());
     try {
       await c.query("BEGIN");
       if (billingOwnerId)
@@ -634,7 +724,7 @@ export class PgStore implements Store {
       await c.query("ROLLBACK").catch(() => {});
       throw error;
     } finally {
-      c.release();
+      if (!client) c.release();
     }
   }
   async setHostedEntitlement(raw: HostedEntitlement) {
@@ -670,6 +760,7 @@ export class PgStore implements Store {
         applyEntitlement(grant, meetings);
         if (ledger) {
           sweepParticipantMeters(ledger, meetings, Date.now());
+          sweepRecordingTimes(ledger, grant, meetings, Date.now());
           if (
             grant.enabled &&
             quotaOverdrawn(ledger, grant, meetings, Date.now())
@@ -1388,6 +1479,39 @@ export class PgStore implements Store {
       throw error;
     }
   }
+  private async recordingUsage<T>(
+    c: pg.PoolClient,
+    code: string,
+    change: RecordingUsageChange<T>,
+    authorize?: (m: Meeting) => void,
+  ) {
+    const snapshot = (
+      await c.query("SELECT data FROM meetings WHERE code=$1", [code])
+    ).rows[0]?.data as Meeting | undefined;
+    if (!snapshot) throw new HttpError(404, "Meeting unavailable");
+    authorize?.(snapshot);
+    const owner = snapshot.hosted?.billingOwnerId;
+    if (!owner)
+      return this.changeWithClient(c, code, (m) => {
+        if (m.hosted?.billingOwnerId)
+          throw new HttpError(409, "Recording allowance owner changed");
+        return change(undefined, undefined, [m], m, Date.now());
+      });
+    return this.usageTransaction(
+      owner,
+      (ledger, grant, meetings, now) => {
+        const m = meetings.find((row) => row.code === code);
+        if (!m) throw new HttpError(409, "Recording allowance owner changed");
+        return change(ledger, grant, meetings, m, now);
+      },
+      c,
+      (grant, meetings, now) => {
+        const m = meetings.find((row) => row.code === code);
+        if (!m) throw new HttpError(409, "Recording allowance owner changed");
+        return change(undefined, grant, meetings, m, now);
+      },
+    );
+  }
   async withRecordingLock<T>(
     code: string,
     id: string,
@@ -1416,6 +1540,10 @@ export class PgStore implements Store {
       ).rows[0].acquired;
       if (!acquired) return { acquired: false };
       const value = await fn({
+        ...recordingTimeMethods(id, async (change, authorize) => {
+          await check();
+          return this.recordingUsage(c, code, change, authorize);
+        }),
         check,
         get: async () => {
           await check();
@@ -1477,11 +1605,16 @@ export class MemoryStore implements Store {
       meetings: Meeting[],
       now: number,
     ) => T,
+    missingLedger?: (
+      grant: HostedEntitlement | undefined,
+      meetings: Meeting[],
+      now: number,
+    ) => T,
   ) {
     let failure: unknown;
     const result = await this.serialize(async () => {
       const ledger = structuredClone(this.usageLedgers.get(owner));
-      if (!ledger)
+      if (!ledger && !missingLedger)
         throw new HttpError(404, "Usage unavailable", "USAGE_UNAVAILABLE");
       const grant = this.hostedEntitlements.get(owner);
       const meetings = structuredClone(
@@ -1490,14 +1623,17 @@ export class MemoryStore implements Store {
         ),
       );
       const now = Date.now();
-      sweepParticipantMeters(ledger, meetings, now);
+      if (ledger) sweepParticipantMeters(ledger, meetings, now);
+      sweepRecordingTimes(ledger, grant, meetings, now);
       let value: T | undefined;
       try {
-        value = fn(ledger, grant, meetings, now);
+        value = ledger
+          ? fn(ledger, grant, meetings, now)
+          : missingLedger!(grant, meetings, now);
       } catch (error) {
         failure = error;
       }
-      this.usageLedgers.set(owner, ledger);
+      if (ledger) this.usageLedgers.set(owner, ledger);
       for (const m of meetings) {
         m.revision++;
         this.data.set(m.code, m);
@@ -1656,6 +1792,7 @@ export class MemoryStore implements Store {
             (m) => m.hosted?.billingOwnerId === input.billingOwnerId,
           );
           sweepParticipantMeters(ledger, bound, Date.now());
+          sweepRecordingTimes(ledger, grant, bound, Date.now());
           if (grant.enabled && quotaOverdrawn(ledger, grant, bound, Date.now()))
             for (const m of bound) if (m.lifecycle) endMeeting(m);
           this.usageLedgers.set(input.billingOwnerId, ledger);
@@ -1807,6 +1944,33 @@ export class MemoryStore implements Store {
     };
     try {
       const value = await fn({
+        ...recordingTimeMethods(id, async (change, authorize) => {
+          await check();
+          const snapshot = await this.get(code);
+          if (!snapshot) throw new HttpError(404, "Meeting unavailable");
+          authorize?.(snapshot);
+          const owner = snapshot.hosted?.billingOwnerId;
+          if (!owner)
+            return this.change(code, (m) => {
+              if (m.hosted?.billingOwnerId)
+                throw new HttpError(409, "Recording allowance owner changed");
+              return change(undefined, undefined, [m], m, Date.now());
+            });
+          const apply = (
+            ledger: UsageLedger | undefined,
+            grant: HostedEntitlement | undefined,
+            meetings: Meeting[],
+            now: number,
+          ) => {
+            const m = meetings.find((row) => row.code === code);
+            if (!m)
+              throw new HttpError(409, "Recording allowance owner changed");
+            return change(ledger, grant, meetings, m, now);
+          };
+          return this.usageTransaction(owner, apply, (grant, meetings, now) =>
+            apply(undefined, grant, meetings, now),
+          );
+        }),
         check,
         get: async () => {
           await check();

@@ -858,3 +858,128 @@ test(
     );
   },
 );
+
+test(
+  "PostgreSQL recording time reuses its reserved connection and retains pooled unknown jobs across restart",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const at = Date.now();
+    t.mock.timers.enable({ apis: ["Date"], now: at });
+    const f = await fixture(t),
+      owner = f.account();
+    const first = await f.create(0, owner, randomUUID());
+    const second = await f.create(1, owner, randomUUID());
+    for (const response of [first, second])
+      assert.equal(response.statusCode, 200, response.body);
+    const codes = [first.json().code, second.json().code];
+    const grant = (
+      await f.stores[0].pool.query(
+        "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+        [owner],
+      )
+    ).rows[0]!.data;
+    await f.stores[0].setHostedEntitlement({
+      ...grant,
+      revision: 2,
+      quota: { ...grant.quota, recordingSecondsPerMonth: 30 },
+    });
+    for (const code of codes)
+      await f.stores[0].change(code, (m) => {
+        m.recordingAllowed = true;
+      });
+
+    const narrow = async () => {
+      const store = new PgStore(databaseUrl!);
+      await store.pool.end();
+      store.pool = new pg.Pool({
+        connectionString: databaseUrl,
+        max: 1,
+        connectionTimeoutMillis: 1000,
+      });
+      t.after(() => store.close());
+      return store;
+    };
+    const stores = await Promise.all([narrow(), narrow()]);
+    const ids = [randomUUID(), randomUUID()];
+    const starts = await Promise.allSettled(
+      stores.map((store, index) =>
+        store.withRecordingLock(codes[index], ids[index]!, (lock) =>
+          lock.reserveRecording(
+            { id: ids[index]!, status: "starting", createdAt: at },
+            (m) => {
+              assert.equal(m.hosted!.billingOwnerId, owner);
+            },
+          ),
+        ),
+      ),
+    );
+    assert.equal(starts.filter((r) => r.status === "fulfilled").length, 1);
+    assert.equal(starts.filter((r) => r.status === "rejected").length, 1);
+    assert.deepEqual((await f.stores[0].hostedUsage(owner)).recordingSeconds, {
+      limit: 30,
+      used: 0,
+      reserved: 30,
+      available: 0,
+    });
+    const winner = starts.findIndex((r) => r.status === "fulfilled"),
+      code = codes[winner],
+      id = ids[winner]!;
+    const restarted = await narrow();
+    t.mock.timers.tick(45000);
+    const checked = await restarted.withRecordingLock(code, id, (lock) =>
+      lock.checkRecordingTime(),
+    );
+    assert.equal(checked.acquired && checked.value.mustStop, true);
+    assert.deepEqual((await restarted.hostedUsage(owner)).recordingSeconds, {
+      limit: 30,
+      used: 0,
+      reserved: 45,
+      available: 0,
+    });
+    const proof = {
+      egressId: "restart-recovered-job",
+      terminal: true as const,
+      startedAt: at,
+      endedAt: at + 12345,
+    };
+    await restarted.withRecordingLock(code, id, (lock) =>
+      lock.observeRecordingTime(proof),
+    );
+    // A different API sees the terminal tombstone before the service changes file state.
+    const replay = await stores[1]!.withRecordingLock(
+      code,
+      id,
+      async (lock) => {
+        assert.equal((await lock.checkRecordingTime()).mustStop, true);
+        return lock.observeRecordingTime(proof);
+      },
+    );
+    assert.equal(replay.acquired && replay.value.mustStop, false);
+    await assert.rejects(
+      stores[0]!.withRecordingLock(code, id, (lock) =>
+        lock.observeRecordingTime({ ...proof, endedAt: at + 12000 }),
+      ),
+      /settlement changed/,
+    );
+    assert.deepEqual((await restarted.hostedUsage(owner)).recordingSeconds, {
+      limit: 30,
+      used: 13,
+      reserved: 0,
+      available: 17,
+    });
+    const ledger = (
+      await restarted.pool.query(
+        "SELECT data FROM hosted_usage WHERE billing_owner_id=$1",
+        [owner],
+      )
+    ).rows[0]!.data;
+    assert.equal(
+      ledger.windows.reduce(
+        (sum: number, row: { recordingUsedMs?: number }) =>
+          sum + (row.recordingUsedMs ?? 0),
+        0,
+      ),
+      12345,
+    );
+  },
+);

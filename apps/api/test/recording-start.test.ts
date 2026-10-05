@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Transporter } from "nodemailer";
@@ -11,6 +11,7 @@ import {
   RoomCompositeEgressRequest,
   type EncodedFileOutput,
 } from "livekit-server-sdk";
+import { LocalKeyProvider } from "@meeting-platform/recording";
 import { loadConfig } from "../src/config.js";
 import { RecordingService, type RecorderClient } from "../src/recordings.js";
 import { MemoryStore, type Meeting } from "../src/store.js";
@@ -19,7 +20,7 @@ import { HttpError } from "../src/security.js";
 const unavailable = (error: unknown) =>
   error instanceof HttpError && error.status === 503;
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, timestamped = false) {
   const directory = await mkdtemp(
     path.join(tmpdir(), "meeting-recorder-start-"),
   );
@@ -60,13 +61,20 @@ async function fixture(t: TestContext) {
   await store.create(meeting);
   const jobs: EgressInfo[] = [];
   const stops: string[] = [];
-  const controls = { startTimeout: false, stopFailures: 0, listFailures: 0 };
+  const controls = {
+    startTimeout: false,
+    stopFailures: 0,
+    listFailures: 0,
+    listOverride: undefined as EgressInfo[] | undefined,
+  };
   const client = {
     async startRoomCompositeEgress(room: string, output: EncodedFileOutput) {
       const info = new EgressInfo({
         egressId: `EG_${randomUUID()}`,
         roomName: room,
         status: EgressStatus.EGRESS_ACTIVE,
+        startedAt: timestamped ? BigInt(Date.now()) * 1_000_000n : 0n,
+        updatedAt: timestamped ? BigInt(Date.now()) * 1_000_000n : 0n,
         request: {
           case: "roomComposite",
           value: new RoomCompositeEgressRequest({
@@ -88,12 +96,19 @@ async function fixture(t: TestContext) {
       }
       return jobs.find((job) => job.egressId === id)!;
     },
-    async listEgress() {
+    async listEgress(options?: { egressId?: string; roomName?: string }) {
       if (controls.listFailures > 0) {
         controls.listFailures--;
         throw new Error("Recorder listing temporarily unreachable");
       }
-      return jobs;
+      return (
+        controls.listOverride ??
+        jobs.filter(
+          (job) =>
+            (!options?.egressId || job.egressId === options.egressId) &&
+            (!options?.roomName || job.roomName === options.roomName),
+        )
+      );
     },
   } as unknown as RecorderClient;
   const service = new RecordingService(
@@ -106,6 +121,7 @@ async function fixture(t: TestContext) {
   const reconcile = async () =>
     service.reconcile((await store.get(meeting.code))!);
   return {
+    directory,
     config,
     store,
     meeting,
@@ -118,6 +134,354 @@ async function fixture(t: TestContext) {
     reconcile,
   };
 }
+
+async function hostedFixture(t: TestContext, seconds = 90) {
+  const now = Date.UTC(2026, 9, 5, 12);
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const f = await fixture(t, true);
+  const owner = randomUUID();
+  await f.store.change(f.meeting.code, (m) => {
+    m.hosted = { accountId: owner, billingOwnerId: owner, version: 1 };
+  });
+  await f.store.setHostedEntitlement({
+    billingOwnerId: owner,
+    revision: 1,
+    enabled: true,
+    validUntil: now + 300_000,
+    hostAccountIds: [owner],
+    limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 2 },
+    quota: {
+      anchorAt: Date.UTC(2026, 8, 5, 12),
+      participantSecondsPerMonth: 360_000,
+      recordingSecondsPerMonth: seconds,
+    },
+  });
+  await f.store.change(f.meeting.code, (m) => {
+    m.lifecycle = { startedAt: now, deadlineAt: now + 7_200_000 };
+  });
+  const current = () => f.store.get(f.meeting.code) as Promise<Meeting>;
+  const usage = async () => (await f.store.hostedUsage(owner)).recordingSeconds;
+  const another = async () => {
+    const m = structuredClone(await current());
+    m.id = randomUUID();
+    m.code = randomBytes(16).toString("hex");
+    m.room = `m_${randomUUID()}`;
+    m.recordings = [];
+    await f.store.create(m);
+    return m;
+  };
+  return { ...f, now, owner, current, usage, another };
+}
+
+test("hosted recording settles verified job time once before file finalization", async (t) => {
+  const f = await hostedFixture(t);
+  await f.service.start(await f.current());
+  assert.deepEqual(await f.usage(), {
+    limit: 90,
+    used: 0,
+    reserved: 30,
+    available: 60,
+  });
+  t.mock.timers.setTime(f.now + 10_000);
+  await f.service.reconcile(await f.current(), "capture");
+  const active = await f.usage();
+  assert.equal(active.used, 0, "Only verified terminal job time is charged");
+  assert.ok(active.reserved >= 30);
+  assert.equal(active.used + active.reserved + active.available, 90);
+  f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;
+  f.jobs[0]!.endedAt = BigInt(f.now + 12_000) * 1_000_000n;
+  t.mock.timers.setTime(f.now + 15_000);
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.row()).status, "encrypting");
+  assert.equal((await f.row()).metadata, undefined);
+  assert.deepEqual(await f.usage(), {
+    limit: 90,
+    used: 12,
+    reserved: 0,
+    available: 78,
+  });
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal(
+    (await f.usage()).used,
+    12,
+    "Terminal replay must not debit twice",
+  );
+});
+
+test("Egress provisional STARTING time may change before exact terminal settlement", async (t) => {
+  const f = await hostedFixture(t);
+  const start = f.client.startRoomCompositeEgress.bind(f.client);
+  f.client.startRoomCompositeEgress = async (...args) => {
+    const info = await start(...args);
+    info.status = EgressStatus.EGRESS_STARTING;
+    return info;
+  };
+  await f.service.start(await f.current());
+  assert.equal((await f.row()).status, "starting");
+  const id = (await f.row()).id;
+
+  // Egress validates the request in one process, then initializes the same job
+  // again in its child. The child publishes a later top-level startedAt.
+  t.mock.timers.setTime(f.now + 5_000);
+  f.jobs[0]!.status = EgressStatus.EGRESS_ACTIVE;
+  f.jobs[0]!.startedAt = BigInt(f.now + 262) * 1_000_000n;
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.row()).status, "recording");
+  assert.equal((await f.row()).timeReservation!.startedAt, f.now);
+  assert.deepEqual(f.stops, []);
+  assert.equal((await f.usage()).used, 0);
+  assert.ok((await f.usage()).reserved >= 30);
+
+  f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;
+  f.jobs[0]!.endedAt = BigInt(f.now + 12_100) * 1_000_000n;
+  t.mock.timers.setTime(f.now + 15_000);
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.row()).status, "encrypting");
+  assert.deepEqual((await f.row()).timeReservation!.settled, {
+    startedAt: f.now + 262,
+    endedAt: f.now + 12_100,
+  });
+  assert.equal(
+    (await f.usage()).used,
+    12,
+    "Charge the final11.838s interval, not the provisional12.1s interval",
+  );
+  assert.equal((await f.usage()).reserved, 0);
+
+  await writeFile(
+    path.join(f.directory, "raw", `${id}.mp4`),
+    Buffer.from("Synthetic recording encryption fixture"),
+    { mode: 0o600 },
+  );
+  await f.service.reconcile(await f.current(), "files");
+  assert.equal((await f.row()).status, "ready");
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.usage()).used, 12);
+});
+
+test("terminal usage survives a crash before the recording file-state transition", async (t) => {
+  const f = await hostedFixture(t);
+  await f.service.start(await f.current());
+  f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;
+  f.jobs[0]!.endedAt = BigInt(f.now + 12_000) * 1_000_000n;
+  t.mock.timers.setTime(f.now + 15_000);
+  const withLock = f.store.withRecordingLock.bind(f.store);
+  let failNextChange = false;
+  f.store.withRecordingLock = (code, id, work) =>
+    withLock(code, id, (lock) =>
+      work({
+        ...lock,
+        observeRecordingTime: async (observation) => {
+          const result = await lock.observeRecordingTime(observation);
+          if (observation.terminal) failNextChange = true;
+          return result;
+        },
+        change: async (change) => {
+          if (failNextChange) {
+            failNextChange = false;
+            throw new Error("Process lost after terminal usage commit");
+          }
+          return lock.change(change);
+        },
+      }),
+    );
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.row()).status, "recording");
+  assert.equal((await f.usage()).used, 12);
+  assert.equal((await f.usage()).reserved, 0);
+  f.store.withRecordingLock = withLock;
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.row()).status, "encrypting");
+  assert.equal((await f.usage()).used, 12);
+  assert.equal((await f.usage()).reserved, 0);
+});
+
+test("malformed recorder times and a different job never release the hosted hold", async (t) => {
+  for (const scenario of [
+    "zero-start",
+    "zero-end",
+    "negative-start",
+    "reversed",
+    "unsafe",
+    "different-job",
+  ]) {
+    await t.test(scenario, async (t) => {
+      const f = await hostedFixture(t);
+      await f.service.start(await f.current());
+      const id = f.jobs[0]!.egressId;
+      const job = f.jobs[0]!;
+      job.status = EgressStatus.EGRESS_COMPLETE;
+      job.endedAt = BigInt(f.now + 12_000) * 1_000_000n;
+      if (scenario === "zero-start") job.startedAt = 0n;
+      if (scenario === "zero-end") job.endedAt = 0n;
+      if (scenario === "negative-start") job.startedAt = -1n;
+      if (scenario === "reversed")
+        job.startedAt = BigInt(f.now + 20_000) * 1_000_000n;
+      if (scenario === "unsafe")
+        job.endedAt = (BigInt(Number.MAX_SAFE_INTEGER) + 1n) * 1_000_000n;
+      if (scenario === "different-job") {
+        job.egressId = `EG_${randomUUID()}`;
+        f.controls.listOverride = f.jobs;
+      }
+      t.mock.timers.setTime(f.now + 12_000);
+      await f.service.reconcile(await f.current(), "capture");
+      const row = await f.row();
+      assert.equal(row.egressId, id);
+      assert.ok(["starting", "recording", "stopping"].includes(row.status));
+      assert.equal(row.metadata, undefined);
+      assert.ok((await f.usage()).reserved > 0);
+      assert.ok(f.stops.every((stopped) => stopped === id));
+    });
+  }
+});
+
+test("exhausted recording funding requests stop even when the recorder listing fails", async (t) => {
+  const f = await hostedFixture(t, 5);
+  await f.service.start(await f.current());
+  t.mock.timers.setTime(f.now + 6_000);
+  f.controls.listFailures = 1;
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.row()).status, "stopping");
+  assert.ok(f.stops.includes(f.jobs[0]!.egressId));
+  assert.ok(
+    (await f.usage()).reserved > 0,
+    "An unconfirmed stop is not a refund",
+  );
+});
+
+test("uncertain recorder status stops before funding expires and blocks another room", async (t) => {
+  for (const lookup of ["failed", "empty"] as const) {
+    await t.test(lookup, async (t) => {
+      const f = await hostedFixture(t);
+      await f.service.start(await f.current());
+      const id = f.jobs[0]!.egressId;
+      t.mock.timers.setTime(f.now + 1_000);
+      assert.ok((await f.row()).timeReservation!.fundedUntil > Date.now());
+      if (lookup === "failed") f.controls.listFailures = 1;
+      else f.controls.listOverride = [];
+
+      await f.service.reconcile(await f.current(), "capture");
+
+      assert.equal((await f.row()).status, "stopping");
+      assert.deepEqual(f.stops, [id]);
+      const usage = await f.usage();
+      assert.equal(
+        usage.used,
+        0,
+        "Missing terminal evidence must not debit used time",
+      );
+      assert.ok(
+        usage.reserved > 0,
+        "An uncertain job must retain its pool hold",
+      );
+      await assert.rejects(
+        f.service.start(await f.another()),
+        (error: unknown) => error instanceof HttpError && error.status === 409,
+      );
+      assert.equal(
+        f.jobs.length,
+        1,
+        "A second room cannot allocate around the hold",
+      );
+      assert.equal((await f.usage()).used, 0);
+    });
+  }
+});
+
+test("unknown start retains its pool hold across missing recorder listings", async (t) => {
+  const f = await hostedFixture(t);
+  f.controls.startTimeout = true;
+  f.controls.listFailures = 1;
+  await assert.rejects(f.service.start(await f.current()), unavailable);
+  assert.equal((await f.row()).egressId, undefined);
+  f.jobs.length = 0;
+  t.mock.timers.setTime(f.now + 31_000);
+  await f.service.reconcile(await f.current(), "capture");
+  assert.equal((await f.row()).status, "stopping");
+  assert.ok((await f.usage()).reserved > 0);
+  f.controls.startTimeout = false;
+  await assert.rejects(
+    f.service.start(await f.another()),
+    (error: unknown) => error instanceof HttpError && error.status === 409,
+  );
+  assert.equal(
+    f.jobs.length,
+    0,
+    "Another room must not bypass uncertain usage",
+  );
+});
+
+test(
+  "blocked encryption does not prevent another room's capture-phase stop",
+  { timeout: 10_000 },
+  async (t) => {
+    const f = await hostedFixture(t);
+    await f.service.start(await f.current());
+    const first = await f.row();
+    f.jobs[0]!.status = EgressStatus.EGRESS_COMPLETE;
+    f.jobs[0]!.endedAt = BigInt(f.now + 12_000) * 1_000_000n;
+    t.mock.timers.setTime(f.now + 12_000);
+    await f.service.reconcile(await f.current(), "capture");
+    await writeFile(
+      path.join(f.directory, "raw", `${first.id}.mp4`),
+      Buffer.from("Synthetic recording encryption fixture"),
+      { mode: 0o600 },
+    );
+    const provider = new LocalKeyProvider({
+      keyId: f.config.recordingActiveKeyId,
+      key: Buffer.from(f.config.recordingKek, "base64"),
+    });
+    t.after(() => provider.destroy());
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const files = new RecordingService(
+      f.config,
+      f.store,
+      {} as Transporter,
+      f.client,
+      {
+        keyProvider: {
+          unwrapKey: (...args) => provider.unwrapKey(...args),
+          wrapKey: async (...args) => {
+            enter();
+            await gate;
+            return provider.wrapKey(...args);
+          },
+        },
+      },
+    );
+    let finished = false;
+    const finalizing = files
+      .reconcile(await f.current(), "files")
+      .finally(() => {
+        finished = true;
+      });
+    try {
+      await entered;
+      const second = await f.another();
+      await f.service.start(second);
+      const secondJob = f.jobs[1]!;
+      t.mock.timers.setTime(f.now + 50_000);
+      await f.service.reconcile((await f.store.get(second.code))!, "capture");
+      assert.ok(f.stops.includes(secondJob.egressId));
+      assert.equal(
+        finished,
+        false,
+        "The file pass must still be waiting on encryption",
+      );
+    } finally {
+      release();
+      await finalizing;
+    }
+    assert.equal((await f.row()).status, "ready");
+  },
+);
 
 test("recovery stops capture after committed opt-out or global disable", async (t) => {
   const f = await fixture(t);
