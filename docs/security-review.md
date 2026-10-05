@@ -10,6 +10,8 @@ The first GitHub native validation then exposed a late-callback crash during kic
 
 Ponytail's complexity review removed unused ARI originate variables, playback lookup and bridge-channel removal methods, plus an unused string-identity option in the validation observer. This simplification does not remove isolation checks or cleanup ownership.
 
+The SIP fixture now records the outer process result separately from the in-container checks, so a crashed runner cannot leave an apparently unfinished result without its failure context. Cleanup success requires verified absence of the fixture's containers, networks and volumes, plus removal of generated secrets and its lock. GitHub has a bounded recovery step that selects the exact disposable project label and rechecks ownership before removal. Recovery produces separate evidence and cannot convert failed validation into success. Seven fake-command/filesystem tests cover scope, uncertain cleanup, interruption and evidence handling; an independent static review found no actionable issue. This does not prove behavior after a lost runner or replace a native validation run.
+
 Two earlier native runs stopped unexpectedly during code entry. Later runs passed, including exact repeated-digit sequence checks, but the earlier cause remains unresolved. Durable orphan reconciliation, production private TLS, concurrent/redial isolation, carrier limits and recording/phone breakout behavior remain release gates in [the phone design](phone-sip-design.md#gates-before-real-dial-in). Phone access stays disabled by default.
 
 ## Phone foundation follow-up

@@ -12,6 +12,13 @@ import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  allAbsent,
+  executionEvidence,
+  removeFixtureLock,
+  removeGeneratedInputs,
+  verifyProjectAbsent,
+} from "./sip-test-support.mjs";
 
 process.umask(0o077);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -22,6 +29,7 @@ await access(path.join(root, "scripts/validation/sip-media.mjs"));
 await mkdir(runtime, { recursive: true, mode: 0o700 });
 const lock = path.join(runtime, "running");
 await writeFile(lock, String(process.pid), { flag: "wx", mode: 0o600 });
+const evidence = executionEvidence(path.join(results, "execution.json"));
 const args = [
   "compose",
   "--project-name",
@@ -36,13 +44,16 @@ let activeChild,
   prepared = false,
   cleanupSucceeded = false,
   diagnosticsCollected = false;
-const interrupt = () => {
+const interrupt = (signal) => {
   if (interrupted) return;
   interrupted = true;
+  evidence.interrupt(signal);
   activeChild?.kill("SIGINT");
 };
-process.on("SIGINT", interrupt);
-process.on("SIGTERM", interrupt);
+const onInterrupt = () => interrupt("SIGINT");
+const onTerminate = () => interrupt("SIGTERM");
+process.on("SIGINT", onInterrupt);
+process.on("SIGTERM", onTerminate);
 async function command(
   commandArgs,
   { allowFailure = false, cleanup = false, timeout = 900000 } = {},
@@ -55,12 +66,18 @@ async function command(
       timeout,
     });
     activeChild = child;
-    child.once("error", reject);
-    child.once("exit", (code) => {
+    child.once("error", () => {
+      if (activeChild === child) activeChild = undefined;
+      evidence.command(null, null);
+      reject(new Error("SIP fixture command could not start"));
+    });
+    child.once("exit", (code, signal) => {
+      evidence.command(code, signal);
       if (activeChild === child) activeChild = undefined;
       resolve(code ?? 1);
     });
   });
+  await evidence.save();
   if (code !== 0 && !allowFailure)
     throw new Error("SIP fixture command failed");
   return code;
@@ -320,7 +337,7 @@ async function certificates() {
   await rm(file("bad-ca.key"));
 }
 try {
-  await mkdir(results, { recursive: true, mode: 0o700 });
+  await evidence.save();
   const subnet = await unusedSubnet();
   const secrets = {
     db: randomBytes(24).toString("hex"),
@@ -405,6 +422,7 @@ try {
   await certificates();
   prepared = true;
   // Build the client first because the Node runner copies its ABI-compatible binary.
+  await evidence.phase("build-client");
   await command([
     "build",
     "-f",
@@ -413,7 +431,9 @@ try {
     "covemeet-sip-client:local",
     ".",
   ]);
+  await evidence.phase("build-services");
   await compose(["build", "asterisk", "sip", "sip-runner"]);
+  await evidence.phase("start-services");
   await compose([
     "up",
     "-d",
@@ -423,18 +443,28 @@ try {
     "asterisk",
     "sip",
   ]);
+  await evidence.phase("readiness");
   await waitForServices();
+  await evidence.phase("tls-preflight");
   await verifySipTls();
+  await evidence.phase("native-validation");
   const runnerExit = await compose(
     ["run", "--rm", "--no-deps", "--use-aliases", "sip-runner"],
     { allowFailure: true },
   );
+  if (runnerExit !== 0) evidence.fail();
+  await evidence.phase("diagnostics");
   await diagnostics();
   if (runnerExit !== 0)
     throw new Error("Native SIP validation failed; sanitized reports retained");
+  evidence.report.validationPassed = true;
   console.log(
     `Native SIP validation report: ${path.join(results, "sip-media.json")}`,
   );
+} catch {
+  evidence.fail();
+  process.exitCode = 1;
+  console.error("SIP fixture failed; inspect sanitized execution evidence");
 } finally {
   if (prepared && !diagnosticsCollected) {
     try {
@@ -444,34 +474,51 @@ try {
     }
   }
   try {
-    if (prepared)
-      cleanupSucceeded =
-        (await compose(["down", "--volumes", "--remove-orphans"], {
-          allowFailure: true,
-          cleanup: true,
-        })) === 0;
-    else cleanupSucceeded = true;
+    await evidence.phase("cleanup");
   } catch {
-    ((cleanupSucceeded = false), (diagnosticsCollected = false));
+    /* Continue on artifact failure. */
   }
-  // Remove only this script's private generated inputs, even if Docker cleanup failed.
-  for (const name of [
-    "fixture.env",
-    "client-password",
-    "livekit.yaml",
-    "sip.yaml",
-    "asterisk",
-    "certs",
-  ]) {
-    await rm(path.join(runtime, name), { recursive: true, force: true });
+  try {
+    cleanupSucceeded =
+      !prepared ||
+      (await compose(["down", "--volumes", "--remove-orphans"], {
+        allowFailure: true,
+        cleanup: true,
+        timeout: 60000,
+      })) === 0;
+  } catch {
+    cleanupSucceeded = false;
   }
-  if (cleanupSucceeded) await rm(lock, { force: true });
-  else {
+  evidence.report.cleanup.composeDownSucceeded = prepared
+    ? cleanupSucceeded
+    : null;
+  Object.assign(
+    evidence.report.cleanup,
+    await verifyProjectAbsent((args) => quiet("docker", args)),
+  );
+  evidence.report.cleanup.generatedInputsRemoved =
+    await removeGeneratedInputs(runtime);
+  cleanupSucceeded =
+    cleanupSucceeded &&
+    allAbsent(evidence.report.cleanup) &&
+    evidence.report.cleanup.generatedInputsRemoved;
+  evidence.report.cleanup.lockRemoved = cleanupSucceeded
+    ? await removeFixtureLock(runtime)
+    : false;
+  cleanupSucceeded = cleanupSucceeded && evidence.report.cleanup.lockRemoved;
+  if (!cleanupSucceeded) {
     console.error(
-      "SIP fixture Docker cleanup incomplete; reserved fixture lock retained for inspection",
+      "SIP fixture cleanup not verified; fixture lock retained when present",
     );
     process.exitCode = 1;
   }
-  process.off("SIGINT", interrupt);
-  process.off("SIGTERM", interrupt);
+  try {
+    await evidence.finish(cleanupSucceeded);
+  } catch {
+    console.error("SIP fixture execution evidence could not be saved");
+    process.exitCode = 1;
+  }
+  if (evidence.report.status !== "passed") process.exitCode = 1;
+  process.off("SIGINT", onInterrupt);
+  process.off("SIGTERM", onTerminate);
 }

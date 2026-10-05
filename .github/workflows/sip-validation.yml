@@ -6,7 +6,8 @@ on:
     paths:
       - .github/workflows/sip-validation.yml
       - apps/phone/**
-      - scripts/sip-test.mjs
+      - apps/api/**
+      - scripts/sip-test*.mjs
       - scripts/validation/sip-*
       - scripts/validation/rtc-fixture.mjs
       - infra/asterisk.Dockerfile
@@ -21,24 +22,36 @@ permissions:
 jobs:
   native-sip:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # Bounded steps total 29 minutes, leaving 1 minute for runner/post-step overhead.
+    # A lost or forcibly killed runner can still prevent recovery and upload.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 1
         with:
           persist-credentials: false
       - uses: actions/setup-node@v4
+        timeout-minutes: 1
         with:
           node-version: "24"
           cache: npm
       - run: npm ci
+        timeout-minutes: 3
       - name: SIP controller helper tests
-        run: node --test scripts/validation/sip-client.test.mjs
+        timeout-minutes: 1
+        run: node --test --test-concurrency=1 scripts/validation/sip-client.test.mjs scripts/sip-test-support.test.mjs
       - name: Isolated native SIP validation
+        timeout-minutes: 20
         run: npm run test:sip
+      - name: Scoped SIP recovery
+        if: always()
+        timeout-minutes: 2
+        run: node scripts/sip-test-recovery.mjs
       - name: Native SIP validation evidence
         if: always()
+        timeout-minutes: 1
         uses: actions/upload-artifact@v4
         with:
           name: native-sip-validation
           path: test-results/sip/*.json
-          if-no-files-found: ignore
+          if-no-files-found: error
