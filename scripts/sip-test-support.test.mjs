@@ -5,6 +5,7 @@ import {
   mkdir,
   readFile,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -21,6 +22,30 @@ import {
   removeGeneratedInputs,
   verifyProjectAbsent,
 } from "./sip-test-support.mjs";
+
+test("sanitized manager evidence stays host-readable under a private umask", async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "sip-report-mode-"));
+  try {
+    const moduleUrl = new URL("./sip-test-support.mjs", import.meta.url).href;
+    const shared = path.join(dir, "shared.json");
+    const privateFile = path.join(dir, "private.json");
+    await promisify(execFile)(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      `import { writeEvidence } from ${JSON.stringify(moduleUrl)};
+       process.umask(0o077);
+       await writeEvidence(${JSON.stringify(shared)}, { result: "passed" }, { shared: true });
+       await writeEvidence(${JSON.stringify(privateFile)}, { result: "passed" });`,
+    ]);
+    assert.equal((await stat(shared)).mode & 0o777, 0o644);
+    assert.equal((await stat(privateFile)).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(await readFile(shared, "utf8")), {
+      result: "passed",
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 function fakeDocker({
   failRemoval = false,

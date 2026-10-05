@@ -1,4 +1,4 @@
-import { lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export const PROJECT = "covemeet-sip-test";
@@ -32,12 +32,15 @@ const phases = new Set([
   "complete",
 ]);
 
-export async function writeEvidence(file, value) {
+export async function writeEvidence(file, value, { shared = false } = {}) {
   await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
     mode: 0o600,
   });
+  // Only sanitized manager reports opt in: their root container and host runner
+  // have different owners on Linux. chmod is explicit because umask strips mode.
+  if (shared) await chmod(temporary, 0o644);
   await rename(temporary, file);
 }
 

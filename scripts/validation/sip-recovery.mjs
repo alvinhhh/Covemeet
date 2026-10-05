@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
+import { writeEvidence } from "../sip-test-support.mjs";
 import { RoomServiceClient, SipClient } from "livekit-server-sdk";
 import { loadConfig } from "../../apps/api/dist/config.js";
 import { PgStore } from "../../apps/api/dist/store.js";
@@ -141,10 +142,8 @@ try {
 } finally {
   media.close();
   await store.close();
-  await writeFile(
-    `/results/sip-${report.mode}.json`,
-    `${JSON.stringify(report, null, 2)}\n`,
-    { mode: 0o644 },
-  );
+  await writeEvidence(`/results/sip-${report.mode}.json`, report, {
+    shared: true,
+  });
   console.log(`Managed SIP ${report.mode}: ${report.result}`);
 }
