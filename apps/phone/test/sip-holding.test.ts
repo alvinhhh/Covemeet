@@ -718,6 +718,56 @@ test("holding closure waits for acknowledged native removal to become visible", 
   assert.equal(staleReads, -1);
 });
 
+test("holding closure waits for its disconnected RTC relay after the native peer has left", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  const relay = {
+    ...f.native,
+    identity: `cm-relay-${f.config.callId}`,
+    kind: 0,
+    attributes: {},
+  };
+  let staleReads = 3;
+  f.service.listParticipants = async () => (staleReads-- > 0 ? [relay] : []);
+  await f.holding.close();
+  assert.equal(staleReads, -1);
+  assert.equal(
+    f.log.some((entry) => entry.startsWith("remove:")),
+    false,
+  );
+});
+
+test("a disconnected RTC relay that remains cannot acknowledge holding cleanup", async () => {
+  const f = fixture();
+  await f.holding.open(() => {});
+  f.service.listParticipants = async () => [
+    {
+      ...f.native,
+      identity: `cm-relay-${f.config.callId}`,
+      kind: 0,
+      attributes: {},
+    },
+  ];
+  await assert.rejects(
+    f.holding.close(),
+    (error: Error & { cleanupCounts?: unknown }) => {
+      assert.match(error.message, /SIP holding participant remains/);
+      assert.deepEqual(error.cleanupCounts, {
+        native: 0,
+        relay: 1,
+        total: 1,
+        nativeRemovalAttempted: false,
+        relayDisconnectAttempted: true,
+      });
+      return true;
+    },
+  );
+  assert.equal(
+    f.log.some((entry) => entry.startsWith("remove:")),
+    false,
+  );
+});
+
 test("native removal rejection cannot finish while the peer remains", async () => {
   const f = fixture();
   await f.holding.open(() => {});

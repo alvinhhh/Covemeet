@@ -610,6 +610,25 @@ async function run() {
           ];
           if (report.holdingCleanup.length < 40)
             report.holdingCleanup.push({
+              ...(error?.message === "SIP holding participant remains" &&
+              error.cleanupCounts
+                ? {
+                    cleanupCounts: Object.fromEntries(
+                      Object.entries(error.cleanupCounts).filter(
+                        ([key, value]) =>
+                          (["native", "relay", "total"].includes(key) &&
+                            Number.isSafeInteger(value) &&
+                            value >= 0 &&
+                            value <= 10000) ||
+                          ([
+                            "nativeRemovalAttempted",
+                            "relayDisconnectAttempted",
+                          ].includes(key) &&
+                            typeof value === "boolean"),
+                      ),
+                    ),
+                  }
+                : {}),
               message: known.includes(error?.message)
                 ? error.message
                 : "Holding cleanup failed",

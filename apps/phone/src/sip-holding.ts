@@ -352,6 +352,15 @@ export class SipHolding implements SupervisedMedia {
             if (absent(error)) return [];
             throw error;
           });
+        // A resolved local RTC disconnect can precede its disappearance from
+        // the SFU. The SIP peer may already have left, so native removal alone
+        // cannot decide whether to wait for this call's relay to become absent.
+        const ownedRelay = (peer: (typeof peers)[number]) =>
+          !!this.rtc &&
+          this.native?.room === room.name &&
+          peer.kind === 0 &&
+          peer.identity === `cm-relay-${this.config.callId}`;
+        const relayDisconnectAttempted = peers.some(ownedRelay);
         let removalAttempted = false;
         for (const peer of peers) {
           if (
@@ -371,6 +380,7 @@ export class SipHolding implements SupervisedMedia {
             // Uncertain allocation or failed RTC/PBX cleanup still rejects.
           }
         }
+        let remainingPeers = peers;
         if (
           !(await this.absentAfterTeardown(async () => {
             const remaining = await this.rooms
@@ -379,10 +389,25 @@ export class SipHolding implements SupervisedMedia {
                 if (absent(error)) return [];
                 throw error;
               });
+            remainingPeers = remaining;
             return remaining.length ? remaining : undefined;
-          }, removalAttempted))
+          }, removalAttempted || relayDisconnectAttempted))
         )
-          throw new Error("SIP holding participant remains");
+          throw Object.assign(new Error("SIP holding participant remains"), {
+            cleanupCounts: {
+              native: remainingPeers.filter(
+                (peer) =>
+                  peer.kind === 3 &&
+                  peer.identity === nativeIdentity &&
+                  peer.attributes["sip.trunkID"] === this.config.sipTrunkId &&
+                  peer.attributes["sip.ruleID"] === this.config.sipRuleId,
+              ).length,
+              relay: remainingPeers.filter(ownedRelay).length,
+              total: remainingPeers.length,
+              nativeRemovalAttempted: removalAttempted,
+              relayDisconnectAttempted,
+            },
+          });
       }
       if (
         this.uncertain ||
