@@ -210,8 +210,15 @@ test(
         fn({
           ...lock,
           change: async (change) => {
-            entered();
-            await blocked;
+            const row = (await lock.get())?.recordings.find(
+              (entry) => entry.id === recording.id,
+            );
+            // Terminal capture now commits encrypting before file work. Pause
+            // only the later metadata commit, after its immutable output exists.
+            if (row?.status === "encrypting" && !row.metadata) {
+              entered();
+              await blocked;
+            }
             return lock.change(change);
           },
         }),
