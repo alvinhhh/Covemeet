@@ -1,0 +1,158 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import pg from "pg";
+import { createMailBudget } from "../src/budget.js";
+
+const config = {
+  production: false,
+  mailDatabaseUrl: "postgresql://fixture:fixture@127.0.0.1/covemeet_mail_test",
+};
+const scope = { accountId: "123456789012", region: "us-east-1" };
+
+test("budget validates TLS options without opening a database connection", async (t) => {
+  t.mock.method(pg.Pool.prototype, "connect", () => {
+    throw new Error("Must not connect");
+  });
+  for (const query of [
+    "sslmode=disable",
+    "sslmode=require",
+    "ssl=false",
+    "host=other",
+    "options=-c%20statement_timeout=0",
+  ]) {
+    assert.throws(
+      () =>
+        createMailBudget({
+          ...config,
+          mailDatabaseUrl: `${config.mailDatabaseUrl}?${query}`,
+        }),
+      /may not override verified TLS/,
+    );
+  }
+  assert.throws(
+    () => createMailBudget({ production: false }),
+    /Invalid mail database URL/,
+  );
+  const budget = createMailBudget({ ...config, production: true });
+  await budget.close();
+  await budget.close();
+  await assert.rejects(
+    budget.reserve({ ...scope, signal: new AbortController().signal }),
+    /closed/,
+  );
+});
+
+test("already aborted requests and invalid scopes never connect", async (t) => {
+  t.mock.method(pg.Pool.prototype, "connect", () => {
+    throw new Error("Must not connect");
+  });
+  const budget = createMailBudget(config);
+  const controller = new AbortController();
+  const reason = new Error("Synthetic operation deadline");
+  controller.abort(reason);
+  await assert.rejects(
+    budget.reserve({ ...scope, signal: controller.signal }),
+    reason,
+  );
+  await assert.rejects(
+    budget.reserve({
+      ...scope,
+      accountId: "not-an-account",
+      signal: new AbortController().signal,
+    }),
+    /Invalid mail budget/,
+  );
+  await budget.close();
+});
+
+test("abort while acquiring a connection releases its eventual client without starting a transaction", async (t) => {
+  let acquired!: (client: pg.PoolClient) => void;
+  let releaseCount = 0;
+  const pending = new Promise<pg.PoolClient>((resolve) => {
+    acquired = resolve;
+  });
+  t.mock.method(pg.Pool.prototype, "connect", () => pending);
+  t.mock.method(pg.Pool.prototype, "end", async () => {});
+  const budget = createMailBudget(config);
+  const controller = new AbortController();
+  const attempt = budget.reserve({ ...scope, signal: controller.signal });
+  const rejection = assert.rejects(attempt, /Synthetic deadline/);
+  controller.abort(new Error("Synthetic deadline"));
+  await rejection;
+  acquired({
+    release(destroy: boolean) {
+      assert.equal(destroy, true);
+      releaseCount++;
+    },
+    query() {
+      throw new Error("An aborted request must not query");
+    },
+  } as unknown as pg.PoolClient);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(releaseCount, 1);
+  await budget.close();
+});
+
+test("permit wait releases the transaction and client, then aborts without another claim", async (t) => {
+  let connects = 0;
+  let released = false;
+  let transaction = false;
+  let claimed = false;
+  let waitEntered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    waitEntered = resolve;
+  });
+  const client = {
+    async query(sql: string) {
+      if (sql === "BEGIN") transaction = true;
+      if (sql === "COMMIT" || sql === "ROLLBACK") transaction = false;
+      if (sql.startsWith("SELECT attempts"))
+        return { rows: [{ attempts: ["100000"] }] };
+      if (sql.includes("clock_timestamp()"))
+        return { rows: [{ now_ms: "100000" }] };
+      if (sql.startsWith("UPDATE public.mail_send_budget")) claimed = true;
+      return { rows: [] };
+    },
+    release() {
+      released = true;
+      assert.equal(transaction, false);
+      waitEntered();
+    },
+  } as unknown as pg.PoolClient;
+  t.mock.method(pg.Pool.prototype, "connect", async () => {
+    connects++;
+    return client;
+  });
+  t.mock.method(pg.Pool.prototype, "end", async () => {});
+  const budget = createMailBudget(config);
+  const controller = new AbortController();
+  const attempt = budget.reserve({ ...scope, signal: controller.signal });
+  const rejection = assert.rejects(attempt, { name: "AbortError" });
+  await waiting;
+  assert.equal(released, true);
+  assert.equal(claimed, false);
+  controller.abort();
+  await rejection;
+  assert.equal(connects, 1);
+  await budget.close();
+});
+
+test("production uses verified TLS and driver errors do not expose connection secrets", async (t) => {
+  let ssl: unknown;
+  t.mock.method(pg.Pool.prototype, "connect", function (this: pg.Pool) {
+    ssl = this.options.ssl;
+    throw new Error("database password=private-fixture-marker");
+  });
+  t.mock.method(pg.Pool.prototype, "end", async () => {});
+  const budget = createMailBudget({ ...config, production: true });
+  await assert.rejects(
+    budget.reserve({ ...scope, signal: new AbortController().signal }),
+    (error: Error) => {
+      assert.equal(error.message, "Mail budget unavailable");
+      assert.equal(error.message.includes("private-fixture-marker"), false);
+      return true;
+    },
+  );
+  assert.deepEqual(ssl, { rejectUnauthorized: true });
+  await budget.close();
+});

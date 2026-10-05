@@ -71,6 +71,7 @@ async function fixture(t: TestContext, status = "ready") {
       emails.push(message);
       return { messageId: "test" };
     },
+    close() {},
   } as unknown as Transporter;
   const store = new MemoryStore();
   const recording: Recording = {
@@ -173,16 +174,10 @@ async function fixture(t: TestContext, status = "ready") {
     close() {},
   };
   async function app() {
-    // Inject a transport through nodemailer's factory, without opening a socket or sending real mail.
-    const original = nodemailer.createTransport;
-    nodemailer.createTransport = (() =>
-      mail) as typeof nodemailer.createTransport;
-    let server;
-    try {
-      server = await createApp(config, store, media);
-    } finally {
-      nodemailer.createTransport = original;
-    }
+    // Transports are created per send. Keep this factory stub for the test's
+    // entire request lifecycle so no fixture opens an SMTP socket.
+    t.mock.method(nodemailer, "createTransport", () => mail);
+    const server = await createApp(config, store, media);
     t.after(() => server.close());
     return server;
   }
@@ -268,6 +263,130 @@ test("email failure revokes the newly generated download credentials", async (t)
   assert.equal(row.tokenHash, undefined);
   assert.equal(row.passwordHash, undefined);
   assert.equal(row.expiresAt, undefined);
+});
+
+test("SES configuration enables recording links without an SMTP host", async (t) => {
+  const f = await fixture(t);
+  f.config.smtpHost = "";
+  f.config.mailTransport = "ses";
+  f.config.mailDatabaseUrl =
+    "postgres://mail:unused@localhost/covemeet_mail_test";
+  f.config.ses = {
+    region: "us-east-2",
+    accountId: "123456789012",
+    roleArn: "arn:aws:iam::123456789012:role/MailTest",
+  };
+  const service = new RecordingService(f.config, f.store, f.mail);
+  assert.equal(service.available, true);
+  const link = await service.link(f.meeting, f.recording.id);
+  assert.match(link.url, /#.+/);
+  assert.match(f.emails.at(-1)!.text, /Password: /);
+  assert.doesNotMatch(f.emails.at(-1)!.text, /#|https?:/);
+});
+
+test("failed host verification email invalidates only its code", async (t) => {
+  const f = await fixture(t);
+  f.mail.sendMail = (async () => {
+    throw new Error("Private provider error");
+  }) as typeof f.mail.sendMail;
+  const app = await f.app();
+  const result = await app.inject({
+    method: "POST",
+    url: `/api/meetings/${f.meeting.code}/host-email`,
+    headers: {
+      origin,
+      "x-requested-with": "MeetingPlatform",
+      cookie: `mp_${f.meeting.code}=${f.hostSession}`,
+    },
+    payload: { email: "next@example.test" },
+  });
+  assert.equal(result.statusCode, 503);
+  assert.match(result.body, /Verification email failed/);
+  assert.doesNotMatch(result.body, /Private provider/);
+  const meeting = (await f.store.get(f.meeting.code))!;
+  assert.equal(meeting.hostEmailVerified, false);
+  assert.equal(meeting.emailOtpHash, undefined);
+  assert.equal(meeting.emailOtpExpiresAt, undefined);
+  assert.equal(meeting.emailOtpAttempts, undefined);
+});
+
+test("a delayed email failure cannot clear a newer verification request", async (t) => {
+  const f = await fixture(t);
+  let rejectFirst!: (error: Error) => void;
+  let firstSending!: () => void;
+  const started = new Promise<void>((resolve) => {
+    firstSending = resolve;
+  });
+  let attempts = 0;
+  f.mail.sendMail = (async () => {
+    if (++attempts === 1) {
+      firstSending();
+      await new Promise<void>((_resolve, reject) => {
+        rejectFirst = reject;
+      });
+    }
+    return { messageId: "synthetic" };
+  }) as typeof f.mail.sendMail;
+  const app = await f.app();
+  const request = (email: string) =>
+    app.inject({
+      method: "POST",
+      url: `/api/meetings/${f.meeting.code}/host-email`,
+      headers: {
+        origin,
+        "x-requested-with": "MeetingPlatform",
+        cookie: `mp_${f.meeting.code}=${f.hostSession}`,
+      },
+      payload: { email },
+    });
+  const first = request("first@example.test");
+  await Promise.race([
+    started,
+    first.then(() => {
+      throw new Error("First request did not reach mail");
+    }),
+  ]);
+  let current: Meeting;
+  try {
+    assert.equal((await request("second@example.test")).statusCode, 200);
+    current = (await f.store.get(f.meeting.code))!;
+    assert.ok(current.emailOtpHash);
+  } finally {
+    rejectFirst(new Error("Synthetic timeout"));
+    await first;
+  }
+  assert.equal((await first).statusCode, 503);
+  const after = (await f.store.get(f.meeting.code))!;
+  assert.equal(after.hostEmail, "second@example.test");
+  assert.equal(after.emailOtpHash, current.emailOtpHash);
+  assert.equal(after.emailOtpExpiresAt, current.emailOtpExpiresAt);
+});
+
+test("core mail sends release their transport before store shutdown", async (t) => {
+  const f = await fixture(t);
+  const closed: string[] = [];
+  f.mail.close = () => {
+    closed.push("mail");
+  };
+  f.store.close = async () => {
+    closed.push("store");
+  };
+  const app = await f.app();
+  const response = await app.inject({
+    method: "POST",
+    url: `/api/meetings/${f.meeting.code}/host-email`,
+    headers: {
+      origin,
+      "x-requested-with": "MeetingPlatform",
+      cookie: `mp_${f.meeting.code}=${f.hostSession}`,
+    },
+    payload: { email: "next@example.test" },
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(f.emails.length, 1);
+  assert.deepEqual(closed, ["mail"]);
+  await app.close();
+  assert.deepEqual(closed, ["mail", "store"]);
 });
 
 test("token lookup reads only the authenticated meeting and never scans all meetings", async (t) => {

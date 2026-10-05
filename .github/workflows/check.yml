@@ -8,6 +8,20 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      mail_postgres:
+        image: postgres:17.11-alpine3.23
+        env:
+          POSTGRES_USER: mail_test
+          POSTGRES_PASSWORD: ci-only-mail-test-password
+          POSTGRES_DB: covemeet_mail_test
+        ports:
+          - "127.0.0.1:5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U mail_test -d covemeet_mail_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,6 +31,10 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm test
+      - name: Shared email budget concurrency and restart
+        run: node --import tsx --test packages/mail/test/budget-postgres.integration.test.ts
+        env:
+          MAIL_TEST_DATABASE_URL: postgres://mail_test:ci-only-mail-test-password@127.0.0.1:5432/covemeet_mail_test
       - name: Local network and relay validation helpers
         run: node --test scripts/local-network-test.test.mjs scripts/validation/browser-turn.test.mjs
       - run: npm run build

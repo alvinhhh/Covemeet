@@ -4,7 +4,7 @@ import { lstat, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { addAbortSignal, Readable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
-import type { Transporter } from "nodemailer";
+import { hasMail, type MailTransport } from "@meeting-platform/mail";
 import {
   EgressClient,
   EgressStatus,
@@ -62,7 +62,7 @@ export class RecordingService {
   constructor(
     private config: Config,
     private store: Store,
-    private mail: Transporter,
+    private mail: Pick<MailTransport, "sendMail"> | undefined,
     client?: RecorderClient,
     adapters?: {
       keyProvider?: KeyProvider;
@@ -76,7 +76,8 @@ export class RecordingService {
     this.available =
       config.recordingEnabled &&
       keyConfigured &&
-      !!config.smtpHost &&
+      hasMail(config) &&
+      !!mail &&
       !!config.livekitKey &&
       !!config.livekitSecret;
     // Recovery and retention must keep running when new recordings are disabled.
@@ -1064,7 +1065,7 @@ export class RecordingService {
     }
   }
   async link(m: Meeting, id: string) {
-    if (!this.available)
+    if (!this.available || !this.mail)
       throw new HttpError(503, "Recording is not configured");
     const credentials = await createDownloadCredentials();
     let expiresAt = Date.now() + 86400000;

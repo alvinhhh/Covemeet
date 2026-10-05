@@ -1,4 +1,5 @@
 import path from "node:path";
+import { loadMailConfig, mailbox } from "@meeting-platform/mail";
 export type Config = ReturnType<typeof loadConfig>;
 export function loadConfig(env = process.env) {
   const secret = env.SESSION_SECRET ?? "";
@@ -26,6 +27,20 @@ export function loadConfig(env = process.env) {
   const edition = env.EDITION === "hosted" ? "hosted" : "self-hosted";
   if (edition === "hosted" && (env.CREATION_KEY?.length ?? 0) < 32)
     throw new Error("Hosted mode requires a random CREATION_KEY.");
+  const mail = loadMailConfig(env, {
+    defaultFrom:
+      edition === "hosted" ? "meetings@covemeet.io" : "meetings@localhost",
+    defaultPort: 1025,
+  });
+  const sender = mailbox(mail.smtpFrom);
+  if (
+    edition === "hosted" &&
+    (/@(?:[^@]+\.)?covemeet\.com$/i.test(sender) ||
+      (mail.production && !/^[^@]+@covemeet\.io$/i.test(sender)))
+  )
+    throw new Error(
+      "Hosted production email must send from covemeet.io; covemeet.com cannot send automated mail",
+    );
   const recordingKeyProvider = env.RECORDING_KEY_PROVIDER ?? "local";
   if (!["local", "aws-kms"].includes(recordingKeyProvider))
     throw new Error("Unsupported recording key provider");
@@ -206,16 +221,10 @@ export function loadConfig(env = process.env) {
     recordingMaxBytes,
     recordingDir: path.resolve(env.RECORDING_DIR ?? "../../runtime/recordings"),
     egressFileRoot: env.EGRESS_FILE_ROOT ?? "/recordings",
-    smtpHost: env.SMTP_HOST ?? "",
-    smtpPort: Number(env.SMTP_PORT ?? 1025),
-    smtpFrom: env.SMTP_FROM ?? "meetings@localhost",
-    smtpSecure: env.SMTP_SECURE === "true",
-    smtpUser: env.SMTP_USER,
-    smtpPass: env.SMTP_PASS,
+    ...mail,
     trustProxy: env.TRUST_PROXY
       ? env.TRUST_PROXY.split(",").map((v) => v.trim())
       : (false as false | string[]),
-    production: env.NODE_ENV === "production",
     staticDir: path.resolve(env.STATIC_DIR ?? "../web/dist"),
   };
 }

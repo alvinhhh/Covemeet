@@ -10,7 +10,7 @@ import rateLimit from "@fastify/rate-limit";
 import staticFiles from "@fastify/static";
 import { existsSync } from "node:fs";
 import { randomUUID, randomInt } from "node:crypto";
-import nodemailer from "nodemailer";
+import { createMailBudget, createMailTransport } from "@meeting-platform/mail";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Meeting, Participant, Store } from "./store.js";
@@ -115,16 +115,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
       done(null, Object.fromEntries(fields));
     },
   );
-  const mail = nodemailer.createTransport({
-    host: config.smtpHost,
-    port: config.smtpPort,
-    secure: config.smtpSecure,
-    requireTLS: config.production,
-    tls: { rejectUnauthorized: true },
-    auth: config.smtpUser
-      ? { user: config.smtpUser, pass: config.smtpPass }
-      : undefined,
-  });
+  const mailBudget =
+    config.mailTransport === "ses" ? createMailBudget(config) : undefined;
+  const mail = createMailTransport(config, { budget: mailBudget });
   const recordings = new RecordingService(config, store, mail);
   const phone = new PhoneService(config, store, media);
   const phoneDialogs = new PhoneDialogService(config, store, media);
@@ -1236,24 +1229,41 @@ export async function createApp(config: Config, store: Store, media: Media) {
     "/api/meetings/:code/host-email",
     { config: { rateLimit: { max: 3, timeWindow: "10 minutes" } } },
     async (req) => {
-      if (!config.smtpHost) throw new HttpError(503, "Email is not configured");
+      if (!mail) throw new HttpError(503, "Email is not configured");
       const { email } = z.object({ email: z.email().max(254) }).parse(req.body);
       const m = await find(req);
       actor(req, m, true);
       const otp = String(randomInt(100000, 1000000));
+      const otpHash = keyedDigest(config.secret, `${m.code}:${otp}`);
+      const expiresAt = Date.now() + 600000;
       await store.change(m.code, (m) => {
         m.hostEmail = email;
         m.hostEmailVerified = false;
-        m.emailOtpHash = keyedDigest(config.secret, `${m.code}:${otp}`);
-        m.emailOtpExpiresAt = Date.now() + 600000;
+        m.emailOtpHash = otpHash;
+        m.emailOtpExpiresAt = expiresAt;
         m.emailOtpAttempts = 0;
       });
-      await mail.sendMail({
-        from: config.smtpFrom,
-        to: email,
-        subject: "Verify recording email",
-        text: `Verification code: ${otp}\nExpires in 10 minutes.`,
-      });
+      try {
+        await mail.sendMail({
+          from: config.smtpFrom,
+          to: email,
+          subject: "Verify recording email",
+          text: `Verification code: ${otp}\nExpires in 10 minutes.`,
+        });
+      } catch {
+        await store.change(m.code, (state) => {
+          if (
+            state.hostEmail === email &&
+            state.emailOtpHash === otpHash &&
+            state.emailOtpExpiresAt === expiresAt
+          ) {
+            delete state.emailOtpHash;
+            delete state.emailOtpExpiresAt;
+            delete state.emailOtpAttempts;
+          }
+        });
+        throw new HttpError(503, "Verification email failed. Try again.");
+      }
       return { ok: true };
     },
   );
@@ -1454,7 +1464,15 @@ export async function createApp(config: Config, store: Store, media: Media) {
     clearInterval(timer);
     media.close();
     await Promise.all([controlPass, filesPass]);
-    await store.close();
+    try {
+      await mail?.close();
+    } finally {
+      try {
+        await mailBudget?.close();
+      } finally {
+        await store.close();
+      }
+    }
   });
   return app;
 }

@@ -11,11 +11,11 @@
   },
   "scripts": {
     "dev": "concurrently -k -n api,web \"npm run dev -w apps/api\" \"npm run dev -w apps/web\"",
-    "build": "npm run build -w packages/recording && npm run build -w apps/api && npm run build -w apps/web && npm run build -w apps/phone",
-    "check": "npm run build -w packages/recording && npm run check --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
+    "build": "npm run build -w packages/mail && npm run build -w packages/recording && npm run build -w apps/api && npm run build -w apps/web && npm run build -w apps/phone",
+    "check": "npm run build -w packages/mail && npm run build -w packages/recording && npm run check --workspaces --if-present",
+    "test": "npm run build -w packages/mail && npm run test --workspaces --if-present",
     "setup": "node scripts/bootstrap.mjs",
-    "predev": "npm run build -w packages/recording",
+    "predev": "npm run build -w packages/mail && npm run build -w packages/recording",
     "test:sip": "node scripts/sip-test.mjs"
   },
   "devDependencies": {
