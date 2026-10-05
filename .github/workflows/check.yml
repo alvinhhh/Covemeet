@@ -17,6 +17,8 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm test
+      - name: Local network and relay validation helpers
+        run: node --test scripts/local-network-test.test.mjs scripts/validation/browser-turn.test.mjs
       - run: npm run build
       - name: Isolated phone admission and audio relay
         run: node scripts/phone-test.mjs

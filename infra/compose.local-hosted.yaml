@@ -24,6 +24,11 @@ services:
       CORE_CREATION_KEY: ${CREATION_KEY:?Run local setup}
       HOSTED_ADMIN_KEY: ${HOSTED_ADMIN_KEY:?Run local setup}
       SESSION_SECRET: ${HOSTED_SESSION_SECRET:?Run local setup}
+      HOSTED_DATABASE_URL: postgres://hosted:${HOSTED_POSTGRES_PASSWORD:?Run local setup}@portal-postgres:5432/hosted
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_SECURE: "false"
+      SMTP_FROM: covemeet@example.test
       TRUST_PROXY: ${CADDY_TRUSTED_IP:-}
     volumes:
       - ../runtime/local-tls/trust:/local-trust:ro
@@ -34,6 +39,8 @@ services:
     security_opt: [no-new-privileges:true]
     depends_on:
       core:
+        condition: service_healthy
+      portal-postgres:
         condition: service_healthy
     healthcheck:
       test:
@@ -47,3 +54,19 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+  portal-postgres:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_USER: hosted
+      POSTGRES_PASSWORD: ${HOSTED_POSTGRES_PASSWORD:?Run local setup}
+      POSTGRES_DB: hosted
+    volumes:
+      - local-hosted-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U hosted -d hosted"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+volumes:
+  local-hosted-postgres-data:

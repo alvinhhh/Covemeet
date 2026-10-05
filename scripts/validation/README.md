@@ -7,7 +7,7 @@ No browser, microphone, camera, audio source, speaker, or media playback is used
 ## Coverage
 
 - Waiting room media denial and host admission.
-- Cookie requirement at the gateway.
+- Cookie requirement, another participant's cookie rejection and foreign-Origin rejection at both `/rtc` and `/rtc/v1`; every stale-token reconnect check exercises both paths.
 - Lock rejection of new guests while admitted media remains connected.
 - Audio/video restrictions, stale-token rejection, and a real denied camera publication.
 - Breakout moves, return to main, closing breakout rooms, scoped chat, and broadcast.
@@ -17,6 +17,8 @@ No browser, microphone, camera, audio source, speaker, or media playback is used
 - Webinar viewer publication denial, presenter promotion, demotion, and rotated media authority.
 
 Each successful publisher must send actual RTP video bytes with DTLS connected and an SRTP cipher reported by the native SDK. The evidence records the negotiated cipher names; this does not assert end-to-end encryption or certification.
+
+The evidence also records the selected local ICE candidate type and relay protocol. `VALIDATION_TURN_TRANSPORT=udp` or `tls` disables direct ICE candidates and requires every successful video publisher to select an actual relay candidate with that transport. A direct path or different relay transport fails validation. Native TLS mode requires a client-trusted TURN/TLS endpoint advertised by the SFU. The pinned native SDK exposes no custom TURN CA option, and `NODE_EXTRA_CA_CERTS` covers Node HTTPS/WSS rather than the native WebRTC TLS implementation. Use the separate trusted-browser fixture for the local private CA; never enable insecure certificate policies to make a test pass.
 
 The SDK does not expose custom WebSocket headers. A temporary relay on `127.0.0.1` adds the test client's existing cookie and Origin, and puts its application-issued token in the browser client's query parameter, on its connection to the real gateway. It never signs tokens or bypasses application admission. An independent, privileged `RoomServiceClient` observes only rooms created by this run and removes them during cleanup.
 
@@ -55,6 +57,45 @@ docker run --rm --network covemeet-local-tls --user "$(id -u):$(id -g)" \
 Run the container with permission to read only the mounted test secrets and write the evidence directory. No Docker socket, host devices, host networking, or privileged mode is needed. The host must have the local certificate trusted separately for browser testing.
 
 Set `VALIDATION_RECORDING=true` to include the real recorder workflow, after enabling recording on the isolated stack. It verifies default-off behavior, a host OTP delivered only to local Mailpit, an active recorder, 30 seconds of silent video, encrypted-ready status, a 24-hour fragment link, the emailed password download, wrong-password denial, revocation, and recording disabled again. `VALIDATION_MAILPIT_URL` defaults to `http://mailpit:8025` and only accepts the local Mailpit service or a loopback host. The script never prints OTPs, recording passwords, or download capabilities. This check adds several minutes and does not inspect physical storage directly; correlate the recording ID with a separate ciphertext/raw-spool inspection when required.
+
+## Native UDP relay diagnostic
+
+The current local native run failed at connection setup: authenticated TURN grants and SFU candidates arrived, but the native client sent no relay candidate before timeout. This is not a passing UDP check; the cause remains unresolved. Use the browser variant below to test the route independently. Retain this command for diagnosis in an approved local environment, separately from other media runs.
+
+Enable the local embedded TURN fixture after ending active test calls:
+
+```sh
+node scripts/local.mjs start --hosted --turn
+docker build -t covemeet-media-validation scripts/validation
+docker run --rm --network container:covemeet-local-tls-livekit-1 --memory 512m --cpus 1 \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$PWD/runtime/local-tls/.env",dst=/secrets/local.env,readonly \
+  --mount type=bind,src="$PWD/runtime/local-tls/trust/root.crt",dst=/trust/root.crt,readonly \
+  --mount type=bind,src="$PWD/test-results",dst=/results \
+  -e VALIDATION_ENV_FILE=/secrets/local.env \
+  -e SITE_ORIGIN=https://meet.localhost:8443 \
+  -e VALIDATION_LIVEKIT_URL=http://livekit:7880 \
+  -e NODE_EXTRA_CA_CERTS=/trust/root.crt \
+  -e VALIDATION_TURN_TRANSPORT=udp \
+  -e VALIDATION_REPORT=/results/media-controls-turn-udp.json \
+  covemeet-media-validation
+```
+
+This fixture deliberately shares only the SFU's network namespace so its advertised loopback relay address resolves correctly; it has no Docker socket, host networking, devices or privileged mode. A passing run would verify authenticated local UDP relay selection and moderation using silent video, not TURN/TLS or traversal from an external restricted network. No certificate or trust-store change is needed. Run it separately from other media or recording tests on a resource-constrained laptop.
+
+## Local browser relay
+
+After `start --turn`, prepare a disposable meeting through the ordinary `/api/meetings` creation API using the protected creation key locally. Keep the operator key out of the browser. Open this fixture with the returned meeting code and one-use host token only in its fragment:
+
+```text
+https://meet.localhost:8443/__validation/turn.html#code=MEETING_CODE&host=ONE_USE_HOST_TOKEN
+```
+
+Use the trusted Yuxuan browser session and select **Run**. The page immediately removes the fragment, exchanges the one-use host capability for the ordinary host cookie, and connects through the admission-checked signaling gateway. The default TLS mode restricts the SDK's authenticated ICE servers to `turns:meet.localhost:15349`. To test UDP separately, prepare a fresh meeting link and append `&transport=udp` to the fragment; that mode allows only `turn:127.0.0.1:13478?transport=udp`. Both modes enforce relay-only ICE on every browser peer connection, publish a 160×90 synthetic canvas video, and require selected `relay` candidates with the requested transport plus increasing outbound RTP bytes and connected DTLS. It never opens a microphone/camera, creates audio, or attaches media playback. Results are visible on the page without credentials; preserve them in ignored test evidence. It disconnects and ends the disposable meeting in `finally`; `meetingEnded` must be true.
+
+LiveKit 1.13.7's embedded TURN advertisement always uses TLS port 443 ([upstream implementation](https://github.com/livekit/livekit/blob/v1.13.7/pkg/service/roommanager.go#L998-L1000)). This local fixture maps only that exact `meet.localhost:443` TLS URL to the published loopback port 15349; the authenticated username/password, hostname verification and TLS requirements remain unchanged. This mapping is confined to the test page and does not establish TURN fallback for the ordinary meeting UI on this local port layout. Sanitized ICE configuration counts, candidate types, error codes and states help diagnose failures without exposing credentials.
+
+This local browser check relies on the user's existing trust in the exact project CA. The fixture never installs trust or bypasses a certificate error. A passing run establishes this browser's selected local TURN route, not external firewall traversal, certificate renewal, protocol conformance, phone/SIP or capacity. UDP TURN still carries DTLS-SRTP media; it does not establish TLS protection of the client-to-TURN connection. Re-run after source or infrastructure changes.
 
 ## Results
 

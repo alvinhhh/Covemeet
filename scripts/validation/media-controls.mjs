@@ -23,10 +23,17 @@ const {
   TrackPublishOptions,
   TrackSource,
   VideoBufferType,
+  IceTransportType,
+  ContinualGatheringPolicy,
   dispose,
 } = await import("@livekit/rtc-node");
 const envPath = process.env.VALIDATION_ENV_FILE || ".env";
 const env = { ...parseEnv(await readFile(envPath, "utf8")), ...process.env };
+const forcedRelay = env.VALIDATION_TURN_TRANSPORT;
+assert(
+  !forcedRelay || ["udp", "tls"].includes(forcedRelay),
+  "VALIDATION_TURN_TRANSPORT must be udp or tls",
+);
 const apiOrigin =
   env.VALIDATION_API_URL || env.SITE_ORIGIN || "http://localhost:5173";
 const browserOrigin = env.SITE_ORIGIN || apiOrigin;
@@ -67,6 +74,9 @@ const report = {
   },
   scope:
     "Isolated meeting and webinar; authorization and media enforcement, not load or browser UX",
+  requiredMediaRoute: forcedRelay
+    ? `TURN/${forcedRelay.toUpperCase()} relay`
+    : "any ICE route",
   limitations: [
     "No audio is generated. Microphone restrictions are checked against signed grants and SFU permissions; audible/audio-packet delivery is not tested.",
   ],
@@ -217,18 +227,16 @@ async function relay(gatewayUrl, cookies, token) {
     upstream.on("open", () =>
       wss.handleUpgrade(req, socket, head, (client) => {
         sockets.add(client);
-        client.on(
-          "message",
-          (data, binary) =>
-            upstream.readyState === WebSocket.OPEN &&
-            upstream.send(data, { binary }),
-        );
-        upstream.on(
-          "message",
-          (data, binary) =>
-            client.readyState === WebSocket.OPEN &&
-            client.send(data, { binary }),
-        );
+        client.on("message", (data, binary) => {
+          observeSignal(data, binary, "client");
+          if (upstream.readyState === WebSocket.OPEN)
+            upstream.send(data, { binary });
+        });
+        upstream.on("message", (data, binary) => {
+          observeSignal(data, binary, "sfu");
+          if (client.readyState === WebSocket.OPEN)
+            client.send(data, { binary });
+        });
         const close = () => {
           client.terminate();
           upstream.terminate();
@@ -281,6 +289,17 @@ async function connect(client, grant) {
       room.connect(bridge.url, grant.token, {
         autoSubscribe: false,
         dynacast: false,
+        ...(forcedRelay
+          ? {
+              rtcConfig: {
+                iceTransportType: IceTransportType.TRANSPORT_RELAY,
+                // Keep the SDK default: authenticated ICE servers arrive after signaling joins.
+                continualGatheringPolicy:
+                  ContinualGatheringPolicy.GATHER_CONTINUALLY,
+                iceServers: [], // Retain the SFU's authenticated ICE server grants.
+              },
+            }
+          : {}),
       }),
       "SDK connection",
     );
@@ -355,12 +374,39 @@ async function publish(peer) {
           entry.stats.case === "transport" &&
           entry.stats.value.transport?.dtlsState === 2,
       )?.stats.value.transport;
-      return videoBytesSent > 0 && transport?.srtpCipher
+      const pair = stats.find(
+        (entry) =>
+          entry.stats.case === "candidatePair" &&
+          entry.stats.value.rtc?.id === transport?.selectedCandidatePairId,
+      )?.stats.value.candidatePair;
+      const candidate = stats.find(
+        (entry) =>
+          entry.stats.case === "localCandidate" &&
+          entry.stats.value.rtc?.id === pair?.localCandidateId,
+      )?.stats.value.candidate;
+      if (videoBytesSent > 0 && candidate && forcedRelay) {
+        assert.equal(
+          candidate.candidateType,
+          3,
+          "Media bypassed the required TURN relay",
+        );
+        assert.equal(
+          candidate.relayProtocol,
+          forcedRelay === "tls" ? 2 : 0,
+          `TURN media did not select ${forcedRelay.toUpperCase()} transport`,
+        );
+      }
+      return videoBytesSent > 0 && transport?.srtpCipher && candidate
         ? {
             videoBytesSent,
             dtlsConnected: true,
             dtlsCipher: transport.dtlsCipher,
             srtpCipher: transport.srtpCipher,
+            selectedCandidateType:
+              ["host", "srflx", "prflx", "relay"][candidate.candidateType] ??
+              "unknown",
+            relayProtocol:
+              ["udp", "tcp", "tls"][candidate.relayProtocol] ?? null,
           }
         : false;
     },
@@ -394,33 +440,45 @@ async function removed(peer, label) {
   });
   await close(peer);
 }
-async function deniedGateway(client, grant, label, withCookie = true) {
-  const target = new URL("/rtc", grant.url);
-  target.searchParams.set("access_token", grant.token);
-  const status = await bounded(
-    new Promise((resolve, reject) => {
-      const ws = new WebSocket(target, {
-        headers: {
-          Origin: browserOrigin,
-          ...(withCookie ? { Cookie: client.header() } : {}),
-        },
-        handshakeTimeout: 8000,
-      });
-      ws.on("unexpected-response", (_req, response) => {
-        resolve(response.statusCode);
-        response.resume();
-        ws.terminate();
-      });
-      ws.on("open", () => {
-        ws.terminate();
-        reject(new Error(`${label}: gateway admitted forbidden token`));
-      });
-      ws.on("error", reject);
-    }),
-    "gateway denial",
-  );
-  assert.equal(status, 403, label);
-  await checkpoint(label, { gatewayStatus: status });
+async function deniedGateway(
+  client,
+  grant,
+  label,
+  { withCookie = true, origin = browserOrigin, acceptedStatuses = [403] } = {},
+) {
+  const gatewayStatuses = {};
+  for (const path of ["/rtc", "/rtc/v1"]) {
+    const target = new URL(path, grant.url);
+    target.searchParams.set("access_token", grant.token);
+    const status = await bounded(
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(target, {
+          headers: {
+            Origin: origin,
+            ...(withCookie ? { Cookie: client.header() } : {}),
+          },
+          handshakeTimeout: 8000,
+        });
+        ws.on("unexpected-response", (_req, response) => {
+          resolve(response.statusCode);
+          response.resume();
+          ws.terminate();
+        });
+        ws.on("open", () => {
+          ws.terminate();
+          reject(new Error(`${label}: gateway admitted forbidden token`));
+        });
+        ws.on("error", reject);
+      }),
+      "gateway denial",
+    );
+    assert(
+      acceptedStatuses.includes(status),
+      `${label} at ${path}: received ${status}`,
+    );
+    gatewayStatuses[path] = status;
+  }
+  await checkpoint(label, { gatewayStatuses });
 }
 
 async function recordingCycle(client, code) {
@@ -606,7 +664,23 @@ try {
   await checkpoint("lobby blocks media credentials before host admission");
   await action(id, "admit");
   let grant = await media(guest);
-  await deniedGateway(guest, grant, "gateway requires session cookie", false);
+  await deniedGateway(guest, grant, "gateway requires session cookie", {
+    withCookie: false,
+  });
+  await deniedGateway(
+    host,
+    grant,
+    "gateway rejects another participant's session cookie",
+  );
+  await deniedGateway(
+    guest,
+    grant,
+    "gateway rejects a foreign browser origin",
+    {
+      origin: "https://untrusted.localhost:8443",
+      acceptedStatuses: [403, 502], // The gateway closes the foreign-Origin socket; Caddy returns 502.
+    },
+  );
   let peer = await connect(guest, grant);
   await publish(peer);
   await checkpoint(

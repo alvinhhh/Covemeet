@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Project-local HTTPS lifecycle. Never installs a CA, disables TLS checks, or deletes volumes.
-import { randomBytes, X509Certificate } from "node:crypto";
+import { createPrivateKey, randomBytes, X509Certificate } from "node:crypto";
 import { spawn } from "node:child_process";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import https from "node:https";
@@ -14,6 +14,7 @@ const runtime = resolve(root, "runtime/local-tls");
 const envPath = resolve(runtime, ".env");
 const statePath = resolve(runtime, "state.json");
 const certificatePath = resolve(runtime, "trust/root.crt");
+const turnPath = resolve(runtime, "turn");
 const command = process.argv[2] ?? "help";
 const flags = new Set(process.argv.slice(3));
 const allowedFlags = new Set([
@@ -22,6 +23,8 @@ const allowedFlags = new Set([
   "--recording",
   "--no-recording",
   "--no-build",
+  "--turn",
+  "--no-turn",
 ]);
 for (const flag of flags)
   if (!allowedFlags.has(flag)) throw new Error(`Unknown option: ${flag}`);
@@ -29,6 +32,8 @@ if (flags.has("--hosted") && flags.has("--self-hosted"))
   throw new Error("Select one local edition.");
 if (flags.has("--recording") && flags.has("--no-recording"))
   throw new Error("Select one recording mode.");
+if (flags.has("--turn") && flags.has("--no-turn"))
+  throw new Error("Select one local TURN mode.");
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 async function run(
@@ -61,7 +66,7 @@ async function run(
   });
 }
 
-async function setup() {
+async function setup(turn = false) {
   await mkdir(runtime, { recursive: true, mode: 0o700 });
   await chmod(runtime, 0o700);
   await mkdir(resolve(runtime, "trust"), { recursive: true, mode: 0o755 });
@@ -77,6 +82,7 @@ async function setup() {
     RECORDING_KEK: randomBytes(32).toString("base64"),
     HOSTED_ADMIN_KEY: secret(),
     HOSTED_SESSION_SECRET: secret(),
+    HOSTED_POSTGRES_PASSWORD: secret(),
   };
   try {
     await writeFile(
@@ -94,6 +100,15 @@ async function setup() {
   }
   await chmod(envPath, 0o600);
   const env = parseEnv(await readFile(envPath, "utf8"));
+  if (!Object.hasOwn(env, "HOSTED_POSTGRES_PASSWORD")) {
+    env.HOSTED_POSTGRES_PASSWORD = generated.HOSTED_POSTGRES_PASSWORD;
+    await writeFile(
+      envPath,
+      (await readFile(envPath, "utf8")).trimEnd() +
+        `\nHOSTED_POSTGRES_PASSWORD=${env.HOSTED_POSTGRES_PASSWORD}\n`,
+      { mode: 0o600 },
+    );
+  }
   for (const key of Object.keys(generated)) {
     if (!env[key] || !/^[A-Za-z0-9_+/=-]+$/.test(env[key]))
       throw new Error(`Invalid ${key} in local configuration.`);
@@ -135,7 +150,7 @@ async function setup() {
         "\n",
       { mode: 0o600 },
     );
-  const yaml = `# Generated project-local configuration. Do not commit.\nport: 7880\nbind_addresses: [0.0.0.0]\nrtc:\n  tcp_port: 17881\n  udp_port: 17882\n  node_ip: 127.0.0.1\n  use_external_ip: false\n  advertise_internal_ip: true\n  enable_loopback_candidate: true\nredis:\n  address: redis:6379\n  password: ${JSON.stringify(env.REDIS_PASSWORD)}\nkeys:\n  ${JSON.stringify(env.LIVEKIT_API_KEY)}: ${JSON.stringify(env.LIVEKIT_API_SECRET)}\nlogging:\n  level: warn\n`;
+  const yaml = `# Generated project-local configuration. Do not commit.\nport: 7880\nbind_addresses: [0.0.0.0]\nrtc:\n  tcp_port: 17881\n  udp_port: 17882\n  node_ip: 127.0.0.1\n  use_external_ip: false\n  advertise_internal_ip: true\n  enable_loopback_candidate: true\nredis:\n  address: redis:6379\n  password: ${JSON.stringify(env.REDIS_PASSWORD)}\nkeys:\n  ${JSON.stringify(env.LIVEKIT_API_KEY)}: ${JSON.stringify(env.LIVEKIT_API_SECRET)}\nturn:\n  enabled: ${Boolean(turn)}\n  tls_port: 15349\n  udp_port: 13478\n  domain: meet.localhost\n  cert_file: /local-turn/meet.localhost.crt\n  key_file: /local-turn/meet.localhost.key\n  relay_range_start: 19000\n  relay_range_end: 19063\n  ttl_seconds: 300\n  per_user_relay_allocation_limit: 4\n  allow_restricted_peer_cidrs: [127.0.0.1/32]\nlogging:\n  level: warn\n`;
   await writeFile(resolve(runtime, "livekit.yaml"), yaml, { mode: 0o600 });
   await chmod(resolve(runtime, "livekit.yaml"), 0o600);
   return env;
@@ -160,7 +175,7 @@ async function stopContainers(ids) {
 }
 
 async function configuration() {
-  let state = { hosted: false, recording: false };
+  let state = { hosted: false, recording: false, turn: false };
   try {
     state = JSON.parse(await readFile(statePath, "utf8"));
   } catch (error) {
@@ -172,8 +187,21 @@ async function configuration() {
     state.recording =
       flags.has("--recording") ||
       (!flags.has("--no-recording") && state.recording);
+    state.turn =
+      flags.has("--turn") || (!flags.has("--no-turn") && Boolean(state.turn));
   }
-  const secrets = await setup();
+  const secrets = await setup(state.turn);
+  if (state.turn && ["start", "setup"].includes(command)) {
+    try {
+      await readFile(
+        resolve(root, "node_modules/livekit-client/dist/livekit-client.umd.js"),
+      );
+    } catch {
+      throw new Error(
+        "The local browser fixture requires npm ci in the core repository before --turn.",
+      );
+    }
+  }
   const hostedSource = resolve(
     process.env.HOSTED_SOURCE_DIR ?? resolve(root, "../MeetingPlatformHosted"),
   );
@@ -197,6 +225,7 @@ async function configuration() {
     "infra/compose.local-tls.yaml",
   ];
   if (state.hosted) args.push("-f", "infra/compose.local-hosted.yaml");
+  if (state.turn) args.push("-f", "infra/compose.local-turn.yaml");
   if (state.recording) args.push("--profile", "recording");
   const compose = (extra, options = {}) =>
     run("docker", [...args, ...extra], { env, ...options });
@@ -239,6 +268,8 @@ async function request(
         timeout: 5000,
       },
       (response) => {
+        const certificateFingerprint =
+          response.socket.getPeerCertificate()?.fingerprint256;
         const chunks = [];
         let bytes = 0;
         response.on("data", (chunk) => {
@@ -253,6 +284,7 @@ async function request(
             headers: response.headers,
             body: Buffer.concat(chunks).toString("utf8"),
             protocol: response.socket?.getProtocol?.(),
+            certificateFingerprint,
           }),
         );
       },
@@ -267,6 +299,66 @@ async function request(
     req.on("error", reject);
     req.end();
   });
+}
+
+async function exportTurnLeaf(config) {
+  await mkdir(turnPath, { recursive: true, mode: 0o700 });
+  await chmod(turnPath, 0o700);
+  const ca = await readFile(certificatePath);
+  // Persistent CA files can exist before the recreated edge accepts TLS.
+  // Retry the same CA- and hostname-verified request; never relax validation.
+  const deadline = Date.now() + 30_000;
+  let endpoint;
+  while (!endpoint) {
+    try {
+      endpoint = await request(ca, "meet.localhost", "/");
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await sleep(500);
+    }
+  }
+  let previous;
+  try {
+    previous = new X509Certificate(
+      await readFile(resolve(turnPath, "meet.localhost.crt")),
+    ).fingerprint256;
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  for (const extension of ["crt", "key"]) {
+    const target = resolve(turnPath, `meet.localhost.${extension}.pending`);
+    await config.compose(
+      [
+        "cp",
+        `edge:/data/caddy/certificates/local/meet.localhost/meet.localhost.${extension}`,
+        target,
+      ],
+      { quiet: true },
+    );
+    await chmod(target, 0o600);
+  }
+  const leaf = new X509Certificate(
+    await readFile(resolve(turnPath, "meet.localhost.crt.pending")),
+  );
+  const key = createPrivateKey(
+    await readFile(resolve(turnPath, "meet.localhost.key.pending")),
+  );
+  if (
+    leaf.ca ||
+    !leaf.checkHost("meet.localhost") ||
+    !leaf.checkPrivateKey(key) ||
+    leaf.fingerprint256 !== endpoint.certificateFingerprint ||
+    Date.parse(leaf.validTo) < Date.now() + 300_000
+  )
+    throw new Error(
+      "Local TURN leaf certificate does not match the verified edge endpoint or is near expiry.",
+    );
+  for (const extension of ["crt", "key"])
+    await rename(
+      resolve(turnPath, `meet.localhost.${extension}.pending`),
+      resolve(turnPath, `meet.localhost.${extension}`),
+    );
+  return previous !== leaf.fingerprint256;
 }
 
 async function health(config) {
@@ -314,7 +406,11 @@ async function health(config) {
   );
   const allowed = {
     edge: ["8443/tcp"],
-    livekit: ["17881/tcp", "17882/udp"],
+    livekit: [
+      "17881/tcp",
+      "17882/udp",
+      ...(config.state.turn ? ["13478/udp", "15349/tcp"] : []),
+    ],
     mailpit: ["8025/tcp"],
   };
   for (const container of containers) {
@@ -369,7 +465,7 @@ async function health(config) {
 async function main() {
   if (command === "help") {
     console.log(
-      "node scripts/local.mjs setup|start|health|status|stop|certificate [--hosted|--self-hosted] [--recording|--no-recording] [--no-build]",
+      "node scripts/local.mjs setup|start|health|status|stop|certificate [--hosted|--self-hosted] [--recording|--no-recording] [--turn|--no-turn] [--no-build]",
     );
     console.log(
       "Start preserves the selected edition and recording mode unless changed explicitly. Stop preserves data and certificates. No command installs certificate trust.",
@@ -415,7 +511,10 @@ async function main() {
   }
   if (!flags.has("--no-build")) await config.compose(["build"]);
   if (!config.state.hosted)
-    await stopContainers(await projectContainers("portal"));
+    await stopContainers([
+      ...(await projectContainers("portal")),
+      ...(await projectContainers("portal-postgres")),
+    ]);
   await config.compose(["up", "-d", "--no-deps", "edge"]);
   let copied = false;
   const pendingCertificate = `${certificatePath}.pending`;
@@ -440,6 +539,8 @@ async function main() {
     );
   await chmod(pendingCertificate, 0o644);
   await rename(pendingCertificate, certificatePath);
+  const turnCertificateChanged =
+    config.state.turn && (await exportTurnLeaf(config));
   const edgeId = (
     await config.compose(["ps", "-q", "edge"], { quiet: true })
   ).text.trim();
@@ -464,6 +565,8 @@ async function main() {
       "egress",
     ]);
   await config.compose(["up", "-d", "--wait", "--wait-timeout", "120"]);
+  if (turnCertificateChanged)
+    await config.compose(["restart", "--timeout", "30", "livekit"]);
   await health(config);
   await certificate();
   console.log("Portal: https://portal.localhost:8443");

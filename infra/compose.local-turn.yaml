@@ -1,0 +1,13 @@
+# Optional local TURN fixture; no public or LAN relay endpoint.
+services:
+  livekit:
+    volumes:
+      - ../runtime/local-tls/turn:/local-turn:ro
+    ports:
+      - "127.0.0.1:13478:13478/udp"
+      - "127.0.0.1:15349:15349/tcp"
+  core:
+    volumes:
+      - ../scripts/validation/browser-turn.html:/app/apps/web/dist/__validation/turn.html:ro
+      - ../scripts/validation/browser-turn.mjs:/app/apps/web/dist/__validation/browser-turn.mjs:ro
+      - ../node_modules/livekit-client/dist/livekit-client.umd.js:/app/apps/web/dist/__validation/livekit-client.umd.js:ro

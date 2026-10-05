@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <title>TURN validation</title>
+  <style>
+    body {
+      font: 16px system-ui;
+      margin: 2rem;
+      max-width: 65rem;
+    }
+    button {
+      font: inherit;
+      padding: 0.5rem 1.5rem;
+    }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    canvas {
+      display: none;
+    }
+  </style>
+  <h1>TURN validation</h1>
+  <p id="description">
+    Publishes synthetic video through local TURN/TLS. No camera, microphone or
+    playback.
+  </p>
+  <button id="run" disabled>Run</button>
+  <pre id="results" role="status" aria-live="polite">Preparing</pre>
+  <canvas id="video" width="160" height="90" aria-hidden="true"></canvas>
+  <script src="./livekit-client.umd.js" defer></script>
+  <script src="./browser-turn.mjs" type="module"></script>
+</html>
