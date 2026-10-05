@@ -20,7 +20,7 @@ import { loadConfig } from "../../apps/api/dist/config.js";
 import { PgStore } from "../../apps/api/dist/store.js";
 import { LiveMedia } from "../../apps/api/dist/media.js";
 import { HttpAuthority } from "../../apps/phone/dist/authority.js";
-import { AriClient } from "../../apps/phone/dist/ari.js";
+import { AriClient, AriRequestError } from "../../apps/phone/dist/ari.js";
 import { SipSupervisor } from "../../apps/phone/dist/supervisor.js";
 import { SipHolding } from "../../apps/phone/dist/sip-holding.js";
 import { JournalRegistry } from "../../apps/phone/dist/journal.js";
@@ -600,13 +600,42 @@ async function run() {
             "SIP holding participant remains",
             "SIP cleanup requires reconciliation",
             "Unowned SIP holding resources require reconciliation",
+            "Invalid cleanup namespace",
           ];
           if (report.holdingCleanup.length < 40)
-            report.holdingCleanup.push(
-              known.includes(error?.message)
+            report.holdingCleanup.push({
+              message: known.includes(error?.message)
                 ? error.message
                 : "Holding cleanup failed",
-            );
+              kind:
+                error instanceof AriRequestError
+                  ? "ari"
+                  : error instanceof ServerError
+                    ? "livekit"
+                    : error instanceof TypeError
+                      ? "type"
+                      : "other",
+              status: Number.isInteger(error?.status)
+                ? error.status
+                : undefined,
+              code: [
+                "not_found",
+                "permission_denied",
+                "unauthenticated",
+                "unavailable",
+                "internal",
+              ].includes(error?.code)
+                ? error.code
+                : undefined,
+              sites:
+                error instanceof Error
+                  ? (
+                      error.stack?.match(
+                        /(?:sip-holding|rtc|ari)\.(?:ts|js):\d+:\d+/g,
+                      ) ?? []
+                    ).slice(0, 4)
+                  : [],
+            });
           throw error;
         }
       };
