@@ -4,7 +4,7 @@ Browser meeting software with an open-source core and hosted deployment. Follow 
 
 Use functional labels and concise UI copy. Keep hosted meeting codes random (130 bits); custom codes are self-hosted only. Guests have no account. Host privileges use separate capabilities. Enforce all moderation on the server and through the media signaling gateway, including reconnects. Recordings default off. Never store secrets, recordings, private runtime state, or personal data in Git.
 
-Run npm run check, npm test, and npm run build before committing substantive changes. Use separate meaningful commits and push to the existing private alvinhhh/Covemeet repository. Do not change its visibility without user instruction.
+Run npm run check, npm test, and npm run build before committing substantive changes. Use separate meaningful commits and push to the existing public alvinhhh/Covemeet repository. Keep proprietary hosted code in the private CovemeetHosted repository. Do not change either repository's visibility without user instruction.
 
 Browser tests use the Yuxuan Google session. Never play generated test tones on the user's speakers. Use silent video or an isolated non-playing test sink.
 

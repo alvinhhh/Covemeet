@@ -96,4 +96,4 @@ Pins were checked against official upstream sources on 2026-10-04. They are sele
 | Egress     | `v1.14.1`               | [Release](https://github.com/livekit/egress/releases/tag/v1.14.1)  |
 | Mailpit    | `v1.31.4`               | [Release](https://github.com/axllent/mailpit/releases/tag/v1.31.4) |
 
-The repositories remain private during development. The core uses Apache-2.0; public release still requires checking dependency obligations; Redis 8 has a choice of licenses that must be reviewed for the distribution and hosting model. [Redis licensing](https://redis.io/legal/licenses/)
+The core repository is public under Apache-2.0; the proprietary hosted repository remains private. Check dependency obligations for packaged releases: Redis 8 has a choice of licenses that must be reviewed for the distribution and hosting model. [Redis licensing](https://redis.io/legal/licenses/)
