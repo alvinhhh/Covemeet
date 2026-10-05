@@ -12,6 +12,10 @@ services:
       context: ${HOSTED_SOURCE_DIR:?Set the private hosted repository path}
       dockerfile: Dockerfile
       target: hosted-runtime
+    # Local opt-in only; this ignored file is never passed to core/media services.
+    env_file:
+      - path: ../runtime/local-tls/stripe-test.env
+        required: false
     environment:
       NODE_ENV: development
       HOST: 0.0.0.0
