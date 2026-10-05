@@ -26,10 +26,12 @@ The SDK does not expose custom WebSocket headers. A temporary relay on `127.0.0.
 
 `scripts/media-generation-test.mjs` runs two API instances against a temporary PostgreSQL database and real SFU. It holds an old participant-removal request, connects the replacement, then releases the old request. The replacement must keep the same SFU session, continue decoding silent video and retain its usage reservation. A second case closes the old API's database pool before releasing the request. That case tests lost database access, not a killed operating-system process.
 
-Build the current source and use its exact local image:
+Pull the pinned fixture dependencies, build the current source and use its exact local image. The runner does not pull images automatically.
 
 ```sh
 npm run build
+docker pull postgres:17.11-alpine3.23
+docker pull livekit/livekit-server:v1.13.7
 docker build -t covemeet-core:local .
 MEDIA_GENERATION_IMAGE="$(docker image inspect covemeet-core:local --format '{{.Id}}')" \
   node scripts/media-generation-test.mjs --execute-reviewed-fixture

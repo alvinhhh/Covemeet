@@ -23,6 +23,8 @@ jobs:
       - name: Delayed media cleanup regression
         timeout-minutes: 10
         run: |
+          docker pull postgres:17.11-alpine3.23
+          docker pull livekit/livekit-server:v1.13.7
           docker build -t covemeet-core:generation-test .
           MEDIA_GENERATION_IMAGE="$(docker image inspect covemeet-core:generation-test --format '{{.Id}}')" \
             node scripts/media-generation-test.mjs --execute-reviewed-fixture
