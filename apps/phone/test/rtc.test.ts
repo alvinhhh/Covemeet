@@ -44,14 +44,43 @@ const policy: CallPolicy = {
   expiresAt: Date.now() + 60000,
   grant,
 };
-function fixture() {
+function fixture(openHolding = false) {
+  const roomName = "phone-hold-1234567890123456";
   const events: string[] = [],
     opening = deferred(),
-    publishing = deferred();
+    publishing = deferred(),
+    holdingClosing = deferred(),
+    capture = deferred();
   let gateOpening = false,
     gatePublishing = false,
+    gateHoldingClose = false,
+    gateCapture = false,
+    failTrackCloses = 0,
     failDisconnects = 0,
     rooms = 0;
+  class FakeSource {
+    disposed = false;
+    clearQueue() {
+      if (this.disposed) {
+        events.push("flush-disposed");
+        throw new Error("AudioSource handle disposed");
+      }
+      events.push("flush");
+    }
+    async captureFrame() {
+      events.push("capture-start");
+      if (gateCapture) await capture.promise;
+      if (this.disposed) {
+        events.push("capture-disposed");
+        throw new Error("AudioSource handle disposed during capture");
+      }
+      events.push("capture-end");
+    }
+    async close() {
+      this.disposed = true;
+      events.push("source-close");
+    }
+  }
   class FakeRoom extends EventEmitter {
     name = "m_synthetic";
     remoteParticipants = new Map();
@@ -76,6 +105,7 @@ function fixture() {
   }
   const holding = new FakeRoom(),
     meeting = new FakeRoom();
+  if (openHolding) holding.name = roomName;
   const proxy = {
     url: "ws://127.0.0.1:1234",
     updateGrant() {},
@@ -88,17 +118,19 @@ function fixture() {
       rooms++;
       return rooms === 1 ? holding : meeting;
     },
-    source: () => ({
-      clearQueue() {
-        events.push("flush");
-      },
-      async close() {
-        events.push("source-close");
-      },
-    }),
-    track: () => ({
-      async close() {
+    source: () => new FakeSource(),
+    track: (name: string, source: FakeSource) => ({
+      async close(disposeSource: boolean) {
         events.push("track-close");
+        if (disposeSource) source.disposed = true;
+        if (name === "phone-return") {
+          events.push("holding-track-close");
+          if (gateHoldingClose) await holdingClosing.promise;
+        }
+        if (failTrackCloses > 0) {
+          failTrackCloses--;
+          throw new Error("uncertain track close");
+        }
       },
     }),
     mixer: () => ({
@@ -123,8 +155,10 @@ function fixture() {
     {
       holding: {
         url: "wss://private.example.test",
-        token: "placeholder",
-        roomName: "phone-hold-1234567890123456",
+        token: openHolding
+          ? `header.${Buffer.from(JSON.stringify({ sub: "relay", video: { room: roomName } })).toString("base64url")}.signature`
+          : "placeholder",
+        roomName,
         participantIdentity: "native",
       },
       meetingOrigin: "https://meet.example.test",
@@ -141,12 +175,23 @@ function fixture() {
     events,
     opening,
     publishing,
+    holdingClosing,
+    capture,
     meeting,
     setOpening() {
       gateOpening = true;
     },
     setPublishing() {
       gatePublishing = true;
+    },
+    setHoldingClose() {
+      gateHoldingClose = true;
+    },
+    setCapture() {
+      gateCapture = true;
+    },
+    failTrackClose(n: number) {
+      failTrackCloses = n;
     },
     failDisconnect(n: number) {
       failDisconnects = n;
@@ -219,6 +264,117 @@ test("uncertain repeated teardown rejects final close instead of acknowledging r
     /cleanup failed/,
   );
   await assert.rejects(f.bridge.close(), /cleanup failed/);
+});
+
+test("late gates after terminal close never flush disposed sources or publish again", async () => {
+  const f = fixture();
+  await f.bridge.meeting(grant, policy);
+  await f.bridge.close();
+  const published = f.events.filter(
+    (event) => event === "publish-start",
+  ).length;
+  const opened = f.events.filter((event) => event === "gateway-start").length;
+  assert.doesNotThrow(() => f.bridge.silence());
+  await Promise.resolve().then(() => f.bridge.silence());
+  await f.bridge.meeting(grant, policy);
+  await f.bridge.close();
+  assert.equal(f.events.includes("flush-disposed"), false);
+  assert.equal(
+    f.events.filter((event) => event === "publish-start").length,
+    published,
+  );
+  assert.equal(
+    f.events.filter((event) => event === "gateway-start").length,
+    opened,
+  );
+  assert.equal(f.bridge.needsReconnect, true);
+  assert.equal(f.failures(), 0);
+});
+
+test("late gates while native track disposal is pending remain safe and cannot restart media", async () => {
+  const f = fixture();
+  await f.bridge.meeting(grant, policy);
+  f.setHoldingClose();
+  const closing = f.bridge.close();
+  await until(() => f.events.includes("holding-track-close"));
+  const published = f.events.filter(
+    (event) => event === "publish-start",
+  ).length;
+  assert.doesNotThrow(() => f.bridge.silence());
+  await Promise.resolve().then(() => f.bridge.silence());
+  const lateMeeting = f.bridge.meeting(grant, policy);
+  f.holdingClosing.resolve();
+  await Promise.all([closing, lateMeeting]);
+  assert.equal(f.events.includes("flush-disposed"), false);
+  assert.equal(
+    f.events.filter((event) => event === "publish-start").length,
+    published,
+  );
+  assert.equal(f.bridge.needsReconnect, true);
+});
+
+test("failed meeting disconnect retains cleanup ownership without touching its disposed audio source", async () => {
+  const f = fixture();
+  await f.bridge.meeting(grant, policy);
+  f.failDisconnect(1);
+  await assert.rejects(
+    f.bridge.meeting(undefined, { ...policy, state: "waiting" }),
+    /cleanup failed/,
+  );
+  assert(f.events.includes("track-close"));
+  assert.doesNotThrow(() => f.bridge.silence());
+  const disconnects = f.events.filter((event) => event === "disconnect").length;
+  await f.bridge.close();
+  assert.equal(f.events.includes("flush-disposed"), false);
+  assert.equal(
+    f.events.filter((event) => event === "disconnect").length,
+    disconnects + 2,
+  );
+});
+
+test("source-safe late gating does not turn failed track cleanup into a successful close", async () => {
+  const f = fixture();
+  await f.bridge.meeting(grant, policy);
+  f.failTrackClose(2);
+  const closing = f.bridge.close();
+  await assert.rejects(closing, /cleanup failed/);
+  assert.doesNotThrow(() => f.bridge.silence());
+  await assert.rejects(f.bridge.close(), /cleanup failed/);
+  assert.equal(f.events.includes("flush-disposed"), false);
+  assert.equal(f.bridge.needsReconnect, true);
+});
+
+test("terminal close waits for the last holding capture before disposing its source", async () => {
+  const f = fixture(true);
+  f.setCapture();
+  await f.bridge.open();
+  await until(() => f.events.includes("capture-start"));
+  let closed = false;
+  const closing = f.bridge.close().then(() => {
+    closed = true;
+  });
+  try {
+    await delay(5);
+    assert.equal(closed, false);
+    assert.equal(f.events.includes("holding-track-close"), false);
+    assert.doesNotThrow(() => f.bridge.silence());
+  } finally {
+    f.capture.resolve();
+    await closing;
+  }
+  assert.equal(f.events.includes("capture-disposed"), false);
+  assert.equal(f.events.includes("flush-disposed"), false);
+  assert(
+    f.events.indexOf("capture-end") < f.events.indexOf("holding-track-close"),
+  );
+  assert.equal(f.events.filter((event) => event === "capture-start").length, 1);
+  const connects = f.events.filter((event) => event === "connect").length;
+  await assert.rejects(f.bridge.open(), /already closed/);
+  assert.equal(
+    f.events.filter((event) => event === "connect").length,
+    connects,
+  );
+  assert.equal(f.failures(), 0);
 });
 
 test("expected meeting disconnect gates and retires only the meeting leg", async () => {

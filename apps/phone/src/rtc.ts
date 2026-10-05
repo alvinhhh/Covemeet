@@ -42,6 +42,7 @@ interface MeetingLeg {
   room: Room;
   proxy: GatewayProxy;
   source?: AudioSource;
+  sourceDisposing?: boolean;
   track?: LocalAudioTrack;
   mixer: AudioMixer;
   readers: Map<string, Reader>;
@@ -171,6 +172,7 @@ export class RtcBridge implements AudioBridge {
     }
   };
   async open() {
+    if (this.closed) throw new Error("Phone relay already closed");
     validateHolding(this.config.holding, this.config.development);
     serviceUrl(
       this.config.meetingOrigin,
@@ -311,10 +313,15 @@ export class RtcBridge implements AudioBridge {
     );
   }
   silence() {
+    // Authority/notice callbacks may finish after terminal cleanup. The first
+    // close gates synchronously; later gates must not touch disposed SDK handles.
+    if (!this.closed) this.gateAudio();
+  }
+  private gateAudio() {
     if (this.current) {
       this.current.active = false;
       this.current.mixed.clear();
-      this.current.source?.clearQueue();
+      if (!this.current.sourceDisposing) this.current.source?.clearQueue();
     }
     this.holdingSource.clearQueue();
     for (const p of this.holding.remoteParticipants.values())
@@ -322,6 +329,7 @@ export class RtcBridge implements AudioBridge {
         publication.setSubscribed(false);
   }
   meeting(grant: MeetingGrant | undefined, policy: CallPolicy) {
+    if (this.closed) return Promise.resolve();
     this.silence();
     return this.enqueue(() => this.replaceMeeting(grant, policy));
   }
@@ -479,7 +487,7 @@ export class RtcBridge implements AudioBridge {
     leg.active = false;
     leg.abort.abort();
     leg.mixed.clear();
-    leg.source?.clearQueue();
+    if (!leg.sourceDisposing) leg.source?.clearQueue();
     this.holdingSource.clearQueue();
     // A timeout does not cancel SDK work. Await its settlement before disconnecting
     // so a late connect/publish cannot appear after a successful cleanup response.
@@ -493,6 +501,9 @@ export class RtcBridge implements AudioBridge {
       leg.mixer.aclose(),
     ]);
     await Promise.allSettled(leg.tasks);
+    // A failed disconnect retains this leg for retry, but track disposal may
+    // already have released its source. Keep cleanup ownership without flushing it.
+    leg.sourceDisposing = true;
     const tracks = await Promise.allSettled([
       leg.track ? leg.track.close(true) : leg.source?.close(),
     ]);
@@ -507,7 +518,7 @@ export class RtcBridge implements AudioBridge {
   close() {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.silence();
+    this.gateAudio();
     this.abort.abort();
     this.closePromise = this.enqueue(async () => {
       await Promise.allSettled(this.holdingPending);
@@ -516,11 +527,12 @@ export class RtcBridge implements AudioBridge {
         this.holding.disconnect(),
         ...Array.from(this.holdingReaders.values(), (r) => r.cancel()),
       ]);
-      const sources = await Promise.allSettled([
-        this.holdingPump,
-        this.holdingTrack.close(true),
-      ]);
-      if ([...results, ...sources].some((r) => r.status === "rejected"))
+      // Let the last captureFrame settle before disposing its source.
+      const pump = await Promise.allSettled([this.holdingPump]);
+      const sources = await Promise.allSettled([this.holdingTrack.close(true)]);
+      if (
+        [...results, ...pump, ...sources].some((r) => r.status === "rejected")
+      )
         throw new Error("Holding audio cleanup failed");
       this.holdingReaders.clear();
     });

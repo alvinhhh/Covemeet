@@ -1,5 +1,17 @@
 # Security review — 4 October 2026
 
+## Native SIP follow-up
+
+The experimental implementation now includes an Asterisk ARI supervisor and a separate native SIP holding room for each call. Earlier local native validation passed 17 checks, covering verified SIP TLS and mandatory SRTP on both PBX legs, waiting-room audio isolation, host admission and speaking controls, keypad actions, cleanup before capacity release, certificate/downgrade rejection, and repeated digit sequences. These results concern an isolated local fixture with generated audio; internal ARI/SFU control still uses development HTTP/WS. They do not establish carrier interoperability, deployment readiness, capacity or compliance.
+
+The follow-up review addressed pre-answer setup ordering and cleanup ownership: the native SIP service subscribes to an isolated silent return track before answering, while the original caller is bridged only after encryption verification. A late opening or failed setup retains its RTC teardown owner. Prompt cancellation waits for a pending playback creation before deleting it. Tests simulate delayed operations and failures without opening a real RTC connection. This review was not performed by Daybreak; a new Daybreak review of the native implementation is pending.
+
+The first GitHub native validation then exposed a late-callback crash during kick cleanup: the relay tried to clear a disposed SDK audio source. Terminal gates now avoid native handles after close begins; a failed meeting teardown retains its cleanup owner while skipping source flushes after disposal starts. The holding pump finishes its final capture before its source closes. Five additional regression cases reproduce these resource-lifetime failures with strict fake sources, including uncertain teardown and blocked reopening. The resulting 12-case RTC suite passes. Native validation must be rerun against the corrected source; the earlier 17-check result does not prove this correction.
+
+Ponytail's complexity review removed unused ARI originate variables, playback lookup and bridge-channel removal methods, plus an unused string-identity option in the validation observer. This simplification does not remove isolation checks or cleanup ownership.
+
+Two earlier native runs stopped unexpectedly during code entry. Later runs passed, including exact repeated-digit sequence checks, but the earlier cause remains unresolved. Durable orphan reconciliation, production private TLS, concurrent/redial isolation, carrier limits and recording/phone breakout behavior remain release gates in [the phone design](phone-sip-design.md#gates-before-real-dial-in). Phone access stays disabled by default.
+
 ## Phone foundation follow-up
 
 An independent code review of the experimental phone admission, host controls and isolated audio relay found a terminal-cleanup race: a delayed RTC connection or publication could finish after cleanup, and a failed teardown could lose its resource reference. The relay now serializes opening and closing, checks terminal state after asynchronous operations, retains failed legs, and waits for pending SDK work before acknowledging cleanup. A follow-up also found that failed initial holding setup could lose its cleanup evidence; opening errors now retain their bridge, and unknown cleanup outcomes withhold the reservation release. The 26 phone tests include deferred lifecycle and failed-opening regressions. This follow-up was not performed by Daybreak and does not extend the earlier review to a native SIP implementation.
