@@ -69,6 +69,8 @@ const report = {
   ],
   checks: [],
   cleanup: {},
+  journalCleanup: [],
+  holdingCleanup: [],
 };
 await mkdir(path.dirname(reportPath), { recursive: true });
 const save = () =>
@@ -378,6 +380,29 @@ async function run() {
     config.phoneGatewayKey,
     true,
   );
+  for (const method of ["journalStop", "journalFinish"]) {
+    const original = authority[method].bind(authority);
+    authority[method] = async (...args) => {
+      try {
+        const result = await original(...args);
+        if (report.journalCleanup.length < 40)
+          report.journalCleanup.push({
+            method,
+            result: "completed",
+            state: result.state,
+          });
+        return result;
+      } catch (error) {
+        if (report.journalCleanup.length < 40)
+          report.journalCleanup.push({
+            method,
+            result: "failed",
+            httpStatus: Number.isInteger(error?.status) ? error.status : null,
+          });
+        throw error;
+      }
+    };
+  }
   const observedAuthority = {
     async join(input) {
       phoneSession = await authority.join(input);
@@ -564,6 +589,27 @@ async function run() {
         sfu,
         journal,
       );
+      const closeHolding = holding.close.bind(holding);
+      holding.close = async () => {
+        try {
+          await closeHolding();
+        } catch (error) {
+          const known = [
+            "SIP outbound leg remains",
+            "SIP bridge remains",
+            "SIP holding participant remains",
+            "SIP cleanup requires reconciliation",
+            "Unowned SIP holding resources require reconciliation",
+          ];
+          if (report.holdingCleanup.length < 40)
+            report.holdingCleanup.push(
+              known.includes(error?.message)
+                ? error.message
+                : "Holding cleanup failed",
+            );
+          throw error;
+        }
+      };
       holdings.push(holding);
       return holding;
     },
@@ -736,13 +782,21 @@ async function run() {
     { ...blocked, ...(await quietHost(hostSink, "blocked keypad")) },
   );
   await hostAction("kick");
-  await until(
-    "kick closes PBX channels and native media",
-    async () =>
+  await until("kick closes PBX channels and native media", async () => {
+    const pbxChannels = (await ari.listChannels()).length;
+    const holdingParticipants = (await participants(nativeRooms[0].name))
+      .length;
+    report.kickCleanup = {
+      ...supervisor.status,
+      pbxChannels,
+      holdingParticipants,
+    };
+    return (
       supervisor.status.calls === 0 &&
-      (await ari.listChannels()).length === 0 &&
-      (await participants(nativeRooms[0].name)).length === 0,
-  );
+      pbxChannels === 0 &&
+      holdingParticipants === 0
+    );
+  });
   const reserve = await store.pool.query(
     "SELECT released FROM phone_calls WHERE participant_id=$1",
     [phoneSession.participantId],
@@ -885,7 +939,25 @@ try {
           )
         ? error.message
         : "Native SIP validation failed; inspect last checkpoint";
+  // Counts and fixed state fields make cleanup failures diagnosable without
+  // printing identities, PINs, tokens, request bodies or raw upstream errors.
+  const dialogs = await store
+    .queryPhoneDialogs({ pbxId: "native-fixture" })
+    .catch(() => undefined);
+  report.cleanupState = {
+    kick: report.kickCleanup,
+    journals: dialogs?.map((dialog) => ({
+      state: dialog.state,
+      uncertain: dialog.uncertain,
+      operations: dialog.operations,
+      hasMeeting: !!dialog.binding,
+      hasHolding: !!dialog.holding,
+    })),
+    journalRequests: report.journalCleanup,
+    holdingErrors: report.holdingCleanup,
+  };
   console.error(`FAIL ${report.failure}`);
+  console.error(`CLEANUP_STATE ${JSON.stringify(report.cleanupState)}`);
 } finally {
   cleaning = true;
   const cleanup = async (name, fn) => {
@@ -934,6 +1006,7 @@ try {
   report.keypadProof = keypadProof;
   if (report.result === "passed") delete report.pendingOperation;
   await save();
+  console.log(`CLEANUP_RESULTS ${JSON.stringify(report.cleanup)}`);
   clearTimeout(watchdog);
 }
 process.exit(report.result === "passed" ? 0 : 1);

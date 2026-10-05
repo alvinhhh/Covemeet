@@ -1,6 +1,7 @@
 import {
   AccessToken,
   RoomServiceClient,
+  ServerError,
   TokenVerifier,
   TrackSource,
 } from "livekit-server-sdk";
@@ -105,7 +106,7 @@ export class LiveMedia implements Media {
         p.id,
       );
     } catch (e) {
-      if (!/not found|does not exist/i.test(String(e))) throw e;
+      if (!(e instanceof ServerError && e.code === "not_found")) throw e;
     }
   }
   async end(m: Meeting) {
@@ -117,7 +118,7 @@ export class LiveMedia implements Media {
         try {
           await this.client.deleteRoom(room);
         } catch (e) {
-          if (!/not found|does not exist/i.test(String(e))) throw e;
+          if (!(e instanceof ServerError && e.code === "not_found")) throw e;
         }
   }
   attach(app: FastifyInstance) {
