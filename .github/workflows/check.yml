@@ -20,6 +20,19 @@ jobs:
       - name: Local network and relay validation helpers
         run: node --test scripts/local-network-test.test.mjs scripts/validation/browser-turn.test.mjs
       - run: npm run build
+      - name: Delayed media cleanup regression
+        timeout-minutes: 10
+        run: |
+          docker build -t covemeet-core:generation-test .
+          MEDIA_GENERATION_IMAGE="$(docker image inspect covemeet-core:generation-test --format '{{.Id}}')" \
+            node scripts/media-generation-test.mjs --execute-reviewed-fixture
+      - name: Media cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: media-generation-validation
+          path: test-results/media-generation/*.json
+          if-no-files-found: ignore
       - name: Isolated phone admission and audio relay
         run: node scripts/phone-test.mjs
       - name: Phone validation evidence

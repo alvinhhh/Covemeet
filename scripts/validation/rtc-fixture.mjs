@@ -26,7 +26,7 @@ export async function bounded(promise, label, ms = 12_000) {
   }
 }
 
-export function observe(room, identity) {
+export function observe(room, acceptsIdentity) {
   const stats = { frames: 0, nonzeroFrames: 0, peak: 0 };
   const readers = new Map();
   const tasks = [];
@@ -40,7 +40,7 @@ export function observe(room, identity) {
   const subscribed = (track, publication, participant) => {
     if (
       stopped ||
-      participant.identity !== identity() ||
+      !acceptsIdentity(participant.identity) ||
       track.kind !== TrackKind.KIND_AUDIO ||
       !publication.sid
     )

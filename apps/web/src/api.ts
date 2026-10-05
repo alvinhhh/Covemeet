@@ -34,6 +34,7 @@ export type Participant = {
   audioAllowed: boolean;
   videoAllowed: boolean;
   mediaVersion: number;
+  mediaIdentity?: string;
   breakoutId: string | null;
   enforcementPending?: boolean;
   transport: "browser" | "phone";
@@ -43,6 +44,12 @@ export type Participant = {
     canBanCallerId: boolean;
   };
 };
+
+export function participantMediaIdentity(
+  participant: Pick<Participant, "id" | "mediaIdentity">,
+): string {
+  return participant.mediaIdentity ?? participant.id;
+}
 
 export type PhoneAccess = {
   enabled: boolean;

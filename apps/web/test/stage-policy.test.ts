@@ -13,7 +13,7 @@ const members = (count: number) =>
 const cameras = (count: number): StageCandidate[] =>
   Array.from({ length: count }, (_, i) => ({
     key: `p${i}:camera`,
-    participantId: `p${i}`,
+    mediaIdentity: `p${i}`,
     source: "camera",
   }));
 
@@ -25,7 +25,7 @@ test("100-person meeting stays within 16 tiles on every page, keeps self visible
   for (let page = 0; page < first.pageCount; page++) {
     const selected = selectStage(tracks, people, context, page);
     assert(selected.visible.length <= 16);
-    assert(selected.visible.some((track) => track.participantId === "p0"));
+    assert(selected.visible.some((track) => track.mediaIdentity === "p0"));
     for (const track of selected.visible) seen.add(track.key);
   }
   assert.equal(seen.size, 100);
@@ -44,7 +44,7 @@ test("1000 webinar viewers do not create video placeholders or consume presenter
   }));
   const viewerTracks: StageCandidate[] = audience.map((member) => ({
     key: `${member.id}:camera`,
-    participantId: member.id,
+    mediaIdentity: member.id,
     source: "camera",
   }));
   const selected = selectStage(
@@ -56,7 +56,7 @@ test("1000 webinar viewers do not create video placeholders or consume presenter
   assert.equal(selected.visible.length, 10);
   assert.equal(selected.eligibleIds.size, 10);
   assert(
-    !selected.visible.some((track) => track.participantId.startsWith("viewer")),
+    !selected.visible.some((track) => track.mediaIdentity.startsWith("viewer")),
   );
 });
 
@@ -74,7 +74,7 @@ test("screen sharing gets bounded priority while overflow screens and cameras re
   assert(
     first.visible.slice(0, 2).every((track) => track.source === "screen_share"),
   );
-  assert.equal(first.visible[2].participantId, "p0");
+  assert.equal(first.visible[2].mediaIdentity, "p0");
   const seen = new Set<string>();
   for (let page = 0; page < first.pageCount; page++) {
     const selected = selectStage(tracks, people, context, page);
@@ -97,7 +97,7 @@ test("unknown, waiting, removed and other-room publishers are excluded; stale pa
   const selected = selectStage(cameras(6), people, context, 99);
   assert.equal(selected.page, 0);
   assert.deepEqual(
-    selected.visible.map((track) => track.participantId),
+    selected.visible.map((track) => track.mediaIdentity),
     ["p0", "p4"],
   );
   assert.equal(selectStage([], [], context, 0).pageCount, 1);
@@ -115,7 +115,7 @@ test("admitted phone callers retain audio eligibility without consuming video ti
   for (const caller of people.slice(10)) {
     assert(selected.eligibleIds.has(caller.id));
     assert(
-      !selected.visible.some((track) => track.participantId === caller.id),
+      !selected.visible.some((track) => track.mediaIdentity === caller.id),
     );
   }
 });
@@ -136,4 +136,54 @@ test("phone transport does not bypass admission, room isolation, or webinar view
   );
   assert.deepEqual([...selected.eligibleIds], ["p0"]);
   assert.equal(selected.visible.length, 0);
+});
+
+test("current media identities preserve logical self and roles while retiring old publishers", () => {
+  const people = [
+    { ...members(1)[0], mediaIdentity: "host-current" },
+    { ...members(2)[1], mediaIdentity: "guest-current" },
+    {
+      ...members(3)[2],
+      mediaIdentity: "phone-current",
+      transport: "phone" as const,
+    },
+    { ...members(4)[3] }, // Untouched legacy participant still uses its logical ID.
+  ];
+  const identities = [
+    "host-current",
+    "guest-current",
+    "phone-current",
+    "p3",
+    "p0",
+    "p1",
+    "host-retired",
+    "guest-retired",
+  ];
+  const tracks = identities.map((mediaIdentity) => ({
+    key: `${mediaIdentity}:camera`,
+    mediaIdentity,
+    source: "camera" as const,
+  }));
+  const selected = selectStage(tracks, people, context, 0);
+  assert.deepEqual(
+    [...selected.eligibleIds],
+    ["host-current", "guest-current", "phone-current", "p3"],
+  );
+  assert.deepEqual(
+    selected.visible.map((track) => track.mediaIdentity),
+    ["host-current", "guest-current", "p3"],
+  );
+  assert.equal(selected.visible[0].mediaIdentity, "host-current");
+  const next = selectStage(
+    tracks,
+    people.map((member) =>
+      member.id === "p1" ? { ...member, mediaIdentity: "guest-next" } : member,
+    ),
+    context,
+    0,
+  );
+  assert(!next.eligibleIds.has("guest-current"));
+  assert(
+    !next.visible.some((track) => track.mediaIdentity === "guest-current"),
+  );
 });

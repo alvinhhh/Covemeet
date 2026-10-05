@@ -1,3 +1,4 @@
+import { completeMediaFence } from "./media-identity.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Config } from "./config.js";
@@ -60,10 +61,7 @@ export const phoneMutations = [
 ] as const;
 export type PhoneMutation = (typeof phoneMutations)[number];
 export type PhoneMutationState =
-  | "pending"
-  | "confirmed"
-  | "rejected"
-  | "unknown";
+  "pending" | "confirmed" | "rejected" | "unknown";
 const mutation = z.enum(phoneMutations);
 const nativeIdentity = `sip_${createHash("sha256").update("covemeet-pbx").digest("hex").slice(0, 16)}`;
 const holdingSchema = z
@@ -326,10 +324,7 @@ export class PhoneDialogService {
       await this.media.remove(meeting, participant);
       await this.store.change(meeting.code, (state) => {
         const current = state.participants.find((p) => p.id === participant.id);
-        if (current?.mediaVersion === participant.mediaVersion) {
-          current.enforcementPending = false;
-          delete current.previousRoom;
-        }
+        if (current) completeMediaFence(current, participant);
       });
     }
     return stopped.dialog;

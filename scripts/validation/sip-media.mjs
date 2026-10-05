@@ -140,6 +140,8 @@ let app,
   hostRoom,
   phoneSession,
   lastPolicy;
+let phoneMediaIdentity;
+const phoneMediaIdentities = new Set();
 let joinedCount = 0,
   releaseAfterTeardown = false;
 const clients = [],
@@ -430,14 +432,24 @@ async function run() {
         }
         const row = await store.get(meeting.code);
         assert(
-          !(await participants(row.room)).some(
-            (p) => p.identity === session.participantId,
+          !(await participants(row.room)).some((p) =>
+            phoneMediaIdentities.has(p.identity),
           ),
           "Leave before meeting relay ended",
         );
         releaseAfterTeardown = true;
       }
       lastPolicy = await authority.action(session, callId, action);
+      if (lastPolicy.grant) {
+        phoneMediaIdentity = JSON.parse(
+          Buffer.from(
+            lastPolicy.grant.token.split(".")[1],
+            "base64url",
+          ).toString(),
+        ).sub;
+        assert.equal(typeof phoneMediaIdentity, "string");
+        phoneMediaIdentities.add(phoneMediaIdentity);
+      }
       return lastPolicy;
     },
   };
@@ -698,7 +710,7 @@ async function run() {
     true,
   );
   hostRoom = new Room();
-  const hostSink = observe(hostRoom, () => phoneSession?.participantId);
+  const hostSink = observe(hostRoom, (id) => phoneMediaIdentities.has(id));
   sinks.push(hostSink);
   await hostRoom.connect(hostGateway.url, grant.token, {
     autoSubscribe: true,
@@ -785,7 +797,7 @@ async function run() {
       promptNames.includes("covemeet-admitted") &&
       (await participants(row.room)).some(
         (p) =>
-          p.identity === phoneSession.participantId &&
+          p.identity === phoneMediaIdentity &&
           p.permission?.canPublish === false,
       ),
   );
@@ -830,7 +842,7 @@ async function run() {
       lastPolicy?.audioAllowed === false &&
       (await participants(row.room)).some(
         (p) =>
-          p.identity === phoneSession.participantId &&
+          p.identity === phoneMediaIdentity &&
           p.permission?.canPublish === false,
       ),
   );

@@ -870,7 +870,9 @@ try {
   const finalHostGrant = await media(host);
   peer = await connect(host, finalHostGrant);
   await publish(peer);
-  assert.equal(peer.id, hostIdentity.participantId);
+  const hostState = await host.call(route("/state"));
+  assert.equal(hostState.me.id, hostIdentity.participantId);
+  assert.equal(peer.id, hostState.me.mediaIdentity ?? hostState.me.id);
   if (env.VALIDATION_RECORDING === "true") {
     stage = "optional encrypted recording";
     await recordingCycle(host, code);

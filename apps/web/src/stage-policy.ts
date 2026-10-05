@@ -1,5 +1,8 @@
+import { participantMediaIdentity } from "./api";
+
 type StageMember = {
   id: string;
+  mediaIdentity?: string;
   role: "host" | "participant" | "viewer";
   status: string;
   breakoutId: string | null;
@@ -7,7 +10,7 @@ type StageMember = {
 };
 export type StageCandidate = {
   key: string;
-  participantId: string;
+  mediaIdentity: string;
   source: "camera" | "screen_share";
 };
 
@@ -30,19 +33,21 @@ export function selectStage<T extends StageCandidate>(
       member.breakoutId === context.breakoutId &&
       (context.mode !== "webinar" || member.role !== "viewer"),
   );
-  const roles = new Map(eligible.map((member) => [member.id, member.role]));
+  const roles = new Map(
+    eligible.map((member) => [participantMediaIdentity(member), member.role]),
+  );
   const phoneIds = new Set(
     eligible
       .filter((member) => member.transport === "phone")
-      .map((member) => member.id),
+      .map(participantMediaIdentity),
   );
   const tracks = [
     ...new Map(
       candidates
         .filter(
           (track) =>
-            roles.has(track.participantId) &&
-            !(track.source === "camera" && phoneIds.has(track.participantId)),
+            roles.has(track.mediaIdentity) &&
+            !(track.source === "camera" && phoneIds.has(track.mediaIdentity)),
         )
         .map((track) => [track.key, track]),
     ).values(),
@@ -50,15 +55,17 @@ export function selectStage<T extends StageCandidate>(
   tracks.sort((a, b) => {
     const priority = (track: T) =>
       (track.source === "screen_share" ? 0 : 2) +
-      (roles.get(track.participantId) === "host" ? 0 : 1);
+      (roles.get(track.mediaIdentity) === "host" ? 0 : 1);
     return priority(a) - priority(b) || a.key.localeCompare(b.key);
   });
   const pinned = tracks
     .filter((track) => track.source === "screen_share")
     .slice(0, PINNED_SCREEN_LIMIT);
+  const localMember = eligible.find((member) => member.id === context.localId);
+  const localIdentity = localMember && participantMediaIdentity(localMember);
   const selfCamera = tracks.find(
     (track) =>
-      track.participantId === context.localId && track.source === "camera",
+      track.mediaIdentity === localIdentity && track.source === "camera",
   );
   if (selfCamera) pinned.push(selfCamera);
   const pinnedKeys = new Set(pinned.map((track) => track.key));

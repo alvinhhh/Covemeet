@@ -4,6 +4,12 @@ import { randomUUID } from "node:crypto";
 import { AccessToken, ServerError } from "livekit-server-sdk";
 import { loadConfig } from "../src/config.js";
 import { LiveMedia } from "../src/media.js";
+import {
+  completeMediaFence,
+  fenceParticipantMedia,
+  mediaIdentity,
+} from "../src/media-identity.js";
+import type { WebSocket } from "ws";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 
 async function fixture(t: TestContext) {
@@ -253,4 +259,139 @@ test("media cleanup preserves unrecognized, authentication, service and network 
     );
     await assert.rejects(f.media.end(f.meeting), (caught) => caught === error);
   }
+});
+
+test("delayed duplicate physical removal cannot disconnect or authorize a successor generation", async (t) => {
+  const f = await fixture(t);
+  const second = new LiveMedia(f.config, f.store);
+  t.after(() => second.close());
+  const oldToken = await f.media.token(f.meeting, f.participant);
+  const retired = await f.store.change(f.meeting.code, (m) => {
+    fenceParticipantMedia(m, m.participants[0]!);
+    m.participants[0]!.videoAllowed = false;
+    return structuredClone(m);
+  });
+  const previous = retired.participants[0]!;
+  assert.equal(previous.previousMediaIdentity, f.participant.id);
+  assert.notEqual(mediaIdentity(previous), f.participant.id);
+  const physicalPeers = new Set([f.participant.id]);
+  let release!: () => void, entered!: () => void;
+  const delayed = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const requested = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  t.after(release);
+  second.client.removeParticipant = async (_room, identity) => {
+    entered();
+    await delayed;
+    physicalPeers.delete(identity);
+  };
+  f.media.client.removeParticipant = async (_room, identity) => {
+    physicalPeers.delete(identity);
+  };
+  const staleRemoval = second.remove(retired, previous);
+  await requested;
+  await f.media.remove(retired, previous);
+  await f.store.change(f.meeting.code, (m) => {
+    assert.equal(completeMediaFence(m.participants[0]!, previous), true);
+  });
+  const fresh = (await f.store.get(f.meeting.code))!,
+    successor = fresh.participants[0]!;
+  const successorId = mediaIdentity(successor);
+  physicalPeers.add(successorId);
+  let closed = false;
+  const socket = {
+    close: () => {
+      closed = true;
+    },
+    terminate: () => {},
+  } as unknown as WebSocket;
+  second.sockets.set(successorId, new Set([socket]));
+  const freshToken = await second.token(fresh, successor);
+  assert.equal((await second.verifier.verify(freshToken)).sub, successorId);
+  assert.equal((await second.authorize(freshToken)).p.id, f.participant.id);
+  await assert.rejects(second.authorize(oldToken));
+  // Even a current-version token addressed to the retired logical identity is denied.
+  await assert.rejects(
+    second.authorize(await f.signed({ version: successor.mediaVersion })),
+  );
+  release();
+  await staleRemoval;
+  // A delayed invocation (not only a delayed provider response) must also target the old map.
+  await second.remove(retired, previous);
+  assert.deepEqual([...physicalPeers], [successorId]);
+  assert.equal(closed, false);
+  assert.equal(second.sockets.get(successorId)?.has(socket), true);
+  await f.store.change(f.meeting.code, (m) => {
+    assert.equal(completeMediaFence(m.participants[0]!, previous), false);
+  });
+});
+
+test("overlapping restrictions keep the first retired room and identity until matching cleanup", async (t) => {
+  const f = await fixture(t),
+    m = f.meeting,
+    p = f.participant;
+  const breakout = { id: randomUUID(), name: "Breakout", room: randomUUID() };
+  m.breakouts.push(breakout);
+  fenceParticipantMedia(m, p);
+  p.breakoutId = breakout.id;
+  const first = structuredClone(p),
+    firstNextIdentity = mediaIdentity(p);
+  fenceParticipantMedia(m, p);
+  assert.equal(p.previousRoom, m.room);
+  assert.equal(p.previousMediaIdentity, p.id);
+  assert.notEqual(mediaIdentity(p), firstNextIdentity);
+  assert.equal(completeMediaFence(p, first), false);
+  const latest = structuredClone(p);
+  assert.equal(completeMediaFence(p, latest), true);
+  fenceParticipantMedia(m, p);
+  assert.equal(p.previousRoom, breakout.room);
+  assert.equal(p.previousMediaIdentity, mediaIdentity(latest));
+});
+
+test("legacy pending cleanup rotates before release and keeps delayed legacy removal off the successor", async (t) => {
+  const f = await fixture(t);
+  const pending = await f.store.change(f.meeting.code, (m) => {
+    const p = m.participants[0]!;
+    p.mediaVersion++;
+    p.enforcementPending = true;
+    p.previousRoom = m.room;
+    return structuredClone(m);
+  });
+  const old = pending.participants[0]!;
+  assert.equal(old.mediaIdentity, undefined);
+  const peers = new Set([old.id]);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  t.after(release);
+  f.media.client.removeParticipant = async (_room, identity) => {
+    await gate;
+    peers.delete(identity);
+  };
+  const delayed = f.media.remove(pending, old);
+  // Another process confirms the same original participant absent and completes the fence.
+  peers.delete(old.id);
+  await f.store.change(f.meeting.code, (m) => {
+    assert.equal(completeMediaFence(m.participants[0]!, old), true);
+  });
+  const current = (await f.store.get(f.meeting.code))!,
+    next = current.participants[0]!;
+  assert.equal(next.mediaVersion, old.mediaVersion + 1);
+  assert.notEqual(mediaIdentity(next), old.id);
+  assert.equal(next.enforcementPending, false);
+  peers.add(mediaIdentity(next));
+  release();
+  await delayed;
+  assert.deepEqual([...peers], [mediaIdentity(next)]);
+  assert.equal(
+    (await f.media.authorize(await f.media.token(current, next))).p.id,
+    old.id,
+  );
+  await assert.rejects(
+    f.media.authorize(await f.signed({ version: next.mediaVersion })),
+  );
 });

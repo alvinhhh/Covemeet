@@ -1,4 +1,9 @@
 import {
+  completeMediaFence,
+  fenceParticipantMedia,
+  mediaIdentity,
+} from "./media-identity.js";
+import {
   meetingAllowed,
   meetingDeadline,
   requireMeetingSeat,
@@ -52,8 +57,7 @@ export function revokePhoneParticipants(m: Meeting) {
   for (const p of m.participants)
     if (p.transport === "phone" && ["waiting", "admitted"].includes(p.status)) {
       p.status = "left";
-      p.mediaVersion++;
-      p.enforcementPending = true;
+      fenceParticipantMedia(m, p);
       p.phone!.leaseExpiresAt = 0;
       revoked.push(structuredClone(p));
     }
@@ -232,8 +236,7 @@ export class PhoneService {
       if (ended) {
         if (["waiting", "admitted"].includes(p.status)) {
           p.status = "left";
-          p.mediaVersion++;
-          p.enforcementPending = true;
+          fenceParticipantMedia(m, p);
         }
         p.phone.leaseExpiresAt = 0;
       } else {
@@ -251,8 +254,7 @@ export class PhoneService {
           p.role !== "viewer"
         ) {
           p.phone.muted = !p.phone.muted;
-          p.mediaVersion++;
-          p.enforcementPending = true;
+          fenceParticipantMedia(m, p);
         }
         if (body.action === "toggle-hand")
           p.phone.handRaised = !p.phone.handRaised;
@@ -263,7 +265,7 @@ export class PhoneService {
         ended,
       };
     });
-    const { meeting: m, participant: p, ended } = snapshot;
+    let { meeting: m, participant: p, ended } = snapshot;
     if (p.enforcementPending) {
       if (p.meter && !this.media.available)
         throw new HttpError(503, "Media cleanup is unavailable");
@@ -274,14 +276,22 @@ export class PhoneService {
         p.mediaVersion,
         p.meter,
       );
-      await this.store.change(code, (state) => {
-        const current = state.participants.find((x) => x.id === id);
-        if (current?.mediaVersion === p.mediaVersion) {
-          current.enforcementPending = false;
-          delete current.previousRoom;
-        }
+      const cleaned = await this.store.change(code, (state) => {
+        const current = state.participants.find((x) => x.id === id)!;
+        completeMediaFence(current, p);
+        return {
+          meeting: structuredClone(state),
+          participant: structuredClone(current),
+        };
       });
-      p.enforcementPending = false;
+      m = cleaned.meeting;
+      p = cleaned.participant;
+      if (p.enforcementPending)
+        throw new HttpError(503, "Phone media cleanup remains pending");
+      ended ||=
+        !meetingAllowed(m) ||
+        !["waiting", "admitted"].includes(p.status) ||
+        p.phone!.leaseExpiresAt <= Date.now();
     }
     if (body.action === "leave") {
       // The trusted gateway sends leave only after both audio legs are closed.
@@ -306,7 +316,7 @@ export class PhoneService {
                 x.expiresAt > Date.now() &&
                 (!x.phone || x.phone.leaseExpiresAt > Date.now()),
             )
-            .map((x) => x.id),
+            .map(mediaIdentity),
         }
       : undefined;
     return {
@@ -316,6 +326,7 @@ export class PhoneService {
           ? ("admitted" as const)
           : ("waiting" as const),
       mediaVersion: p.mediaVersion,
+      mediaIdentity: mediaIdentity(p),
       muted: p.phone!.muted,
       handRaised: p.phone!.handRaised,
       audioAllowed: p.role !== "viewer" && p.audioAllowed,

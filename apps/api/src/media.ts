@@ -1,4 +1,13 @@
 import {
+  completeMediaFence,
+  fenceParticipantMedia,
+  gatewayPresenceExpired,
+  GATEWAY_PRESENCE_MS,
+  mediaIdentity,
+  ownsGatewayConnection,
+  retiredMediaIdentity,
+} from "./media-identity.js";
+import {
   endMeeting,
   meetingAllowed,
   meetingDeadline,
@@ -50,7 +59,7 @@ export class LiveMedia implements Media {
       this.config.livekitKey,
       this.config.livekitSecret,
       {
-        identity: p.id,
+        identity: mediaIdentity(p),
         name: p.name,
         ttl: 120,
         metadata: JSON.stringify({ v: p.mediaVersion, code: m.code }),
@@ -87,13 +96,14 @@ export class LiveMedia implements Media {
       data = JSON.parse(c.metadata ?? "{}");
     } catch {}
     const m = data.code ? await this.store.get(data.code) : null;
-    const p = m?.participants.find((x) => x.id === c.sub);
+    const p = m?.participants.find((x) => mediaIdentity(x) === c.sub);
     if (
       !m ||
       !meetingAllowed(m) ||
       !p ||
       p.status !== "admitted" ||
       p.enforcementPending ||
+      gatewayPresenceExpired(p) ||
       (p.meter &&
         (p.meter.phase === "closing" || p.meter.fundedUntil <= Date.now())) ||
       p.expiresAt < Date.now() ||
@@ -106,14 +116,15 @@ export class LiveMedia implements Media {
     return { m, p };
   }
   async remove(m: Meeting, p: Participant) {
-    for (const ws of this.sockets.get(p.id) ?? [])
+    const identity = retiredMediaIdentity(p);
+    for (const ws of this.sockets.get(identity) ?? [])
       ws.close(4003, "Session changed");
-    this.sockets.delete(p.id);
+    this.sockets.delete(identity);
     if (!this.available) return;
     try {
       await this.client.removeParticipant(
         p.previousRoom ?? participantRoom(m, p),
-        p.id,
+        identity,
       );
     } catch (e) {
       if (!(e instanceof ServerError && e.code === "not_found")) throw e;
@@ -121,8 +132,12 @@ export class LiveMedia implements Media {
   }
   async end(m: Meeting) {
     for (const p of m.participants)
-      for (const ws of this.sockets.get(p.id) ?? [])
-        ws.close(4003, "Meeting ended");
+      for (const identity of new Set([
+        mediaIdentity(p),
+        retiredMediaIdentity(p),
+      ]))
+        for (const ws of this.sockets.get(identity) ?? [])
+          ws.close(4003, "Meeting ended");
     if (this.available)
       for (const room of [m.room, ...m.breakouts.map((b) => b.room)])
         try {
@@ -167,6 +182,32 @@ export class LiveMedia implements Media {
           });
           m = claimed.meeting;
           p = claimed.participant;
+        } else {
+          const expected = p;
+          const claimed = await this.store.change(m.code, (state) => {
+            const member = state.participants.find((x) => x.id === expected.id);
+            if (
+              !member ||
+              !meetingAllowed(state) ||
+              member.status !== "admitted" ||
+              member.enforcementPending ||
+              gatewayPresenceExpired(member) ||
+              member.mediaVersion !== expected.mediaVersion ||
+              mediaIdentity(member) !== mediaIdentity(expected) ||
+              member.expiresAt <= Date.now() ||
+              (member.phone && member.phone.leaseExpiresAt <= Date.now()) ||
+              !safeEqual(member.tokenHash, digest(cookie))
+            )
+              throw new HttpError(403, "Media session changed");
+            member.gatewayConnectionId = connectionId;
+            member.gatewayPresenceUntil = Date.now() + GATEWAY_PRESENCE_MS;
+            return {
+              meeting: structuredClone(state),
+              participant: structuredClone(member),
+            };
+          });
+          m = claimed.meeting;
+          p = claimed.participant;
         }
         wss.handleUpgrade(req, socket, head, (client) => {
           let closed = false;
@@ -179,9 +220,10 @@ export class LiveMedia implements Media {
             maxPayload: 1024 * 1024,
             handshakeTimeout: 4000,
           });
-          const set = this.sockets.get(p.id) ?? new Set<WebSocket>();
+          const identity = mediaIdentity(p);
+          const set = this.sockets.get(identity) ?? new Set<WebSocket>();
           set.add(client);
-          this.sockets.set(p.id, set);
+          this.sockets.set(identity, set);
           let authorized = false;
           let clientPongAt = Date.now(),
             upstreamPongAt = Date.now();
@@ -198,8 +240,30 @@ export class LiveMedia implements Media {
             upstream.terminate();
             client.terminate();
             set.delete(client);
-            if (!set.size) this.sockets.delete(p.id);
+            if (!set.size && this.sockets.get(identity) === set)
+              this.sockets.delete(identity);
             // The durable last-pong deadline survives socket/process loss.
+          };
+          const retireUnmetered = async () => {
+            // Persist a new physical identity before sending the destructive RPC.
+            // Ownership loss or a DB failure must never remove a same-identity successor.
+            const retired = await this.store.change(m.code, (state) => {
+              const current = state.participants.find((x) => x.id === p.id);
+              if (!current || !ownsGatewayConnection(current, p, connectionId))
+                return null;
+              if (!meetingAllowed(state)) endMeeting(state);
+              else fenceParticipantMedia(state, current);
+              return {
+                meeting: structuredClone(state),
+                participant: structuredClone(current),
+              };
+            });
+            if (!retired) return;
+            await this.remove(retired.meeting, retired.participant);
+            await this.store.change(m.code, (state) => {
+              const current = state.participants.find((x) => x.id === p.id);
+              if (current) completeMediaFence(current, retired.participant);
+            });
           };
           const checkExpiry = async () => {
             try {
@@ -242,38 +306,60 @@ export class LiveMedia implements Media {
                 expiryTimer.unref();
                 return;
               }
+              if (closed) return;
               const state = await this.store.get(m.code);
               const member = state?.participants.find((x) => x.id === p.id);
-              const deadline = member
-                ? Math.min(
-                    member.expiresAt,
-                    state ? meetingDeadline(state) : 0,
-                    member.phone?.leaseExpiresAt ?? Infinity,
-                  )
-                : 0;
               if (
                 !state ||
                 !member ||
+                !ownsGatewayConnection(member, p, connectionId)
+              )
+                return stop();
+              const deadline = Math.min(
+                member.expiresAt,
+                meetingDeadline(state),
+                member.phone?.leaseExpiresAt ?? Infinity,
+                member.gatewayPresenceUntil ?? 0,
+              );
+              if (
                 !meetingAllowed(state) ||
-                deadline <= Date.now()
+                member.status !== "admitted" ||
+                deadline <= Date.now() ||
+                Date.now() - Math.min(clientPongAt, upstreamPongAt) >=
+                  GATEWAY_PRESENCE_MS
               ) {
-                if (state && !state.ended && !meetingAllowed(state))
-                  await this.store.change(state.code, (current) => {
-                    if (!meetingAllowed(current)) endMeeting(current);
-                  });
                 stop();
-                await this.remove(m, p);
+                await retireUnmetered();
                 return;
               }
+              if (authorized) {
+                await this.store.change(m.code, (current) => {
+                  const live = current.participants.find((x) => x.id === p.id);
+                  if (
+                    !live ||
+                    !ownsGatewayConnection(live, p, connectionId) ||
+                    gatewayPresenceExpired(live) ||
+                    !meetingAllowed(current) ||
+                    live.status !== "admitted" ||
+                    live.expiresAt <= Date.now() ||
+                    (live.phone && live.phone.leaseExpiresAt <= Date.now())
+                  )
+                    throw new HttpError(403, "Media session changed");
+                  live.gatewayPresenceUntil = Date.now() + GATEWAY_PRESENCE_MS;
+                });
+                if (closed) return;
+              }
+              if (client.readyState === WebSocket.OPEN) client.ping();
+              if (upstream.readyState === WebSocket.OPEN) upstream.ping();
               expiryTimer = setTimeout(
                 () => void checkExpiry(),
-                Math.min(deadline - Date.now(), 2147483647),
+                Math.max(1, Math.min(5000, deadline - Date.now())),
               );
               expiryTimer.unref();
             } catch {
               stop();
-              // A replaced metered socket never removes its successor by identity.
-              if (!metered) await this.remove(m, p).catch(() => {});
+              if (!metered) await retireUnmetered().catch(() => {});
+              // Persisted presence survives a DB/gateway failure for worker cleanup.
             }
           };
           void checkExpiry();
@@ -294,7 +380,12 @@ export class LiveMedia implements Media {
           upstream.on("open", () => {
             opening = (async () => {
               try {
-                await this.authorize(token);
+                const fresh = await this.authorize(token);
+                if (
+                  !metered &&
+                  !ownsGatewayConnection(fresh.p, p, connectionId)
+                )
+                  throw new HttpError(403, "Media session changed");
                 if (closed) return;
                 if (metered)
                   await this.store.updateParticipantMeter(m.code, {
@@ -308,7 +399,7 @@ export class LiveMedia implements Media {
                 pending.length = 0;
               } catch {
                 stop();
-                if (!metered) await this.remove(m, p).catch(() => {});
+                if (!metered) await retireUnmetered().catch(() => {});
               }
             })();
           });
@@ -332,10 +423,13 @@ export class LiveMedia implements Media {
                     (current.meter?.connectionId !== connectionId ||
                       current.meter.phase !== "active" ||
                       current.meter.fundedUntil <= Date.now())) ||
-                  current.mediaVersion !== p.mediaVersion
+                  (!metered &&
+                    !ownsGatewayConnection(current, p, connectionId)) ||
+                  current.mediaVersion !== p.mediaVersion ||
+                  mediaIdentity(current) !== identity
                 ) {
                   stop();
-                  if (!metered) await this.remove(m, p).catch(() => {});
+                  if (!metered) await retireUnmetered().catch(() => {});
                   return;
                 }
                 if (client.readyState === WebSocket.OPEN)

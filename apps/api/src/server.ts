@@ -1,3 +1,9 @@
+import {
+  completeMediaFence,
+  fenceParticipantMedia,
+  gatewayPresenceExpired,
+  mediaIdentity,
+} from "./media-identity.js";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
 import rateLimit from "@fastify/rate-limit";
@@ -8,7 +14,6 @@ import nodemailer from "nodemailer";
 import { z } from "zod";
 import type { Config } from "./config.js";
 import type { Meeting, Participant, Store } from "./store.js";
-import { participantRoom } from "./store.js";
 import type { Media } from "./media.js";
 import { LiveMedia } from "./media.js";
 import {
@@ -288,10 +293,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         );
         await store.change(m.code, (state) => {
           const live = state.participants.find((x) => x.id === p.id);
-          if (live && live.mediaVersion === p.mediaVersion) {
-            live.enforcementPending = false;
-            delete live.previousRoom;
-          }
+          if (live) completeMediaFence(live, p);
         });
       } catch {
         failed = true;
@@ -631,6 +633,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         for (const p of state.participants) {
           p.enforcementPending = false;
           delete p.previousRoom;
+          delete p.previousMediaIdentity;
         }
       });
     } catch {
@@ -819,6 +822,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         audioAllowed: x.audioAllowed,
         videoAllowed: x.videoAllowed,
         mediaVersion: x.mediaVersion,
+        mediaIdentity: mediaIdentity(x),
         breakoutId: x.breakoutId,
         enforcementPending: !!x.enforcementPending,
       });
@@ -985,9 +989,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           p.expiresAt = p.phone.callExpiresAt;
         }
       } else {
-        p.previousRoom ??= participantRoom(m, p);
-        p.mediaVersion++;
-        p.enforcementPending = true;
+        fenceParticipantMedia(m, p);
         if (body.action === "kick" || body.action === "ban") {
           p.status = body.action === "ban" ? "banned" : "kicked";
           if (body.action === "ban") {
@@ -1063,9 +1065,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const m = await store.change(codeOf(req), (m) => {
       const p = actor(req, m);
       p.status = "left";
-      p.previousRoom ??= participantRoom(m, p);
-      p.mediaVersion++;
-      p.enforcementPending = true;
+      fenceParticipantMedia(m, p);
       who = structuredClone(p);
       return structuredClone(m);
     });
@@ -1081,6 +1081,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     await store.checkUsage(m.code, p.id);
     return {
       token: await media.token(m, p),
+      mediaIdentity: mediaIdentity(p),
       url: config.origin.replace(/^http/, "ws"),
     };
   });
@@ -1167,10 +1168,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
               409,
               "Wait for the previous room transfer to complete",
             );
-          p.previousRoom ??= participantRoom(m, p);
+          fenceParticipantMedia(m, p);
           p.breakoutId = body?.breakoutId ?? null;
-          p.mediaVersion++;
-          p.enforcementPending = true;
           moved.push(structuredClone(p));
         }
         if (route === "close-breakouts") m.breakouts = [];
@@ -1341,10 +1340,14 @@ export async function createApp(config: Config, store: Store, media: Media) {
                   (p.phone && p.phone.leaseExpiresAt <= Date.now()))
               ) {
                 p.status = "left";
-                p.mediaVersion++;
-                p.enforcementPending = true;
-                p.previousRoom ??= participantRoom(state, p);
+                fenceParticipantMedia(state, p);
               }
+            return structuredClone(state);
+          });
+        if (m.participants.some((p) => gatewayPresenceExpired(p)))
+          m = await store.change(m.code, (state) => {
+            for (const p of state.participants)
+              if (gatewayPresenceExpired(p)) fenceParticipantMedia(state, p);
             return structuredClone(state);
           });
         for (const p of m.participants.filter((p) => p.enforcementPending))

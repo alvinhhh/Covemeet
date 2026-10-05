@@ -22,6 +22,21 @@ The evidence also records the selected local ICE candidate type and relay protoc
 
 The SDK does not expose custom WebSocket headers. A temporary relay on `127.0.0.1` adds the test client's existing cookie and Origin, and puts its application-issued token in the browser client's query parameter, on its connection to the real gateway. It never signs tokens or bypasses application admission. An independent, privileged `RoomServiceClient` observes only rooms created by this run and removes them during cleanup.
 
+## Delayed cleanup regression
+
+`scripts/media-generation-test.mjs` runs two API instances against a temporary PostgreSQL database and real SFU. It holds an old participant-removal request, connects the replacement, then releases the old request. The replacement must keep the same SFU session, continue decoding silent video and retain its usage reservation. A second case closes the old API's database pool before releasing the request. That case tests lost database access, not a killed operating-system process.
+
+Build the current source and use its exact local image:
+
+```sh
+npm run build
+docker build -t covemeet-core:local .
+MEDIA_GENERATION_IMAGE="$(docker image inspect covemeet-core:local --format '{{.Id}}')" \
+  node scripts/media-generation-test.mjs --execute-reviewed-fixture
+```
+
+The test uses an internal Docker network with no published ports. It mounts the matching compiled phone gateway adapter and writes `test-results/media-generation/media-generation.json`. It does not restart the local installation. If teardown cannot be confirmed, `runtime/media-generation-test/owner.json` retains the exact project and image alongside its private configuration; recover that project before running again. Run this test separately from other media, phone or recording jobs on a laptop.
+
 ## Local development
 
 From the core repository:

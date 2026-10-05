@@ -1,3 +1,4 @@
+import { fenceParticipantMedia } from "./media-identity.js";
 import type { Meeting, Participant } from "./store.js";
 import { HttpError } from "./security.js";
 import { z } from "zod";
@@ -217,11 +218,7 @@ export function endMeeting(m: Meeting) {
   m.recordingAllowed = false;
   delete m.hostTokenHash;
   for (const p of m.participants) {
-    p.mediaVersion++;
-    p.enforcementPending = true;
-    p.previousRoom ??= p.breakoutId
-      ? (m.breakouts.find((b) => b.id === p.breakoutId)?.room ?? m.room)
-      : m.room;
+    fenceParticipantMedia(m, p);
   }
   for (const r of m.recordings)
     if (["starting", "recording", "stopping"].includes(r.status))

@@ -6,6 +6,11 @@ import { loadConfig } from "../src/config.js";
 import { createApp } from "../src/server.js";
 import { PgStore, type Meeting, type Participant } from "../src/store.js";
 import { LiveMedia, type Media } from "../src/media.js";
+import {
+  completeMediaFence,
+  fenceParticipantMedia,
+  mediaIdentity,
+} from "../src/media-identity.js";
 
 const databaseUrl = process.env.PHONE_TEST_DATABASE_URL;
 const origin = "http://localhost:5173";
@@ -683,6 +688,103 @@ test(
       (await f.stores[1].get(code))!.ended,
       true,
       "Renewal never revives an ended occurrence",
+    );
+  },
+);
+
+test(
+  "PostgreSQL retired identity remains fenced across API ownership loss and delayed physical removal",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account();
+    const created = await f.create(0, owner, randomUUID());
+    assert.equal(created.statusCode, 200, created.body);
+    const { code, hostToken } = created.json();
+    const started = await f.apps[0].inject({
+      method: "POST",
+      url: `/api/meetings/${code}/host`,
+      headers: browserHeaders,
+      payload: { token: hostToken },
+    });
+    assert.equal(started.statusCode, 200, started.body);
+    const id = started.json().participantId;
+    const firstConnection = randomUUID();
+    await f.stores[0].updateParticipantMeter(code, {
+      participantId: id,
+      mediaVersion: 1,
+      connectionId: firstConnection,
+      action: "claim",
+    });
+    const retired = await f.stores[0].change(code, (m) => {
+      fenceParticipantMedia(m, m.participants[0]!);
+      return structuredClone(m);
+    });
+    const snapshot = (await f.stores[1].get(code))!;
+    assert.equal(snapshot.participants[0]!.previousMediaIdentity, id);
+    const mediaA = new LiveMedia(f.config, f.stores[0]),
+      mediaB = new LiveMedia(f.config, f.stores[1]);
+    t.after(() => {
+      mediaA.close();
+      mediaB.close();
+    });
+    const peers = new Set([id]);
+    let release!: () => void, entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const requested = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    t.after(release);
+    mediaA.client.removeParticipant = async (_room, identity) => {
+      peers.delete(identity);
+    };
+    mediaB.client.removeParticipant = async (_room, identity) => {
+      entered();
+      await gate;
+      peers.delete(identity);
+    };
+    const delayed = mediaB.remove(snapshot, snapshot.participants[0]!);
+    await requested;
+    // Closing this API's DB pool cannot cancel a request already accepted by the provider.
+    await f.apps[1].close();
+    await mediaA.remove(retired, retired.participants[0]!);
+    const old = retired.participants[0]!;
+    await f.stores[0].settleParticipantMeter(
+      code,
+      id,
+      old.mediaVersion,
+      old.meter,
+    );
+    await f.stores[0].change(code, (m) => {
+      assert.equal(completeMediaFence(m.participants[0]!, old), true);
+    });
+    const nextConnection = randomUUID();
+    const current = await f.stores[0].updateParticipantMeter(code, {
+      participantId: id,
+      mediaVersion: old.mediaVersion,
+      connectionId: nextConnection,
+      action: "claim",
+    });
+    const successor = current.participant;
+    peers.add(mediaIdentity(successor));
+    release();
+    await delayed;
+    assert.deepEqual([...peers], [mediaIdentity(successor)]);
+    // Old accounting proof also cannot release the replacement's reservation.
+    await f.stores[0].settleParticipantMeter(
+      code,
+      id,
+      old.mediaVersion,
+      old.meter,
+    );
+    const preserved = (await f.stores[0].get(code))!.participants[0]!;
+    assert.equal(preserved.meter!.connectionId, nextConnection);
+    assert.equal(preserved.enforcementPending, false);
+    assert.equal(
+      preserved.meter!.fundedUntil - preserved.meter!.accountedAt,
+      30000,
     );
   },
 );

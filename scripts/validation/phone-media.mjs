@@ -171,6 +171,8 @@ let app,
   relayRun,
   phoneSession,
   lastPolicy;
+let phoneMediaIdentity;
+const phoneMediaIdentities = new Set();
 let nativeTerminated = false;
 let releaseAfterTeardown = false;
 const publishers = [],
@@ -222,7 +224,7 @@ async function scopedToken(identity) {
   });
   return token.toJwt();
 }
-function observe(room, identity) {
+function observe(room, acceptsIdentity) {
   const stats = { frames: 0, nonzeroFrames: 0, peak: 0 };
   const readers = new Map(),
     tasks = [];
@@ -235,7 +237,7 @@ function observe(room, identity) {
   const subscribed = (track, publication, participant) => {
     if (
       stopped ||
-      participant.identity !== identity() ||
+      !acceptsIdentity(participant.identity) ||
       track.kind !== TrackKind.KIND_AUDIO ||
       !publication.sid
     )
@@ -399,7 +401,7 @@ async function run() {
     true,
   );
   hostRoom = new Room();
-  const hostSink = observe(hostRoom, () => phoneSession?.participantId);
+  const hostSink = observe(hostRoom, (id) => phoneMediaIdentities.has(id));
   await bounded(
     hostRoom.connect(hostGateway.url, hostGrant.token, {
       autoSubscribe: true,
@@ -414,7 +416,7 @@ async function run() {
   const phoneAccess = await host.call(`/meetings/${meeting.code}/phone`, {});
   await sfu.createRoom({ name: holdingRoom, maxParticipants: 2 });
   nativeRoom = new Room();
-  const nativeSink = observe(nativeRoom, () => relayIdentity);
+  const nativeSink = observe(nativeRoom, (id) => id === relayIdentity);
   await bounded(
     nativeRoom.connect(holdingUrl.href, await scopedToken(nativeIdentity), {
       autoSubscribe: true,
@@ -445,14 +447,24 @@ async function run() {
           "Private leave must follow holding teardown",
         );
         assert(
-          !(await list(meetingRow.room)).some(
-            (participant) => participant.identity === session.participantId,
+          !(await list(meetingRow.room)).some((participant) =>
+            phoneMediaIdentities.has(participant.identity),
           ),
           "Private leave must follow meeting-media teardown",
         );
         releaseAfterTeardown = true;
       }
       lastPolicy = await authority.action(session, id, action);
+      if (lastPolicy.grant) {
+        phoneMediaIdentity = JSON.parse(
+          Buffer.from(
+            lastPolicy.grant.token.split(".")[1],
+            "base64url",
+          ).toString(),
+        ).sub;
+        assert.equal(typeof phoneMediaIdentity, "string");
+        phoneMediaIdentities.add(phoneMediaIdentity);
+      }
       return lastPolicy;
     },
   };
@@ -517,7 +529,7 @@ async function run() {
   );
   const mutedParticipant = await until("muted phone present at SFU", async () =>
     (await list(meetingRow.room)).find(
-      (p) => p.identity === phoneSession.participantId,
+      (p) => p.identity === phoneMediaIdentity,
     ),
   );
   assert.equal(mutedParticipant.permission?.canPublish, false);
@@ -564,7 +576,7 @@ async function run() {
   await hostAction("block-audio");
   await until("blocked receive-only phone reconnect", async () => {
     const p = (await list(meetingRow.room)).find(
-      (p) => p.identity === phoneSession.participantId,
+      (p) => p.identity === phoneMediaIdentity,
     );
     return (
       lastPolicy?.audioAllowed === false && p?.permission?.canPublish === false
@@ -605,8 +617,8 @@ async function run() {
     "both relay legs and native participant removed",
     async () =>
       nativeTerminated &&
-      !(await list(meetingRow.room)).some(
-        (p) => p.identity === phoneSession.participantId,
+      !(await list(meetingRow.room)).some((p) =>
+        phoneMediaIdentities.has(p.identity),
       ) &&
       (await list(holdingRoom)).length === 0,
   );

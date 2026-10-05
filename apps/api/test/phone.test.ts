@@ -4,6 +4,11 @@ import { randomUUID } from "node:crypto";
 import { loadConfig } from "../src/config.js";
 import { createApp } from "../src/server.js";
 import { LiveMedia } from "../src/media.js";
+import {
+  completeMediaFence,
+  fenceParticipantMedia,
+  mediaIdentity,
+} from "../src/media-identity.js";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import { RecordingService } from "../src/recordings.js";
 
@@ -864,4 +869,52 @@ test("ending with an unresolved phone reservation returns pending until verified
   );
   assert.equal(completed.statusCode, 200);
   assert.deepEqual(completed.json(), { ok: true, cleanupPending: false });
+});
+
+test("legacy pending phone cleanup returns the migrated grant and physical subscription roster", async (t) => {
+  const f = await fixture(t),
+    h = await f.host(),
+    c = await f.call(h);
+  assert.equal((await h.action(c.participantId, "admit")).statusCode, 200);
+  const old = (await c.update()).json();
+  const snapshot = await f.store.change(h.code, (m) => {
+    const host = m.participants.find((p) => p.role === "host")!;
+    fenceParticipantMedia(m, host);
+    completeMediaFence(host, structuredClone(host));
+    const phone = m.participants.find((p) => p.id === c.participantId)!;
+    phone.mediaVersion++;
+    phone.enforcementPending = true;
+    phone.previousRoom = m.room;
+    return structuredClone(m);
+  });
+  const response = await c.update();
+  assert.equal(response.statusCode, 200, response.body);
+  const policy = response.json();
+  assert.equal(policy.state, "admitted");
+  assert.notEqual(policy.mediaIdentity, c.participantId);
+  assert.equal(policy.mediaVersion, old.mediaVersion + 2);
+  assert.equal(
+    (await f.media.verifier.verify(policy.grant.token)).sub,
+    policy.mediaIdentity,
+  );
+  assert.equal(
+    (await f.media.authorize(policy.grant.token)).p.id,
+    c.participantId,
+  );
+  assert.deepEqual(policy.grant.subscribeParticipantIds, [
+    mediaIdentity(snapshot.participants.find((p) => p.role === "host")!),
+  ]);
+  await assert.rejects(f.media.authorize(old.grant.token));
+  const publicState = (
+    await f.browser("GET", `/api/meetings/${h.code}/state`, {}, h.cookie)
+  ).json();
+  assert.equal(
+    publicState.me.mediaIdentity,
+    policy.grant.subscribeParticipantIds[0],
+  );
+  assert.equal(
+    publicState.participants.find((p: Participant) => p.id === c.participantId)
+      .mediaIdentity,
+    policy.mediaIdentity,
+  );
 });

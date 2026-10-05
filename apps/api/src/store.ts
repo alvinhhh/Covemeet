@@ -1,3 +1,4 @@
+import { fenceParticipantMedia } from "./media-identity.js";
 import pg from "pg";
 import {
   canSettleMeter,
@@ -62,6 +63,10 @@ export type Participant = {
   audioAllowed: boolean;
   videoAllowed: boolean;
   mediaVersion: number;
+  mediaIdentity?: string;
+  previousMediaIdentity?: string;
+  gatewayConnectionId?: string;
+  gatewayPresenceUntil?: number;
   tokenHash: string;
   expiresAt: number;
   ipHash: string;
@@ -310,9 +315,7 @@ function revokeHostedMeeting(m: Meeting) {
     }
     p.tokenHash = "";
     p.status = "left";
-    p.previousRoom ??= participantRoom(m, p);
-    p.mediaVersion++;
-    p.enforcementPending = true;
+    fenceParticipantMedia(m, p);
   }
   for (const r of m.recordings) {
     if (["starting", "recording", "stopping"].includes(r.status))
@@ -362,8 +365,7 @@ function stopPhoneParticipant(
   if (dialog.state === "open") {
     if (["waiting", "admitted"].includes(participant.status))
       participant.status = "left";
-    participant.mediaVersion++;
-    participant.enforcementPending = true;
+    fenceParticipantMedia(meeting!, participant);
     participant.phone.leaseExpiresAt = 0;
   }
   return participant;

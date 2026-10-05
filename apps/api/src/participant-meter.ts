@@ -1,5 +1,5 @@
 import type { Meeting, Participant } from "./store.js";
-import { participantRoom } from "./store.js";
+import { fenceParticipantMedia } from "./media-identity.js";
 import {
   endMeeting,
   meetingAllowed,
@@ -135,9 +135,7 @@ export function sweepParticipantMeters(
         if (meter.fundedUntil <= now && p.role === "host" && !m.ended)
           endMeeting(m);
         if (!p.enforcementPending) {
-          p.previousRoom ??= participantRoom(m, p);
-          p.mediaVersion++;
-          p.enforcementPending = true;
+          fenceParticipantMedia(m, p);
         }
       } else if (meter.phase === "active") account(ledger, meter, now);
     }

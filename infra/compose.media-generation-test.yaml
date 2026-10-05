@@ -1,0 +1,56 @@
+# Disposable delayed-removal fixture. No host ports or existing installation data.
+services:
+  media-postgres:
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_USER: generation
+      POSTGRES_DB: covemeet_media_generation_test
+      POSTGRES_PASSWORD: ${MEDIA_TEST_DB_PASSWORD:?Use the guarded runner}
+    tmpfs: [/var/lib/postgresql/data]
+    mem_limit: 256m
+    cpus: 0.5
+    healthcheck:
+      test:
+        [CMD-SHELL, pg_isready -U generation -d covemeet_media_generation_test]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  media-livekit:
+    image: livekit/livekit-server:v1.13.7
+    command: [--config, /etc/livekit.yaml]
+    volumes:
+      - ../runtime/media-generation-test/livekit.yaml:/etc/livekit.yaml:ro
+    mem_limit: 256m
+    cpus: 0.5
+  media-runner:
+    image: ${MEDIA_GENERATION_IMAGE:?Use an explicitly reviewed core image digest}
+    command: [node, scripts/validation/media-generation.mjs]
+    environment:
+      MEDIA_GENERATION_IMAGE: ${MEDIA_GENERATION_IMAGE}
+      MEDIA_GENERATION_DATABASE_URL: postgresql://generation:${MEDIA_TEST_DB_PASSWORD}@media-postgres:5432/covemeet_media_generation_test
+      LIVEKIT_URL: http://media-livekit:7880
+      LIVEKIT_API_KEY: ${MEDIA_TEST_LIVEKIT_KEY}
+      LIVEKIT_API_SECRET: ${MEDIA_TEST_LIVEKIT_SECRET}
+      MEDIA_GENERATION_REPORT: /results/media-generation.json
+      RUST_LOG: error
+    volumes:
+      - ../scripts/validation/media-generation.mjs:/app/scripts/validation/media-generation.mjs:ro
+      # The existing core image contains its matching API and native SDK dependencies.
+      # Reuse only the compiled cookie adapter from the same checkout's required build.
+      - ../apps/phone/dist:/app/apps/phone/dist:ro
+      - ../test-results/media-generation:/results
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1
+    user: "${MEDIA_TEST_UID:-1000}:${MEDIA_TEST_GID:-1000}"
+    depends_on:
+      media-postgres:
+        condition: service_healthy
+      media-livekit:
+        condition: service_started
+networks:
+  default:
+    internal: true

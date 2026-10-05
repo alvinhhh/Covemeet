@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { EventEmitter } from "node:events";
 import { RoomEvent } from "livekit-client";
+import { participantMediaIdentity } from "../src/api.ts";
 import {
   audioSignal,
   observeAudioSignals,
@@ -88,4 +89,48 @@ test("room events refresh ongoing speech, remove departed peers, and detach on r
   room.state = "connected";
   room.emit(RoomEvent.ActiveSpeakersChanged, [local]);
   assert.equal(signals, detached);
+});
+
+test("speaking follows only the current physical identity and its logical host permission", () => {
+  const people = [
+    { id: "host", mediaIdentity: "host-current", audioAllowed: true },
+    { id: "guest", mediaIdentity: "guest-current", audioAllowed: false },
+    { id: "legacy", audioAllowed: true },
+  ];
+  const speaker = (identity: string) => ({
+    identity,
+    isMicrophoneEnabled: true,
+    isSpeaking: true,
+    audioLevel: 0.5,
+  });
+  const room = Object.assign(new EventEmitter(), {
+    state: "connected",
+    localParticipant: speaker("host-current"),
+    remoteParticipants: new Map(
+      ["host", "host-retired", "guest-current", "guest-retired", "legacy"].map(
+        (identity) => [identity, speaker(identity)],
+      ),
+    ),
+  });
+  let signals = new Map<string, AudioSignal>();
+  const stop = observeAudioSignals(
+    room,
+    new Set(people.map(participantMediaIdentity)),
+    new Set(
+      people
+        .filter((person) => person.audioAllowed)
+        .map(participantMediaIdentity),
+    ),
+    (value) => {
+      signals = value;
+    },
+  );
+  assert.deepEqual(
+    [...signals.keys()],
+    ["host-current", "guest-current", "legacy"],
+  );
+  assert.equal(signals.get("host-current")!.speaking, true);
+  assert.equal(signals.get("guest-current")!.speaking, false);
+  assert.equal(signals.get("legacy")!.speaking, true);
+  stop();
 });

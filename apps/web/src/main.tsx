@@ -29,6 +29,7 @@ import {
   ApiError,
   meetingPath,
   messageOf,
+  participantMediaIdentity,
   type Config,
   type MeetingState,
   type Participant,
@@ -1329,7 +1330,7 @@ function MediaStage({
   const selection = selectStage(
     tracks.map((track) => ({
       key: `${track.participant.identity}:${track.source}:${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`,
-      participantId: track.participant.identity,
+      mediaIdentity: track.participant.identity,
       source:
         track.source === Track.Source.ScreenShare
           ? ("screen_share" as const)
@@ -1350,18 +1351,22 @@ function MediaStage({
   const allowedAudioIds = participants
     .filter(
       (participant) =>
-        selection.eligibleIds.has(participant.id) && participant.audioAllowed,
+        selection.eligibleIds.has(participantMediaIdentity(participant)) &&
+        participant.audioAllowed,
     )
-    .map((participant) => participant.id)
+    .map(participantMediaIdentity)
     .sort()
     .join(",");
   const [signals, setSignals] = useState<Map<string, AudioSignal>>(new Map());
   const otherSpeakers = participants.filter(
     (participant) =>
-      selection.eligibleIds.has(participant.id) &&
+      selection.eligibleIds.has(participantMediaIdentity(participant)) &&
       participant.audioAllowed &&
-      signals.get(participant.id)?.speaking &&
-      !visible.some((track) => track.participant.identity === participant.id),
+      signals.get(participantMediaIdentity(participant))?.speaking &&
+      !visible.some(
+        (track) =>
+          track.participant.identity === participantMediaIdentity(participant),
+      ),
   );
   useEffect(
     () =>
@@ -1471,7 +1476,9 @@ function MediaStage({
           const signal = signals.get(track.participant.identity);
           const name =
             participants.find(
-              (participant) => participant.id === track.participant.identity,
+              (participant) =>
+                participantMediaIdentity(participant) ===
+                track.participant.identity,
             )?.name ||
             track.participant.name ||
             "Participant";
