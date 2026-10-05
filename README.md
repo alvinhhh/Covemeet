@@ -60,7 +60,7 @@ npm run build
 
 Bug reports and pull requests are welcome. Include steps to reproduce bugs, and run the checks above before submitting code changes.
 
-Covemeet Hosted is maintained separately and uses this core. Changes to meetings, media and self-hosting belong here.
+Covemeet Hosted is maintained separately and uses this as our base core. Any proposals to change features regarding meetings, media and self-hosting belong here.
 
 ## License
 
