@@ -60,7 +60,8 @@ export class RecordingService {
       !!config.smtpHost &&
       !!config.livekitKey &&
       !!config.livekitSecret;
-    if (this.available) {
+    // Recovery and retention must keep running when new recordings are disabled.
+    if (keyConfigured) {
       if (adapters?.keyProvider) this.provider = adapters.keyProvider;
       else {
         const keys: Record<string, Buffer> = Object.create(null);
@@ -112,18 +113,19 @@ export class RecordingService {
           },
         };
       }
-      if (config.recordingStorage === "s3")
-        this.objectStorage =
-          adapters?.objectStorage ??
-          new S3RecordingStorage({
-            bucket: config.recordingS3Bucket,
-            region: config.recordingS3Region,
-            endpoint: config.recordingS3Endpoint,
-            prefix: config.recordingS3Prefix,
-            forcePathStyle: config.recordingS3PathStyle,
-            allowInsecureLocalEndpoint: config.recordingS3AllowLocalHttp,
-            maxBytes: config.recordingMaxBytes,
-          });
+    }
+    if (config.recordingStorage === "s3") {
+      this.objectStorage =
+        adapters?.objectStorage ??
+        new S3RecordingStorage({
+          bucket: config.recordingS3Bucket,
+          region: config.recordingS3Region,
+          endpoint: config.recordingS3Endpoint,
+          prefix: config.recordingS3Prefix,
+          forcePathStyle: config.recordingS3PathStyle,
+          allowInsecureLocalEndpoint: config.recordingS3AllowLocalHttp,
+          maxBytes: config.recordingMaxBytes,
+        });
     }
     this.client =
       client ??
@@ -414,37 +416,39 @@ export class RecordingService {
       await this.stop(m, r.id);
   }
   async reconcile(m: Meeting) {
-    if (!this.available) return;
     for (const r of m.recordings) {
       if (this.working.has(r.id)) continue;
-      if (r.status === "ready" && r.createdAt < Date.now() - 7 * 86400000) {
-        await this.revoke(m, r.id);
-        if (r.metadata?.storage) {
-          if (!this.objectStorage)
-            throw new Error(
-              "Recording object storage is required for deletion",
-            );
-          await this.objectStorage.delete(
-            r.metadata.storage,
-            r.metadata,
-            this.context(m, r),
-          );
-        }
-        await this.removeFile(this.file(r));
-        await this.removeFile(this.file(r, true));
-        await this.store.change(m.code, (state) => {
-          const row = state.recordings.find((x) => x.id === r.id)!;
-          row.status = "deleted";
-          delete row.metadata;
-        });
-        continue;
-      }
       if (
+        r.status !== "ready" &&
         !["recording", "starting", "stopping", "encrypting"].includes(r.status)
       )
         continue;
       this.working.add(r.id);
       try {
+        if (r.status === "ready") {
+          if (r.createdAt < Date.now() - 7 * 86400000) {
+            await this.revoke(m, r.id);
+            if (r.metadata?.storage) {
+              if (!this.objectStorage)
+                throw new Error(
+                  "Recording object storage is required for deletion",
+                );
+              await this.objectStorage.delete(
+                r.metadata.storage,
+                r.metadata,
+                this.context(m, r),
+              );
+            }
+            await this.removeFile(this.file(r));
+            await this.removeFile(this.file(r, true));
+            await this.store.change(m.code, (state) => {
+              const row = state.recordings.find((x) => x.id === r.id)!;
+              row.status = "deleted";
+              delete row.metadata;
+            });
+          }
+          continue;
+        }
         if (r.status === "encrypting" && r.metadata) {
           await this.finishEncryption(m, r);
           continue;
@@ -485,8 +489,19 @@ export class RecordingService {
               ? "No published media was available to record"
               : "Recording did not complete";
           });
-        } else if (r.status === "stopping" || recovered) {
+        } else if (
+          r.status === "stopping" ||
+          recovered ||
+          !this.available ||
+          !m.recordingAllowed ||
+          m.ended
+        ) {
           await this.client.stopEgress(info.egressId);
+          await this.store.change(m.code, (state) => {
+            const row = state.recordings.find((x) => x.id === r.id)!;
+            if (["starting", "recording"].includes(row.status))
+              row.status = "stopping";
+          });
         } else if (
           info.status === EgressStatus.EGRESS_ACTIVE &&
           r.status === "starting"

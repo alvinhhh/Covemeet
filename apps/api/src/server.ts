@@ -835,6 +835,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
       active(m);
       actor(req, m, true);
       Object.assign(m, body);
+      if (body.recordingAllowed === false)
+        for (const r of m.recordings)
+          if (["starting", "recording", "stopping"].includes(r.status))
+            r.status = "stopping";
       return structuredClone(m);
     });
     if (body.recordingAllowed === false) await recordings.stopAll(m);
@@ -850,10 +854,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
         p.mediaVersion++;
         p.enforcementPending = true;
       }
+      for (const r of m.recordings)
+        if (["starting", "recording", "stopping"].includes(r.status))
+          r.status = "stopping";
       return structuredClone(m);
     });
-    await recordings.stopAll(m);
-    await media.end(m);
+    try {
+      await recordings.stopAll(m);
+    } finally {
+      await media.end(m);
+    }
     await store.audit(m.code, "host", "meeting.end");
     return { ok: true };
   });

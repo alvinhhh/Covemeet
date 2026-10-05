@@ -156,11 +156,14 @@ async function fixture(t: TestContext, status = "ready") {
     for await (const chunk of stream) parts.push(Buffer.from(chunk));
     return Buffer.concat(parts);
   }
+  const endedRooms: string[] = [];
   const media: Media = {
     available: true,
     token: async () => "unused",
     remove: async () => {},
-    end: async () => {},
+    end: async (meeting) => {
+      endedRooms.push(meeting.code);
+    },
     close() {},
   };
   async function app() {
@@ -193,6 +196,7 @@ async function fixture(t: TestContext, status = "ready") {
     link,
     collect,
     app,
+    endedRooms,
   };
 }
 
@@ -357,6 +361,78 @@ test("issuing a download link keeps the same host session valid through link exp
   const cookies = String(response.headers["set-cookie"]);
   assert.match(cookies, /HttpOnly/i);
   assert.match(cookies, /Max-Age=86400/);
+});
+
+test("turning recording off and ending a meeting persist stop intent with policy", async (t) => {
+  const f = await fixture(t, "recording");
+  const app = await f.app();
+  const request = (method: "PATCH" | "POST", path: string, payload: object) =>
+    app.inject({
+      method,
+      url: `/api/meetings/${f.meeting.code}${path}`,
+      headers: {
+        origin,
+        "x-requested-with": "MeetingPlatform",
+        cookie: `mp_${f.meeting.code}=${f.hostSession}`,
+      },
+      payload,
+    });
+  await request("PATCH", "", { recordingAllowed: false });
+  let state = (await f.store.get(f.meeting.code))!;
+  assert.equal(state.recordingAllowed, false);
+  assert.equal(state.recordings[0]!.status, "stopping");
+
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordings[0]!.status = "recording";
+  });
+  await request("POST", "/end", {});
+  state = (await f.store.get(f.meeting.code))!;
+  assert.equal(state.ended, true);
+  assert.equal(state.recordings[0]!.status, "stopping");
+  assert.deepEqual(f.endedRooms, [f.meeting.code]);
+});
+
+test("one expired recording failure does not block the next row", async (t) => {
+  const f = await fixture(t);
+  const next: Recording = {
+    id: randomUUID(),
+    status: "ready",
+    createdAt: Date.now() - 8 * day,
+  };
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordings[0]!.createdAt = Date.now() - 8 * day;
+    m.recordings.push(next);
+  });
+  const audit = f.store.audit.bind(f.store);
+  f.store.audit = async (code, actor, action, target) => {
+    if (target === f.recording.id)
+      throw new Error("Synthetic retention failure");
+    return audit(code, actor, action, target);
+  };
+  await f.service.reconcile((await f.store.get(f.meeting.code))!);
+  const [failed, completed] = (await f.store.get(f.meeting.code))!.recordings;
+  assert.equal(failed!.status, "ready");
+  assert.equal(completed!.status, "deleted");
+});
+
+test("retention continues after new recording and email are disabled", async (t) => {
+  const f = await fixture(t);
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordings[0]!.createdAt = Date.now() - 8 * day;
+  });
+  f.config.recordingEnabled = false;
+  f.config.smtpHost = "";
+  const restarted = new RecordingService(f.config, f.store, f.mail);
+  assert.equal(restarted.available, false);
+  await restarted.reconcile((await f.store.get(f.meeting.code))!);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.status,
+    "deleted",
+  );
+  await assert.rejects(
+    access(f.encrypted),
+    (error: any) => error.code === "ENOENT",
+  );
 });
 
 test("encrypted metadata survives a crash before raw spool removal", async (t) => {
@@ -665,7 +741,7 @@ test("object retention revokes access even during storage failure and retries de
     meeting.recordings[0]!.createdAt = Date.now() - 8 * day;
   });
   storage.failDelete = true;
-  await assert.rejects(service.reconcile((await f.store.get(f.meeting.code))!));
+  await service.reconcile((await f.store.get(f.meeting.code))!);
   assert.equal(await service.findToken(token, f.meeting.code), null);
   assert.equal(storage.objects.size, 1);
   storage.failDelete = false;

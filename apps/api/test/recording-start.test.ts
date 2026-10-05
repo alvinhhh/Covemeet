@@ -113,10 +113,39 @@ async function fixture(t: TestContext) {
     stops,
     controls,
     service,
+    client,
     row,
     reconcile,
   };
 }
+
+test("recovery stops capture after committed opt-out or global disable", async (t) => {
+  const f = await fixture(t);
+  await f.service.start(f.meeting);
+  assert.equal((await f.row()).status, "recording");
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordingAllowed = false;
+  });
+  await f.reconcile();
+  assert.equal((await f.row()).status, "stopping");
+  assert.deepEqual(f.stops, [f.jobs[0]!.egressId]);
+
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordingAllowed = true;
+    m.recordings[0]!.status = "recording";
+  });
+  f.config.recordingEnabled = false;
+  const restarted = new RecordingService(
+    f.config,
+    f.store,
+    {} as Transporter,
+    f.client,
+  );
+  assert.equal(restarted.available, false);
+  await restarted.reconcile((await f.store.get(f.meeting.code))!);
+  assert.equal((await f.row()).status, "stopping");
+  assert.deepEqual(f.stops, [f.jobs[0]!.egressId, f.jobs[0]!.egressId]);
+});
 
 test("audit failure after recorder start stops the remote job and retains its recovery ID", async (t) => {
   const f = await fixture(t);
