@@ -2675,7 +2675,7 @@ input[type="checkbox"] {
   object-fit: contain;
 }
 .conference .stage-footer {
-  padding: 12px 4px 4px;
+  padding: 18px 4px 8px;
   gap: 0;
   flex-shrink: 0;
 }
@@ -2708,10 +2708,10 @@ input[type="checkbox"] {
 .conference .meeting-bottom {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  gap: 16px;
+  gap: 24px;
   height: auto;
-  min-height: 92px;
-  padding: 16px 24px;
+  min-height: 110px;
+  padding: 22px 28px;
   background: #141414;
   border: 0;
 }
@@ -2732,19 +2732,22 @@ input[type="checkbox"] {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: 16px;
+  width: max-content;
+  max-width: 100%;
   min-width: 0;
+  justify-self: center;
 }
 .conference .stage-controls {
-  gap: 6px;
+  gap: 14px;
 }
 .conference .media-controls-slot {
   display: contents;
 }
 .conference .panel-tabs {
   margin: 0;
-  gap: 4px;
-  padding-left: 12px;
+  gap: 12px;
+  padding-left: 16px;
   border-left: 1px solid #414141;
 }
 .conference .stage-controls .button,
@@ -2755,10 +2758,11 @@ input[type="checkbox"] {
   justify-content: center;
   align-items: center;
   gap: 5px;
-  width: 70px;
-  min-width: 0;
-  min-height: 58px;
-  padding: 7px 4px;
+  width: auto;
+  min-width: 88px;
+  min-height: 64px;
+  padding: 10px 14px;
+  flex-shrink: 0;
   border: 1px solid transparent;
   border-radius: 12px;
   font-size: 12px;
@@ -2818,7 +2822,7 @@ input[type="checkbox"] {
 }
 .conference .meeting-bottom .end-button {
   justify-self: end;
-  min-height: 40px;
+  min-height: 48px;
   font-size: 12px;
   white-space: nowrap;
   color: #eeeeee;
@@ -2970,22 +2974,23 @@ input[type="checkbox"] {
 }
 @media (max-width: 1180px) {
   .conference .meeting-bottom {
-    grid-template-columns: 1fr auto;
-    gap: 12px;
-    padding: 14px 16px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 20px;
+    padding: 20px;
   }
   .conference .session-role {
     display: none;
   }
   .conference .meeting-dock {
-    justify-self: center;
+    flex-wrap: wrap;
+    gap: 24px;
   }
   .conference .meeting-panel {
     width: 310px;
   }
-  .conference .stage-controls .button,
-  .conference .panel-tabs button {
-    width: 64px;
+  .conference .panel-tabs {
+    padding-left: 0;
+    border-left: 0;
   }
 }
 @media (max-width: 900px) {
@@ -3020,23 +3025,24 @@ input[type="checkbox"] {
     display: flex;
     flex-wrap: wrap;
     justify-content: center;
-    gap: 10px;
+    gap: 18px;
+    padding: 20px 16px;
   }
   .conference .meeting-bottom .end-button {
     margin-left: auto;
   }
   .conference .meeting-dock {
-    flex: 1;
+    flex: 1 1 100%;
+    width: 100%;
   }
-  .conference .stage-controls .button,
-  .conference .panel-tabs button {
-    width: 58px;
-    font-size: 11px;
+  .conference .stage-controls,
+  .conference .panel-tabs {
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 100%;
   }
   .conference .stage-controls .button > span {
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 }
 @media (max-width: 680px) {
@@ -3105,45 +3111,50 @@ input[type="checkbox"] {
     display: none;
   }
   .conference .stage-footer {
-    padding: 8px 4px 0;
+    padding: 14px 4px 8px;
   }
   .conference .meeting-caption {
     font-size: 11px;
   }
   .conference .meeting-bottom {
-    padding: 12px 8px max(12px, env(safe-area-inset-bottom));
-    gap: 8px;
+    padding: 20px 12px max(20px, env(safe-area-inset-bottom));
+    gap: 16px;
   }
   .conference .meeting-dock {
     flex-wrap: wrap;
-    gap: 10px;
+    gap: 20px;
     flex-basis: 100%;
   }
-  .conference .stage-controls {
-    justify-content: center;
-    gap: 8px;
+  .conference .stage-controls,
+  .conference .panel-tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: min(100%, 440px);
+    gap: 12px;
   }
   .conference .stage-controls .button {
-    width: 64px;
-    min-height: 54px;
+    width: 100%;
+    min-width: 0;
+    min-height: 60px;
+    padding: 10px 8px;
     font-size: 12px;
   }
   .conference .panel-tabs {
-    gap: 4px;
     padding-left: 0;
     border: 0;
   }
   .conference .panel-tabs button {
-    width: 60px;
-    min-height: 44px;
-    padding: 4px;
+    width: 100%;
+    min-width: 0;
+    min-height: 54px;
+    padding: 8px;
     font-size: 11px;
     gap: 3px;
   }
   .conference .meeting-bottom .end-button {
     margin: 0;
-    min-height: 32px;
-    padding: 5px 10px;
+    min-height: 48px;
+    padding: 10px 16px;
   }
   .conference .meeting-panel {
     right: 8px;
@@ -3157,5 +3168,11 @@ input[type="checkbox"] {
   }
   .conference .video-pagination button {
     padding: 4px 6px;
+  }
+}
+@media (max-width: 430px) {
+  .conference .stage-controls,
+  .conference .panel-tabs {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
