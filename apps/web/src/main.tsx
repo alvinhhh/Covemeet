@@ -43,6 +43,7 @@ import { scheduledMeetingPending } from "./scheduled-status";
 import { BrandingEditor } from "./branding";
 import { selectStage } from "./stage-policy";
 import { observeAudioSignals, type AudioSignal } from "./audio-signal";
+import { DeviceCheck } from "./device-check";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
 let initialHostToken = location.pathname.startsWith("/host/")
@@ -750,6 +751,7 @@ function Meeting({
         <div className="joining-as">
           Joining as <strong>{state.me.name}</strong>
         </div>
+        <DeviceCheck />
         {error && <Notice>{error}</Notice>}
         <Button
           onClick={async () => {
@@ -818,17 +820,7 @@ function Prejoin({
         </a>
       </header>
       <div className="prejoin-grid">
-        <section className="camera-preview">
-          <div className="camera-ring">
-            <Icon name="camera-off" size={42} />
-          </div>
-          <h2>Camera and microphone are off</h2>
-          <p>Turn them on after you join.</p>
-          <span className="preview-label">
-            <Icon name="video" size={16} />
-            Devices off
-          </span>
-        </section>
+        <DeviceCheck />
         <section className="prejoin-form">
           <p className="eyebrow">JOIN MEETING</p>
           <h1>Enter the waiting room</h1>

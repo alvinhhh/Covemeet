@@ -704,21 +704,89 @@ textarea:focus {
   font-size: 17px;
   position: relative;
 }
-.camera-preview p {
-  font-size: 12px;
-  color: #919191;
-  position: relative;
-  margin-top: 9px;
+.device-check {
+  width: 100%;
+  min-width: 0;
+  text-align: left;
 }
-.preview-label {
+.camera-preview video:not([hidden]) {
   position: absolute;
-  bottom: 20px;
-  left: 23px;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+}
+.device-check-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px 12px;
+  align-items: end;
+  margin-top: 20px;
+}
+.device-check select {
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  padding: 10px;
+  border: 1px solid #d6d6d6;
+  border-radius: 7px;
+  background: white;
+  color: #323232;
+  font: inherit;
+}
+.device-check select:focus-visible {
+  outline: 3px solid #828282;
+  outline-offset: 3px;
+}
+.device-check .button {
+  min-height: 48px;
+}
+.microphone-check-level,
+.device-check-error {
+  grid-column: 1 / -1;
+  font-size: 13px;
+}
+.microphone-check-level {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   gap: 8px;
-  font-size: 11px;
-  color: #7c7c7c;
+}
+.microphone-check-level meter {
+  appearance: none;
+  width: 100%;
+  height: 12px;
+  border: 1px solid #d6d6d6;
+  border-radius: 6px;
+  background: #ececec;
+  overflow: hidden;
+}
+.microphone-check-level meter::-webkit-meter-bar {
+  background: #ececec;
+  border: 0;
+}
+.microphone-check-level meter::-webkit-meter-optimum-value {
+  background: #171717;
+}
+.microphone-check-level meter::-moz-meter-bar {
+  background: #171717;
+}
+.device-check-error {
+  padding: 10px;
+  border: 1px solid #d6d6d6;
+  border-radius: 7px;
+}
+.device-check-note {
+  margin-top: 16px;
+  color: #666;
+  font-size: 12px;
+}
+.center-card:has(.device-check) {
+  width: min(600px, 100%);
+}
+.center-card .device-check .camera-preview {
+  min-height: 220px;
 }
 .prejoin-form h1 {
   font-size: 28px;
@@ -1779,11 +1847,8 @@ input[type="checkbox"] {
   .camera-preview h2 {
     font-size: 14px;
   }
-  .camera-preview p {
-    font-size: 11px;
-  }
-  .preview-label {
-    display: none;
+  .device-check-controls {
+    grid-template-columns: minmax(0, 1fr);
   }
   .prejoin-form {
     padding-bottom: 35px;
