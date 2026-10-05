@@ -227,7 +227,13 @@ test(
       "Live ownership prevents another encryption attempt",
     );
     assert.ok(ownerPid > 0);
-    await second.pool.query("SELECT pg_terminate_backend($1)", [ownerPid]);
+    // With the default zero timeout PostgreSQL only confirms signal delivery;
+    // the successor must wait for the old session's advisory lock to be released.
+    const terminated = await second.pool.query(
+      "SELECT pg_terminate_backend($1, 5000) AS terminated",
+      [ownerPid],
+    );
+    assert.equal(terminated.rows[0]?.terminated, true);
     await successor.reconcile(stale!);
     const winner = (await second.get(meeting.code))!.recordings[0]!;
     assert.equal(winner.status, "ready");
