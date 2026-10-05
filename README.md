@@ -10,7 +10,7 @@ Built with React, TypeScript, LiveKit, Fastify, PostgreSQL and Redis.
 - **Host controls** for admitting guests, locking meetings, muting microphones, disabling cameras, kicking participants and banning them from a meeting.
 - **Breakout rooms** with separate chat, host announcements and return-to-main controls.
 - **Custom branding** with your own name, logo, background and landing page.
-- **Encrypted recordings** with password-protected, revocable 24-hour download links. Self-hosted installations can use their own recording keys.
+- **Optional encrypted recordings** with password-protected, revocable 24-hour download links. Self-hosted installations can use their own recording keys.
 - **Flexible setup** with custom meeting codes and separate domains for the control panel and meetings.
 
 ## Quick start
@@ -26,7 +26,7 @@ npm run dev
 
 Open [localhost:5173](http://localhost:5173), create a meeting and share the guest link and password. Join from another browser profile to try the lobby and host controls.
 
-The setup script generates `.env` and the local service configuration. Test emails appear in [Mailpit](http://localhost:8025). To edit branding, open the control panel and use the `CREATION_KEY` from `.env`.
+The setup script generates `.env` and the local service configuration. Use `CREATION_KEY` from `.env` when creating meetings or editing branding. Test emails appear in [Mailpit](http://localhost:8025).
 
 For a Docker setup with HTTPS and separate portal and meeting domains, follow the [local HTTPS guide](docs/local-https.md).
 
