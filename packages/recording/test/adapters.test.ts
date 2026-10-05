@@ -455,6 +455,98 @@ test("S3 rejects plaintext before uploading and aborts failed uploads without de
   );
 });
 
+test("S3 cancellation immediately closes a stalled response while the checked iterator is awaiting bytes", async (t) => {
+  const f = await fixture(t);
+  const fake = new ObjectStoreFake(),
+    storage = fake.adapter();
+  const ref = await storage.put(f.encrypted, f.metadata, context, f.provider);
+  const body = new Readable({ read() {} });
+  t.after(() => body.destroy());
+  const prefix = fake.objects.get(ref.key)!.bytes.subarray(0, 4093);
+  body.push(prefix);
+  const send = fake.send.bind(fake);
+  fake.send = async (command) => {
+    const response = await send(command);
+    if (command instanceof GetObjectCommand) {
+      response.Body.destroy();
+      response.Body = body;
+    }
+    return response;
+  };
+  const output = await storage.read(ref, f.metadata, context);
+  const iterator = output[Symbol.asyncIterator]();
+  assert.deepEqual((await iterator.next()).value, prefix);
+  const pending = iterator.next();
+  // Observe cancellation without leaving a rejected iterator promise unhandled.
+  const settled = pending.then(
+    () => undefined,
+    () => undefined,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  output.destroy();
+  assert.equal(
+    body.destroyed,
+    true,
+    "Cancellation must destroy the HTTP body before waiting for iterator completion",
+  );
+  await settled;
+});
+
+test("S3 forwards cancellation before GetObject responds and closes a late response", async (t) => {
+  const f = await fixture(t);
+  const fake = new ObjectStoreFake(),
+    storage = fake.adapter();
+  const ref = await storage.put(f.encrypted, f.metadata, context, f.provider);
+  const send = fake.send.bind(fake);
+  const controller = new AbortController();
+  let enter!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  let calls = 0;
+  fake.send = async (command, options?: { abortSignal?: AbortSignal }) => {
+    assert.ok(command instanceof GetObjectCommand);
+    assert.equal(options?.abortSignal, controller.signal);
+    calls++;
+    return new Promise((_resolve, reject) => {
+      controller.signal.addEventListener(
+        "abort",
+        () => reject(controller.signal.reason),
+        { once: true },
+      );
+      enter();
+    });
+  };
+  const pending = storage.read(ref, f.metadata, context, controller.signal);
+  const denied = assert.rejects(pending, { name: "AbortError" });
+  await entered;
+  controller.abort();
+  await denied;
+  await assert.rejects(
+    storage.read(ref, f.metadata, context, controller.signal),
+    { name: "AbortError" },
+  );
+  assert.equal(calls, 1, "An already-aborted read must not send GetObject");
+
+  const late = new AbortController();
+  const response = await send(
+    new GetObjectCommand({
+      Bucket: "private-recordings",
+      Key: ref.key,
+      IfMatch: ref.etag,
+    }),
+  );
+  fake.send = async (_command, options?: { abortSignal?: AbortSignal }) => {
+    assert.equal(options?.abortSignal, late.signal);
+    late.abort(); // The SDK may already have resolved its response when cancellation arrives.
+    return response;
+  };
+  await assert.rejects(storage.read(ref, f.metadata, context, late.signal), {
+    name: "AbortError",
+  });
+  assert.equal(response.Body.destroyed, true);
+});
+
 test("S3 refuses unencrypted remote endpoints, unsafe prefixes, and excessive object sizes", () => {
   const base = { bucket: "private-recordings", region: "us-east-1" };
   for (const endpoint of [

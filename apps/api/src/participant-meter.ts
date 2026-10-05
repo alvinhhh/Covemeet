@@ -21,7 +21,12 @@ export type ParticipantMeter = {
 };
 export type UsageLedger = {
   anchorAt: number;
-  windows: { start: number; end: number; usedMs: number }[];
+  windows: {
+    start: number;
+    end: number;
+    usedMs: number;
+    recordingDownloadBytesUsed?: number;
+  }[];
 };
 export type MeterAction = "claim" | "connected" | "heartbeat";
 export type MeterInput = {
@@ -152,6 +157,10 @@ export function usageView(
     ledger.windows.find((w) => w.start === window.start)?.usedMs ?? 0;
   const reserved = held(ledger, meetings, window.start);
   const limit = (grant?.quota?.participantSecondsPerMonth ?? 0) * 1000;
+  const downloadLimit = grant?.quota?.downloadBytesPerMonth ?? 0;
+  const downloadUsed =
+    ledger.windows.find((w) => w.start === window.start)
+      ?.recordingDownloadBytesUsed ?? 0;
   return {
     ok: true as const,
     window,
@@ -161,9 +170,39 @@ export function usageView(
       reserved: Math.ceil(reserved / 1000),
       available: Math.floor(Math.max(0, limit - used - reserved) / 1000),
     },
+    recordingDownloadBytes: {
+      limit: downloadLimit,
+      used: downloadUsed,
+      available: Math.max(0, downloadLimit - downloadUsed),
+    },
     asOf: now,
     blocked: usageBlocked(grant, meetings, now) || used + reserved > limit,
   };
+}
+
+export function debitDownloadBytes(
+  ledger: UsageLedger,
+  grant: HostedEntitlement,
+  plaintextBytes: number,
+  now: number,
+) {
+  if (!Number.isSafeInteger(plaintextBytes) || plaintextBytes < 0)
+    throw new HttpError(503, "Recording size is unavailable");
+  const window = usageWindow(ledger.anchorAt, now);
+  const used =
+    ledger.windows.find((w) => w.start === window.start)
+      ?.recordingDownloadBytesUsed ?? 0;
+  const limit = grant.quota?.downloadBytesPerMonth ?? 0;
+  if (plaintextBytes > Math.max(0, limit - used))
+    throw new HttpError(
+      409,
+      "Recording download allowance is unavailable",
+      "RECORDING_DOWNLOAD_QUOTA_UNAVAILABLE",
+    );
+  // Debit the full declared file size before streaming. Retries consume
+  // another full debit; socket failure and cancellation do not refund it.
+  windowRow(ledger, window.start, window.end).recordingDownloadBytesUsed =
+    used + plaintextBytes;
 }
 
 export function quotaOverdrawn(

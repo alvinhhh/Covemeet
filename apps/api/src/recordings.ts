@@ -2,6 +2,8 @@ import { meetingAllowed } from "./meeting-limits.js";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
+import { addAbortSignal, Readable } from "node:stream";
+import { isDeepStrictEqual } from "node:util";
 import type { Transporter } from "nodemailer";
 import {
   EgressClient,
@@ -34,6 +36,7 @@ export type RecorderClient = Pick<
   EgressClient,
   "startRoomCompositeEgress" | "stopEgress" | "listEgress"
 >;
+const retentionMs = 7 * 86400000;
 
 export class RecordingService {
   readonly available: boolean;
@@ -215,7 +218,13 @@ export class RecordingService {
     });
     await lock.audit("recorder", "recording.encrypted", r.id);
   }
-  private async openEncrypted(m: Meeting, r: Recording, metadata = r.metadata) {
+  private async openEncrypted(
+    m: Meeting,
+    r: Recording,
+    metadata = r.metadata,
+    signal?: AbortSignal,
+  ) {
+    signal?.throwIfAborted();
     if (!this.provider)
       throw new HttpError(503, "Recording keys are not configured");
     if (metadata?.storage) {
@@ -225,6 +234,7 @@ export class RecordingService {
         metadata.storage,
         metadata,
         this.context(m, r),
+        signal,
       );
       return decryptRecordingFromStream(
         ciphertext,
@@ -474,7 +484,7 @@ export class RecordingService {
             if (!m || !r) return;
             if (
               r.status === "deleting" ||
-              (r.status === "ready" && r.createdAt < Date.now() - 7 * 86400000)
+              (r.status === "ready" && r.createdAt <= Date.now() - retentionMs)
             ) {
               await lock.change((state) => {
                 const row = state.recordings.find(
@@ -620,13 +630,14 @@ export class RecordingService {
     if (!this.available)
       throw new HttpError(503, "Recording is not configured");
     const credentials = await createDownloadCredentials();
-    const expiresAt = Date.now() + 86400000;
+    let expiresAt = Date.now() + 86400000;
     const email = await this.store.change(m.code, (state) => {
       if (state.hosted?.revoked)
         throw new HttpError(403, "Recording unavailable");
       const r = state.recordings.find((x) => x.id === id);
-      if (!r || r.status !== "ready")
+      if (!r || r.status !== "ready" || r.createdAt <= Date.now() - retentionMs)
         throw new HttpError(409, "Recording is not ready");
+      expiresAt = Math.min(expiresAt, r.createdAt + retentionMs);
       if (!state.hostEmailVerified || !state.hostEmail)
         throw new HttpError(403, "Verify the host email first");
       r.tokenHash = credentials.tokenDigest;
@@ -680,6 +691,7 @@ export class RecordingService {
       const r = m.recordings.find(
         (r) =>
           r.status === "ready" &&
+          r.createdAt > Date.now() - retentionMs &&
           r.tokenHash &&
           safeEqual(r.tokenHash, hash) &&
           (r.expiresAt ?? 0) > Date.now(),
@@ -688,7 +700,15 @@ export class RecordingService {
     }
     return null;
   }
-  async download(m: Meeting, r: Recording, token: string, password: string) {
+  async download(
+    m: Meeting,
+    r: Recording,
+    token: string,
+    password: string,
+    authorize?: (current: Meeting) => void,
+    signal?: AbortSignal,
+  ) {
+    signal?.throwIfAborted();
     const current = await this.findToken(token, m.code);
     if (
       !this.provider ||
@@ -699,10 +719,77 @@ export class RecordingService {
       !(await verifyRecordingPassword(current.r.passwordHash, password))
     )
       throw new HttpError(403, "Download unavailable");
-    // Recheck after the expensive password verification to observe a concurrent revocation.
-    if (!(await this.findToken(token, m.code)))
-      throw new HttpError(403, "Download unavailable");
-    await this.store.audit(m.code, "host", "recording.download", r.id);
-    return this.openEncrypted(current.m, current.r);
+    signal?.throwIfAborted();
+    const source = await this.openEncrypted(
+      current.m,
+      current.r,
+      current.r.metadata,
+      signal,
+    );
+    const reader = source[Symbol.asyncIterator]();
+    let first: IteratorResult<Buffer> | undefined;
+    let handedOff = false;
+    let closing: Promise<void> | undefined;
+    const close = () =>
+      (closing ??= (async () => {
+        source.destroy();
+        if (first && !first.done && !handedOff) first.value.fill(0);
+        await reader.return?.();
+      })());
+    try {
+      if (signal) addAbortSignal(signal, source);
+      // Open the file and authenticate its first frame before charging. The
+      // decryptor bounds every frame by the persisted size; EOF verifies total size.
+      first = await reader.next();
+      await this.store.debitRecordingDownload(
+        m.code,
+        current.r.metadata.plaintextBytes,
+        (state) => {
+          signal?.throwIfAborted();
+          authorize?.(state);
+          const saved = state.recordings.find((row) => row.id === r.id);
+          if (
+            state.id !== current.m.id ||
+            state.hosted?.revoked ||
+            !saved ||
+            saved.status !== "ready" ||
+            saved.createdAt <= Date.now() - retentionMs ||
+            (saved.expiresAt ?? 0) <= Date.now() ||
+            saved.tokenHash !== current.r.tokenHash ||
+            saved.passwordHash !== current.r.passwordHash ||
+            saved.ciphertextId !== current.r.ciphertextId ||
+            !isDeepStrictEqual(saved.metadata, current.r.metadata)
+          )
+            throw new HttpError(403, "Download unavailable");
+        },
+      );
+      await this.store.audit(m.code, "host", "recording.download", r.id);
+      signal?.throwIfAborted();
+      const output = Readable.from(
+        (async function* () {
+          try {
+            if (!first!.done) {
+              handedOff = true;
+              yield first!.value;
+            }
+            for await (const chunk of reader) yield chunk;
+          } finally {
+            await close();
+          }
+        })(),
+        { objectMode: false },
+      );
+      // Interrupt pending source reads before the output waits for its generator.
+      const destroy = output._destroy;
+      output._destroy = (error, done) => {
+        void close().catch(() => {});
+        destroy.call(output, error, done);
+      };
+      if (signal) addAbortSignal(signal, output);
+      return output;
+    } catch (error) {
+      await close().catch(() => {});
+      throw error;
+    }
   }
 }

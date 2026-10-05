@@ -105,6 +105,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
   });
   await app.register(cookie);
   await app.register(rateLimit, { max: 120, timeWindow: "1 minute" });
+  app.addContentTypeParser(
+    "application/x-www-form-urlencoded",
+    { parseAs: "string", bodyLimit: 8192 },
+    (_req, body, done) => {
+      const fields = new URLSearchParams(body as string);
+      if ([...fields.keys()].length !== new Set(fields.keys()).size)
+        return done(new HttpError(400, "Duplicate form fields"));
+      done(null, Object.fromEntries(fields));
+    },
+  );
   const mail = nodemailer.createTransport({
     host: config.smtpHost,
     port: config.smtpPort,
@@ -133,10 +143,28 @@ export async function createApp(config: Config, store: Store, media: Media) {
     footerText: "",
     showHostButton: true,
   };
+  const isDownloadForm = (req: FastifyRequest) =>
+    req.method === "POST" &&
+    req.routeOptions.url === "/api/meetings/:code/download" &&
+    String(req.headers["content-type"] ?? "")
+      .split(";", 1)[0]
+      ?.trim() === "application/x-www-form-urlencoded";
+  app.addHook("onSend", async (req, reply, payload) => {
+    // Form navigation needs a document error response; JSON API calls stay JSON.
+    if (
+      isDownloadForm(req) &&
+      reply.statusCode >= 400 &&
+      typeof payload === "string"
+    ) {
+      reply.type("text/html; charset=utf-8");
+      return `<!doctype html><meta charset="utf-8"><title>Download failed</title><pre>${payload.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</pre>`;
+    }
+    return payload;
+  });
   app.addHook("onRequest", async (req, reply) => {
     reply
       .header("Cache-Control", "no-store")
-      .header("Referrer-Policy", "no-referrer")
+      .header("Referrer-Policy", "same-origin")
       .header("X-Content-Type-Options", "nosniff");
     reply.header(
       "Permissions-Policy",
@@ -175,7 +203,19 @@ export async function createApp(config: Config, store: Store, media: Media) {
           req.headers.origin !== undefined)
       )
         throw new HttpError(403, "Hosted service authentication required");
-      if (!machine && req.headers["x-requested-with"] !== "MeetingPlatform")
+      // Native attachment downloads cannot set custom headers. This exact route
+      // requires the configured Origin plus the existing host cookie and secrets.
+      const formDownload =
+        route === "/api/meetings/:code/download" &&
+        req.headers.origin === config.origin &&
+        String(req.headers["content-type"] ?? "")
+          .split(";", 1)[0]
+          ?.trim() === "application/x-www-form-urlencoded";
+      if (
+        !machine &&
+        !formDownload &&
+        req.headers["x-requested-with"] !== "MeetingPlatform"
+      )
         throw new HttpError(403, "Request verification failed");
       const portalAction =
         config.edition === "self-hosted" &&
@@ -187,6 +227,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       )
         throw new HttpError(403, "Origin not allowed");
       if (
+        !formDownload &&
         !String(req.headers["content-type"] ?? "").startsWith(
           "application/json",
         )
@@ -1270,26 +1311,49 @@ export async function createApp(config: Config, store: Store, media: Media) {
     "/api/meetings/:code/download",
     { config: { rateLimit: { max: 5, timeWindow: "1 minute" } } },
     async (req, reply) => {
-      const { password, token } = z
-        .object({ password: z.string().max(256), token: z.string().max(128) })
-        .parse(req.body);
-      const meeting = await find(req);
-      actor(req, meeting, true);
-      const found = await recordings.findToken(token, meeting.code);
-      if (!found) throw new HttpError(403, "Download unavailable");
-      const stream = await recordings.download(
-        found.m,
-        found.r,
-        token,
-        password,
-      );
-      reply
-        .type("video/mp4")
-        .header(
-          "Content-Disposition",
-          `attachment; filename="recording-${found.r.id}.mp4"`,
+      const controller = new AbortController();
+      const cleanup = () => {
+        reply.raw.off("close", closed);
+        reply.raw.off("finish", cleanup);
+      };
+      const closed = () => {
+        if (!reply.raw.writableFinished) controller.abort();
+        cleanup();
+      };
+      reply.raw.once("close", closed);
+      reply.raw.once("finish", cleanup);
+      if (reply.raw.destroyed) closed();
+      try {
+        controller.signal.throwIfAborted();
+        const { password, token } = z
+          .object({ password: z.string().max(256), token: z.string().max(128) })
+          .strict()
+          .parse(req.body);
+        const meeting = await find(req);
+        actor(req, meeting, true);
+        const found = await recordings.findToken(token, meeting.code);
+        if (!found) throw new HttpError(403, "Download unavailable");
+        const stream = await recordings.download(
+          found.m,
+          found.r,
+          token,
+          password,
+          (state) => {
+            actor(req, state, true);
+          },
+          controller.signal,
         );
-      return reply.send(stream);
+        reply
+          .type("video/mp4")
+          .header(
+            "Content-Disposition",
+            `attachment; filename="recording-${found.r.id}.mp4"`,
+          );
+        return reply.send(stream);
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
     },
   );
   if (media instanceof LiveMedia) media.attach(app);

@@ -587,13 +587,15 @@ export async function decryptRecordingFromStream(
       ),
       { objectMode: false },
     );
-    // Async-generator finally blocks do not run when cancelled before the first read.
+    // Cancel upstream before iterator.return(), which can wait on a stalled read.
+    const destroy = output._destroy;
+    output._destroy = (error, done) => {
+      input.destroy();
+      destroy.call(output, error, done);
+    };
     const failed = (error: Error) => output.destroy(error);
     input.on("error", failed);
-    output.once("close", () => {
-      input.off("error", failed);
-      input.destroy();
-    });
+    output.once("close", () => input.off("error", failed));
     return output;
   } catch (error) {
     input.destroy();

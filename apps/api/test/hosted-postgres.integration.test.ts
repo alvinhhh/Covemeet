@@ -788,3 +788,73 @@ test(
     );
   },
 );
+
+test(
+  "PostgreSQL recording starts share an immutable owner pool across rooms, retries and restarts",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account(),
+      otherOwner = f.account();
+    const first = await f.create(0, owner, randomUUID());
+    const second = await f.create(1, owner, randomUUID());
+    const other = await f.create(0, otherOwner, randomUUID());
+    for (const response of [first, second, other])
+      assert.equal(response.statusCode, 200, response.body);
+    const codes = [first.json().code, second.json().code];
+    const grants = await f.stores[0].pool.query(
+      "SELECT data FROM hosted_entitlements WHERE billing_owner_id=ANY($1::uuid[])",
+      [[owner, otherOwner]],
+    );
+    for (const { data: grant } of grants.rows)
+      await f.stores[0].setHostedEntitlement({
+        ...grant,
+        revision: 2,
+        enabled: false,
+        validUntil: Date.now() - 1,
+        quota: { ...grant.quota, downloadBytesPerMonth: 100 },
+      });
+    const starts = await Promise.allSettled(
+      codes.map((code, i) =>
+        f.stores[i]!.debitRecordingDownload(code, 60, (m) => {
+          assert.equal(m.ended, true);
+          assert.equal(m.hosted!.billingOwnerId, owner);
+        }),
+      ),
+    );
+    assert.equal(
+      starts.filter((result) => result.status === "fulfilled").length,
+      1,
+    );
+    assert.deepEqual(
+      (await f.stores[1].hostedUsage(owner)).recordingDownloadBytes,
+      { limit: 100, used: 60, available: 40 },
+    );
+    const restarted = new PgStore(databaseUrl!);
+    t.after(() => restarted.close());
+    await restarted.debitRecordingDownload(codes[0], 40, () => {});
+    await assert.rejects(
+      f.stores[0].debitRecordingDownload(codes[1], 1, () => {}),
+      { code: "RECORDING_DOWNLOAD_QUOTA_UNAVAILABLE" },
+    );
+    assert.deepEqual(
+      (await restarted.hostedUsage(owner)).recordingDownloadBytes,
+      { limit: 100, used: 100, available: 0 },
+    );
+    assert.deepEqual(
+      (await restarted.hostedUsage(otherOwner)).recordingDownloadBytes,
+      { limit: 100, used: 0, available: 100 },
+    );
+    await f.stores[0].change(other.json().code, (m) => {
+      m.hosted!.revoked = true;
+    });
+    await assert.rejects(
+      restarted.debitRecordingDownload(other.json().code, 1, () => {}),
+      /Recording access denied/,
+    );
+    assert.equal(
+      (await restarted.hostedUsage(otherOwner)).recordingDownloadBytes.used,
+      0,
+    );
+  },
+);

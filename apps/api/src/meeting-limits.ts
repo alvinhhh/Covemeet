@@ -8,7 +8,11 @@ export type HostedEntitlement = {
   revision: number;
   validUntil: number;
   enabled: boolean;
-  quota: { anchorAt: number; participantSecondsPerMonth: number } | null;
+  quota: {
+    anchorAt: number;
+    participantSecondsPerMonth: number;
+    downloadBytesPerMonth?: number;
+  } | null;
   hostAccountIds: string[];
   limits: {
     participants: number;
@@ -36,6 +40,12 @@ export const entitlementSchema = z
       .object({
         anchorAt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
         participantSecondsPerMonth: z.number().int().positive().max(36000000),
+        downloadBytesPerMonth: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(1e12)
+          .optional(),
       })
       .strict()
       .nullable(),
@@ -83,6 +93,7 @@ export function nextEntitlement(
       grant.enabled,
       grant.quota?.anchorAt ?? null,
       grant.quota?.participantSecondsPerMonth ?? null,
+      grant.quota?.downloadBytesPerMonth ?? 0,
       [...grant.hostAccountIds].sort(),
       grant.limits.participants,
       grant.limits.durationSeconds,

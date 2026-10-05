@@ -2,6 +2,7 @@ import { fenceParticipantMedia } from "./media-identity.js";
 import pg from "pg";
 import {
   canSettleMeter,
+  debitDownloadBytes,
   quotaOverdrawn,
   requireUsage,
   settleMeter,
@@ -154,6 +155,11 @@ export interface RecordingLock {
 }
 export interface Store {
   hostedUsage(billingOwnerId: string): Promise<ReturnType<typeof usageView>>;
+  debitRecordingDownload(
+    code: string,
+    plaintextBytes: number,
+    authorize: (current: Meeting) => void,
+  ): Promise<void>;
   checkUsage(code: string, participantId?: string): Promise<void>;
   updateParticipantMeter(
     code: string,
@@ -501,6 +507,34 @@ export class PgStore implements Store {
       if (!m || !grant) throw new HttpError(403, "Hosting plan is unavailable");
       return fn(ledger, grant, meetings, m, now);
     });
+  }
+  async debitRecordingDownload(
+    code: string,
+    plaintextBytes: number,
+    authorize: (current: Meeting) => void,
+  ) {
+    await this.meetingUsage(
+      code,
+      (ledger, grant, _meetings, m, now) => {
+        if (m.hosted?.revoked)
+          throw new HttpError(403, "Recording access denied");
+        authorize(m);
+        debitDownloadBytes(ledger, grant, plaintextBytes, now);
+      },
+      () =>
+        this.change(code, (m) => {
+          // A legacy room may have been bound after the initial read. Retry with
+          // its owner lock rather than bypassing the newly required allowance.
+          if (m.hosted?.billingOwnerId)
+            throw new HttpError(
+              409,
+              "Recording access changed; retry download",
+            );
+          if (m.hosted?.revoked)
+            throw new HttpError(403, "Recording access denied");
+          authorize(m);
+        }),
+    );
   }
   async checkUsage(code: string, participantId?: string) {
     await this.meetingUsage(
@@ -1496,6 +1530,34 @@ export class MemoryStore implements Store {
       if (!m || !grant) throw new HttpError(403, "Hosting plan is unavailable");
       return fn(ledger, grant, meetings, m, now);
     });
+  }
+  async debitRecordingDownload(
+    code: string,
+    plaintextBytes: number,
+    authorize: (current: Meeting) => void,
+  ) {
+    await this.meetingUsage(
+      code,
+      (ledger, grant, _meetings, m, now) => {
+        if (m.hosted?.revoked)
+          throw new HttpError(403, "Recording access denied");
+        authorize(m);
+        debitDownloadBytes(ledger, grant, plaintextBytes, now);
+      },
+      () =>
+        this.change(code, (m) => {
+          // A legacy room may have been bound after the initial read. Retry with
+          // its owner lock rather than bypassing the newly required allowance.
+          if (m.hosted?.billingOwnerId)
+            throw new HttpError(
+              409,
+              "Recording access changed; retry download",
+            );
+          if (m.hosted?.revoked)
+            throw new HttpError(403, "Recording access denied");
+          authorize(m);
+        }),
+    );
   }
   async checkUsage(code: string, participantId?: string) {
     await this.meetingUsage(

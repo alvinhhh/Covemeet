@@ -2688,73 +2688,29 @@ function Download({ code, config }: { code: string; config: Config }) {
   useEffect(() => {
     initialDownloadToken = "";
   }, []);
-  const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [target] = useState(() => `recording-download-${crypto.randomUUID()}`);
+  const frame = useRef<HTMLIFrameElement>(null);
   const [error, setError] = useState("");
-  const [complete, setComplete] = useState(false);
-  async function download(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    setComplete(false);
+  const [requested, setRequested] = useState(false);
+  function downloadResult() {
+    // An attachment streams to the browser's downloads; only errors load the frame.
     try {
-      const response = await fetch(
-        `/api/meetings/${encodeURIComponent(code)}/download`,
-        {
-          method: "POST",
-          credentials: "same-origin",
-          cache: "no-store",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Requested-With": "MeetingPlatform",
-          },
-          body: JSON.stringify({ token, password }),
-        },
+      if (!requested) return;
+      const text = frame.current?.contentDocument?.body?.textContent;
+      if (!text) throw new Error("Unreadable download response");
+      const result: unknown = JSON.parse(text);
+      setError(
+        result &&
+          typeof result === "object" &&
+          "error" in result &&
+          typeof result.error === "string"
+          ? result.error
+          : "Download failed. Try again.",
       );
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.error || "Download failed.");
-      }
-      const size = Number(response.headers.get("Content-Length") || 0);
-      if (size > 512 * 1024 * 1024) {
-        await response.body?.cancel();
-        throw new Error(
-          "This recording exceeds the browser download limit of 512 MB. Contact the installation administrator for an export.",
-        );
-      }
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("No download data received.");
-      const parts: BlobPart[] = [];
-      let received = 0;
-      while (true) {
-        const result = await reader.read();
-        if (result.done) break;
-        received += result.value.byteLength;
-        if (received > 512 * 1024 * 1024) {
-          await reader.cancel();
-          throw new Error(
-            "This recording exceeds the browser download limit of 512 MB.",
-          );
-        }
-        parts.push(result.value.slice().buffer);
-      }
-      const url = URL.createObjectURL(
-        new Blob(parts, {
-          type: response.headers.get("Content-Type") || "video/mp4",
-        }),
-      );
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = "meeting-recording.mp4";
-      anchor.click();
-      setTimeout(() => URL.revokeObjectURL(url), 60_000);
-      setPassword("");
-      setComplete(true);
-    } catch (e) {
-      setError(messageOf(e));
-    } finally {
-      setBusy(false);
+    } catch {
+      setError("Download failed. Check your connection and try again.");
     }
+    setRequested(false);
   }
   if (!token)
     return (
@@ -2780,27 +2736,56 @@ function Download({ code, config }: { code: string; config: Config }) {
         Enter the password emailed to the host. Use the browser with the active
         host session.
       </p>
-      <form onSubmit={download} className="form-stack full-width">
+      <form
+        action={`/api/meetings/${encodeURIComponent(code)}/download`}
+        method="post"
+        target={target}
+        onSubmit={() => {
+          setError("");
+          setRequested(true);
+        }}
+        className="form-stack full-width"
+      >
+        <input type="hidden" name="token" value={token} />
         <Field label="Recording password">
           <input
             type="password"
+            name="password"
             autoComplete="off"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            maxLength={256}
             required
           />
         </Field>
         {error && <Notice>{error}</Notice>}
-        {complete && <Notice kind="success">Download prepared.</Notice>}
-        <Button className="primary full-width" type="submit" disabled={busy}>
+        {requested && (
+          <Notice kind="success">
+            Download requested. Check your browser’s downloads.
+          </Notice>
+        )}
+        <Button className="primary full-width" type="submit">
           <Icon name="download" size={17} />
-          {busy ? "Preparing download…" : "Download recording"}
+          Download recording
         </Button>
       </form>
+      <iframe
+        ref={frame}
+        name={target}
+        title="Recording download result"
+        sandbox="allow-same-origin allow-forms allow-downloads"
+        onLoad={downloadResult}
+        hidden
+      />
       <small className="muted">
-        Links expire 24 hours after creation. The downloaded video is decrypted
-        on this device.
+        Links last up to 24 hours, within the recording’s seven-day retention.
+        The server decrypts the video for download. The downloaded MP4 has no
+        password protection.
       </small>
+      {config.edition === "hosted" && (
+        <small className="muted">
+          Each accepted download uses the full file size from the monthly
+          allowance, including retries and interrupted downloads.
+        </small>
+      )}
     </Center>
   );
 }

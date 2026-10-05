@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { isAbsolute, normalize } from "node:path";
-import { Readable, Transform } from "node:stream";
+import { addAbortSignal, Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
   S3Client,
@@ -41,6 +41,7 @@ export interface RecordingObjectStorage {
     reference: RecordingObjectReference,
     metadata: EncryptedRecordingMetadata,
     context: RecordingContext,
+    signal?: AbortSignal,
   ): Promise<Readable>;
   delete(
     reference: RecordingObjectReference,
@@ -382,7 +383,9 @@ export class S3RecordingStorage implements RecordingObjectStorage {
     reference: RecordingObjectReference,
     metadata: EncryptedRecordingMetadata,
     context: RecordingContext,
+    signal?: AbortSignal,
   ): Promise<Readable> {
+    signal?.throwIfAborted();
     reference = { ...reference };
     this.validate(reference, metadata, context);
     const response = await this.client.send(
@@ -392,10 +395,15 @@ export class S3RecordingStorage implements RecordingObjectStorage {
         VersionId: reference.versionId,
         IfMatch: reference.etag,
       }),
+      { abortSignal: signal },
     );
     const body = response.Body;
     if (!(body instanceof Readable))
       throw new Error("Object store returned no Node byte stream");
+    if (signal?.aborted) {
+      body.destroy();
+      signal.throwIfAborted();
+    }
     if (
       response.ContentLength !== reference.bytes ||
       response.ETag !== reference.etag ||
@@ -426,12 +434,16 @@ export class S3RecordingStorage implements RecordingObjectStorage {
       }
     }
     const output = Readable.from(checked(), { objectMode: false });
+    // Close the HTTP response before waiting for a stalled iterator to return.
+    const destroy = output._destroy;
+    output._destroy = (error, done) => {
+      body.destroy();
+      destroy.call(output, error, done);
+    };
     const failed = (error: Error) => output.destroy(error);
     body.on("error", failed);
-    output.once("close", () => {
-      body.off("error", failed);
-      body.destroy();
-    });
+    output.once("close", () => body.off("error", failed));
+    if (signal) addAbortSignal(signal, output);
     return output;
   }
   async delete(
