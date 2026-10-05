@@ -790,3 +790,78 @@ test("runtime phone admission requires durable ownership outside isolated test m
     0,
   );
 });
+
+test("phone and browser admission enforce the same1000-viewer cap below the total webinar cap", async (t) => {
+  const f = await fixture(t),
+    h = await f.host("webinar");
+  await f.store.change(h.code, (m) => {
+    for (let i = 0; i < 1000; i++)
+      m.participants.push({
+        ...m.participants[0]!,
+        id: randomUUID(),
+        role: "viewer",
+        status: "waiting",
+        tokenHash: "",
+      });
+  });
+  const phoneJoin = () =>
+    f.gateway("/api/internal/phone/calls", {
+      locator: h.access.locator,
+      pin: h.access.pin,
+      callId: randomUUID(),
+      trunkId: "test-trunk",
+    });
+  const browserJoin = () =>
+    f.browser("POST", `/api/meetings/${h.code}/join`, {
+      name: "Extra viewer",
+      password: "browser-password",
+    });
+  assert.equal((await phoneJoin()).statusCode, 409);
+  assert.equal((await browserJoin()).statusCode, 409);
+  await f.store.change(h.code, (m) => {
+    const p = m.participants.at(-1)!;
+    p.status = "left";
+    p.enforcementPending = true;
+  });
+  assert.equal(
+    (await phoneJoin()).statusCode,
+    409,
+    "Unconfirmed removal still occupies its viewer place",
+  );
+  await f.store.change(h.code, (m) => {
+    m.participants.at(-1)!.enforcementPending = false;
+  });
+  assert.equal((await phoneJoin()).statusCode, 200);
+  assert.equal((await browserJoin()).statusCode, 409);
+});
+
+test("ending with an unresolved phone reservation returns pending until verified teardown", async (t) => {
+  const f = await fixture(t),
+    h = await f.host(),
+    call = await f.call(h);
+  const ending = await f.browser(
+    "POST",
+    `/api/meetings/${h.code}/end`,
+    {},
+    h.cookie,
+  );
+  assert.equal(ending.statusCode, 202);
+  assert.deepEqual(ending.json(), { ok: true, cleanupPending: true });
+  const state = await f.browser(
+    "GET",
+    `/api/meetings/${h.code}/state`,
+    undefined,
+    h.cookie,
+  );
+  assert.equal(state.json().meeting.ended, true);
+  assert.equal(state.json().meeting.cleanupPending, true);
+  assert.equal((await call.update("leave")).statusCode, 200);
+  const completed = await f.browser(
+    "POST",
+    `/api/meetings/${h.code}/end`,
+    {},
+    h.cookie,
+  );
+  assert.equal(completed.statusCode, 200);
+  assert.deepEqual(completed.json(), { ok: true, cleanupPending: false });
+});

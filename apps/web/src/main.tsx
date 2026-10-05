@@ -712,6 +712,9 @@ function Meeting({
               ? "The host removed this session. You can request admission again."
               : state.meeting.title}
         </p>
+        {state.meeting.ended && state.meeting.cleanupPending && (
+          <Notice kind="info">Meeting connections are still closing.</Notice>
+        )}
         {state.me.status === "kicked" && !state.meeting.ended && (
           <Button onClick={() => setNeedsJoin(true)}>Request admission</Button>
         )}
@@ -995,6 +998,17 @@ function Conference({
           {state.meeting.breakouts?.find((r) => r.id === state.me.breakoutId)
             ?.name || "Main room"}{" "}
           · {state.meeting.locked ? "Meeting locked" : "Waiting room enabled"}
+          {state.meeting.deadlineAt && (
+            <span>
+              · Ends at{" "}
+              <time dateTime={new Date(state.meeting.deadlineAt).toISOString()}>
+                {new Date(state.meeting.deadlineAt).toLocaleTimeString([], {
+                  hour: "numeric",
+                  minute: "2-digit",
+                })}
+              </time>
+            </span>
+          )}
           {state.me.breakoutId && (
             <button
               className="return-main"

@@ -64,6 +64,10 @@ export type MeetingState = {
     };
     locked: boolean;
     ended: boolean;
+    cleanupPending?: boolean;
+    participantLimit?: number;
+    startedAt?: number;
+    deadlineAt?: number;
     recordingAllowed: boolean;
     recordingActive?: boolean;
     createdAt: string;

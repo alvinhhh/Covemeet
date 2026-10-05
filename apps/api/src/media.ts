@@ -1,4 +1,10 @@
 import {
+  endMeeting,
+  meetingAllowed,
+  meetingDeadline,
+  requireMeetingAccess,
+} from "./meeting-limits.js";
+import {
   AccessToken,
   RoomServiceClient,
   ServerError,
@@ -36,6 +42,7 @@ export class LiveMedia implements Media {
     this.verifier = new TokenVerifier(config.livekitKey, config.livekitSecret);
   }
   async token(m: Meeting, p: Participant) {
+    requireMeetingAccess(m);
     if (!this.available)
       throw new HttpError(503, "Media server is not configured");
     const token = new AccessToken(
@@ -82,7 +89,7 @@ export class LiveMedia implements Media {
     const p = m?.participants.find((x) => x.id === c.sub);
     if (
       !m ||
-      m.ended ||
+      !meetingAllowed(m) ||
       !p ||
       p.status !== "admitted" ||
       p.enforcementPending ||
@@ -170,10 +177,20 @@ export class LiveMedia implements Media {
               const deadline = member
                 ? Math.min(
                     member.expiresAt,
+                    state ? meetingDeadline(state) : 0,
                     member.phone?.leaseExpiresAt ?? Infinity,
                   )
                 : 0;
-              if (!state || !member || deadline <= Date.now()) {
+              if (
+                !state ||
+                !member ||
+                !meetingAllowed(state) ||
+                deadline <= Date.now()
+              ) {
+                if (state && !state.ended && !meetingAllowed(state))
+                  await this.store.change(state.code, (current) => {
+                    if (!meetingAllowed(current)) endMeeting(current);
+                  });
                 stop();
                 await this.remove(m, p);
                 return;
@@ -224,7 +241,7 @@ export class LiveMedia implements Media {
                 const current = fresh?.participants.find((x) => x.id === p.id);
                 if (
                   !fresh ||
-                  fresh.ended ||
+                  !meetingAllowed(fresh) ||
                   current?.status !== "admitted" ||
                   current.expiresAt <= Date.now() ||
                   (current.phone &&

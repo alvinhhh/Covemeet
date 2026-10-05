@@ -83,6 +83,10 @@ async function fixture(t: TestContext) {
         [accounts],
       );
       await cleanup.query(
+        "DELETE FROM hosted_entitlements WHERE billing_owner_id=ANY($1::uuid[])",
+        [accounts],
+      );
+      await cleanup.query(
         "DELETE FROM hosted_authorities WHERE account_id=ANY($1::uuid[])",
         [accounts],
       );
@@ -95,19 +99,45 @@ async function fixture(t: TestContext) {
     accounts.push(id);
     return id;
   };
-  const create = (
+  const provisioned = new Map<string, Promise<unknown>>();
+  const create = async (
     index: number,
     accountId: string,
     operationId: string,
     version = 1,
     settings = meeting,
-  ) =>
-    apps[index]!.inject({
+  ) => {
+    const owner = accountId.toLowerCase();
+    if (!provisioned.has(owner))
+      provisioned.set(
+        owner,
+        stores[0].setHostedEntitlement({
+          billingOwnerId: owner,
+          revision: 1,
+          validUntil: Date.now() + 300000,
+          enabled: true,
+          hostAccountIds: [owner],
+          limits: {
+            participants: 100,
+            durationSeconds: 7200,
+            concurrentMeetings: 1,
+          },
+        }),
+      );
+    await provisioned.get(owner);
+    return apps[index]!.inject({
       method: "POST",
       url: "/api/internal/hosted/meetings",
       headers: internalHeaders,
-      payload: { accountId, version, operationId, meeting: settings },
+      payload: {
+        accountId,
+        billingOwnerId: owner,
+        version,
+        operationId,
+        meeting: settings,
+      },
     });
+  };
   const authority = (
     index: number,
     accountId: string,
@@ -349,5 +379,188 @@ test(
       1,
     );
     assert.equal(equal.filter((r) => r.statusCode === 409).length, 1);
+  },
+);
+
+test(
+  "PostgreSQL pool and named-host start reservations serialize across two pools and retain unknown cleanup",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t);
+    const billingOwnerId = f.account(),
+      firstHost = f.account(),
+      secondHost = f.account();
+    await f.stores[0].setHostedEntitlement({
+      billingOwnerId,
+      revision: 1,
+      validUntil: Date.now() + 300000,
+      enabled: true,
+      hostAccountIds: [firstHost, secondHost],
+      limits: {
+        participants: 100,
+        durationSeconds: 7200,
+        concurrentMeetings: 1,
+      },
+    });
+    const make = async (index: number, accountId: string) => {
+      const r = await f.apps[index]!.inject({
+        method: "POST",
+        url: "/api/internal/hosted/meetings",
+        headers: internalHeaders,
+        payload: {
+          accountId,
+          billingOwnerId,
+          version: 1,
+          operationId: randomUUID(),
+          meeting,
+        },
+      });
+      assert.equal(r.statusCode, 200, r.body);
+      return r.json();
+    };
+    const one = await make(0, firstHost),
+      two = await make(1, secondHost);
+    const start = (index: number, made: { code: string; hostToken: string }) =>
+      f.apps[index]!.inject({
+        method: "POST",
+        url: `/api/meetings/${made.code}/host`,
+        headers: browserHeaders,
+        payload: { token: made.hostToken },
+      });
+    const replies = await Promise.all([start(0, one), start(1, two)]);
+    assert.deepEqual(replies.map((r) => r.statusCode).sort(), [200, 409]);
+    const winner = replies.findIndex((r) => r.statusCode === 200),
+      loser = 1 - winner;
+    const rows = [one, two];
+    const live = (await f.stores[1].get(rows[winner].code))!;
+    assert.equal(
+      live.lifecycle!.deadlineAt! - live.lifecycle!.startedAt,
+      7200000,
+    );
+    f.media.forEach((m) => {
+      m.failing = true;
+    });
+    const cookie = replies[winner]!.cookies.map(
+      (c) => `${c.name}=${c.value}`,
+    ).join("; ");
+    await f.apps[0]!.inject({
+      method: "POST",
+      url: `/api/meetings/${rows[winner].code}/end`,
+      headers: { ...browserHeaders, cookie },
+      payload: {},
+    });
+    assert.equal((await start(loser, rows[loser])).statusCode, 409);
+    assert.equal(
+      (await f.stores[0].get(rows[winner].code))!.lifecycle!.cleanupConfirmed,
+      undefined,
+    );
+    f.media.forEach((m) => {
+      m.failing = false;
+    });
+    const until = Date.now() + 12000;
+    while (
+      !(await f.stores[0].get(rows[winner].code))!.lifecycle!
+        .cleanupConfirmed &&
+      Date.now() < until
+    )
+      await new Promise((r) => setTimeout(r, 100));
+    assert.equal(
+      (await f.stores[0].get(rows[winner].code))!.lifecycle!.cleanupConfirmed,
+      true,
+    );
+    assert.equal((await start(loser, rows[loser])).statusCode, 200);
+    // Raising the pool cap cannot let one named host reserve two meetings.
+    await f.stores[0].setHostedEntitlement({
+      billingOwnerId,
+      revision: 2,
+      validUntil: Date.now() + 300000,
+      enabled: true,
+      hostAccountIds: [firstHost, secondHost],
+      limits: {
+        participants: 100,
+        durationSeconds: 7200,
+        concurrentMeetings: 2,
+      },
+    });
+    const duplicateHost = await make(0, [firstHost, secondHost][loser]!);
+    assert.equal((await start(0, duplicateHost)).statusCode, 409);
+  },
+);
+
+test(
+  "PostgreSQL entitlement restrictions win start races and stale allowed-host lists never restore access",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t);
+    const billingOwnerId = f.account(),
+      accountId = f.account();
+    const grant = {
+      billingOwnerId,
+      revision: 1,
+      validUntil: Date.now() + 300000,
+      enabled: true,
+      hostAccountIds: [accountId],
+      limits: {
+        participants: 100,
+        durationSeconds: 7200,
+        concurrentMeetings: 1,
+      },
+    };
+    await f.stores[0].setHostedEntitlement(grant);
+    const payload = {
+      accountId,
+      billingOwnerId,
+      version: 1,
+      operationId: randomUUID(),
+      meeting,
+    };
+    const made = await f.apps[0]!.inject({
+      method: "POST",
+      url: "/api/internal/hosted/meetings",
+      headers: internalHeaders,
+      payload,
+    });
+    assert.equal(made.statusCode, 200, made.body);
+    const { code, hostToken } = made.json();
+    const [started] = await Promise.all([
+      f.apps[0]!.inject({
+        method: "POST",
+        url: `/api/meetings/${code}/host`,
+        headers: browserHeaders,
+        payload: { token: hostToken },
+      }),
+      f.stores[1].setHostedEntitlement({
+        ...grant,
+        revision: 2,
+        hostAccountIds: [],
+      }),
+    ]);
+    assert.ok([200, 410].includes(started.statusCode), started.body);
+    assert.equal((await f.stores[0].get(code))!.ended, true);
+    const stale = await f.stores[0].setHostedEntitlement(grant);
+    assert.equal(stale.revision, 2);
+    await f.authority(1, accountId, 1, true);
+    const denied = await f.apps[0]!.inject({
+      method: "POST",
+      url: "/api/internal/hosted/meetings",
+      headers: internalHeaders,
+      payload: { ...payload, operationId: randomUUID() },
+    });
+    assert.equal(denied.statusCode, 403, denied.body);
+    const results = await Promise.allSettled([
+      f.stores[0].setHostedEntitlement({ ...grant, revision: 3 }),
+      f.stores[1].setHostedEntitlement({
+        ...grant,
+        revision: 3,
+        enabled: false,
+      }),
+    ]);
+    assert.equal(results.filter((r) => r.status === "fulfilled").length, 1);
+    assert.equal(results.filter((r) => r.status === "rejected").length, 1);
+    assert.equal(
+      (await f.stores[1].get(code))!.ended,
+      true,
+      "Renewal never revives an ended occurrence",
+    );
   },
 );

@@ -1,3 +1,4 @@
+import { meetingAllowed } from "./meeting-limits.js";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -361,7 +362,7 @@ export class RecordingService {
             409,
             "Recording is unavailable while phone calls are active; phone recording announcements are not implemented",
           );
-        if (m.ended || !m.recordingAllowed)
+        if (!meetingAllowed(m) || !m.recordingAllowed)
           throw new HttpError(403, "Enable recording first");
         if (!m.hostEmailVerified)
           throw new HttpError(403, "Verify the host email first");
@@ -392,7 +393,9 @@ export class RecordingService {
           const row = m.recordings.find((x) => x.id === r.id)!;
           row.egressId = info.egressId;
           const stop =
-            m.ended || !m.recordingAllowed || row.status === "stopping";
+            !meetingAllowed(m) ||
+            !m.recordingAllowed ||
+            row.status === "stopping";
           row.status = stop
             ? "stopping"
             : info.status === EgressStatus.EGRESS_ACTIVE
@@ -583,7 +586,7 @@ export class RecordingService {
                 recovered ||
                 !this.available ||
                 !current.recordingAllowed ||
-                current.ended
+                !meetingAllowed(current)
               ) {
                 await lock.check();
                 await this.client.stopEgress(info.egressId);

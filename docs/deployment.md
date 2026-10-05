@@ -22,6 +22,9 @@ Do not change the dev bindings to `0.0.0.0` to invite remote users. The local ra
 | `PORTAL_ORIGIN`                          | Optional separate self-hosted portal origin. Omit it for a single-origin installation.                             |
 | `SESSION_SECRET`                         | Random secret for session-related cryptography. Rotating it may invalidate active sessions.                        |
 | `CREATION_KEY`                           | Server-controlled creation credential in hosted mode. Never embed it in a browser bundle.                          |
+| `MEETING_PARTICIPANT_LIMIT` | Self-hosted total meeting seats, including the host and waiting guests; defaults to 100, maximum 1,000. |
+| `WEBINAR_PARTICIPANT_LIMIT` | Self-hosted total webinar seats; defaults to 1,010, with at most 1,000 viewers and ten stage members. |
+| `MEETING_DURATION_SECONDS` | Self-hosted session length from first host entry; 0 is unlimited, otherwise up to 86,400 seconds. |
 | `LIVEKIT_URL`                            | Private API/signaling destination: localhost in development, `http://livekit:7880` inside Compose.                 |
 | `LIVEKIT_PUBLIC_URL`                     | Browser gateway origin, such as `ws://localhost:4100`; the SDK appends `/rtc`. It must never point at raw LiveKit. |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Server-only credentials shared with LiveKit/Egress.                                                                |

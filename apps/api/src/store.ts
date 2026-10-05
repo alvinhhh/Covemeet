@@ -1,6 +1,16 @@
 import pg from "pg";
 import { HttpError } from "./security.js";
 import {
+  applyEntitlement,
+  entitlementFor,
+  entitlementSchema,
+  nextEntitlement,
+  requireEntitlement,
+  startMeetingReservation,
+  type HostedEntitlement,
+  type MeetingEntitlement,
+} from "./meeting-limits.js";
+import {
   bumpPhoneDialog,
   canFinishPhoneDialog,
   editPhoneDialog,
@@ -29,6 +39,7 @@ export type Participant = {
     leaseExpiresAt: number;
     callExpiresAt: number;
     cleanupTokenHash?: string;
+    closed?: boolean;
   };
   id: string;
   name: string;
@@ -60,12 +71,21 @@ export type Recording = {
 export type Meeting = {
   hosted?: {
     accountId: string;
+    billingOwnerId?: string;
+    entitlement?: MeetingEntitlement;
     version: number;
     operationId?: string;
     requestHash?: string;
     revoked?: boolean;
     cleanupConfirmed?: boolean;
   };
+  limits?: { participants: number; durationSeconds: number };
+  lifecycle?: {
+    startedAt: number;
+    deadlineAt?: number;
+    cleanupConfirmed?: boolean;
+  };
+  cleanupPending?: boolean;
   phoneAccess?: {
     enabled: boolean;
     locator: string;
@@ -115,6 +135,8 @@ export interface RecordingLock {
 }
 export interface Store {
   createHosted(m: Meeting): Promise<Meeting>;
+  setHostedEntitlement(input: HostedEntitlement): Promise<HostedEntitlement>;
+  startMeeting<T>(code: string, fn: (m: Meeting) => Promise<T> | T): Promise<T>;
   setHostedAuthority(
     input: HostedAuthority & { legacyCodes?: string[] },
   ): Promise<{
@@ -186,6 +208,7 @@ export interface Store {
 
 export type HostedAuthority = {
   accountId: string;
+  billingOwnerId?: string;
   version: number;
   enabled: boolean;
 };
@@ -216,13 +239,28 @@ function nextHostedAuthority(
   current: HostedAuthority | undefined,
   input: HostedAuthority,
 ) {
-  if (current?.version === input.version && current.enabled !== input.enabled)
-    throw new HttpError(409, "Hosting authority version conflicts");
+  if (current?.version === input.version) {
+    if (
+      current.enabled !== input.enabled ||
+      (current.billingOwnerId &&
+        input.billingOwnerId &&
+        current.billingOwnerId !== input.billingOwnerId)
+    )
+      throw new HttpError(409, "Hosting authority version conflicts");
+    // One initial binding upgrade is allowed; it never adopts existing unbound meetings.
+    return {
+      ...current,
+      ...(input.billingOwnerId ? { billingOwnerId: input.billingOwnerId } : {}),
+    };
+  }
   return !current || input.version > current.version
     ? {
         accountId: input.accountId,
         version: input.version,
         enabled: input.enabled,
+        ...((input.billingOwnerId ?? current?.billingOwnerId)
+          ? { billingOwnerId: input.billingOwnerId ?? current?.billingOwnerId }
+          : {}),
       }
     : current;
 }
@@ -230,6 +268,7 @@ function nextHostedAuthority(
 function revokeHostedMeeting(m: Meeting) {
   if (m.hosted!.revoked) return false;
   m.hosted!.revoked = true;
+  m.cleanupPending = true;
   m.ended = true;
   m.locked = true;
   m.recordingAllowed = false;
@@ -316,6 +355,7 @@ function finishedPhoneParticipant(dialog: PhoneDialog, meeting?: Meeting) {
     participant.phone.leaseExpiresAt !== 0
   )
     throw new HttpError(409, "Phone meeting cleanup remains unresolved");
+  participant.phone.closed = true;
 }
 export class PgStore implements Store {
   pool: pg.Pool;
@@ -337,16 +377,24 @@ export class PgStore implements Store {
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS hosted_authorities(account_id uuid PRIMARY KEY, version bigint NOT NULL CHECK(version > 0), enabled boolean NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS meetings_hosted_operation ON meetings ((data->'hosted'->>'accountId'), (data->'hosted'->>'operationId')) WHERE data->'hosted'->>'operationId' IS NOT NULL;
+      ALTER TABLE hosted_authorities ADD COLUMN IF NOT EXISTS billing_owner_id uuid;
+      CREATE TABLE IF NOT EXISTS hosted_entitlements(billing_owner_id uuid PRIMARY KEY, data jsonb NOT NULL);
+      CREATE INDEX IF NOT EXISTS meetings_billing_owner ON meetings ((data->'hosted'->>'billingOwnerId'));
       CREATE INDEX IF NOT EXISTS meetings_hosted_account ON meetings ((data->'hosted'->>'accountId'));
     `);
   }
   private async hostedTransaction<T>(
     accountId: string,
     fn: (c: pg.PoolClient) => Promise<T>,
+    billingOwnerId?: string,
   ): Promise<T> {
     const c = await this.pool.connect();
     try {
       await c.query("BEGIN");
+      if (billingOwnerId)
+        await c.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [
+          `hosting-pool:${billingOwnerId}`,
+        ]);
       await c.query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", [
         `hosted:${accountId}`,
       ]);
@@ -360,51 +408,163 @@ export class PgStore implements Store {
       c.release();
     }
   }
+  async setHostedEntitlement(raw: HostedEntitlement) {
+    const input = entitlementSchema.parse(raw);
+    return this.hostedTransaction(
+      `pool:${input.billingOwnerId}`,
+      async (c) => {
+        const previous = (
+          await c.query(
+            "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+            [input.billingOwnerId],
+          )
+        ).rows[0]?.data as HostedEntitlement | undefined;
+        const grant = nextEntitlement(previous, input);
+        if (grant === previous) return grant;
+        const meetings = (
+          await c.query(
+            "SELECT data FROM meetings WHERE data->'hosted'->>'billingOwnerId'=$1 ORDER BY code FOR UPDATE",
+            [input.billingOwnerId],
+          )
+        ).rows.map((row) => row.data as Meeting);
+        applyEntitlement(grant, meetings);
+        await c.query(
+          "INSERT INTO hosted_entitlements(billing_owner_id,data) VALUES($1,$2) ON CONFLICT(billing_owner_id) DO UPDATE SET data=$2",
+          [input.billingOwnerId, JSON.stringify(grant)],
+        );
+        for (const m of meetings) {
+          if (m.lifecycle?.cleanupConfirmed || m.hosted?.cleanupConfirmed)
+            continue;
+          m.revision++;
+          await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+            m.code,
+            JSON.stringify(m),
+          ]);
+        }
+        return grant;
+      },
+      input.billingOwnerId,
+    );
+  }
   async createHosted(m: Meeting) {
     m = structuredClone(m);
     m.hosted!.accountId = m.hosted!.accountId.toLowerCase();
     m.hosted!.operationId = m.hosted!.operationId?.toLowerCase();
+    m.hosted!.billingOwnerId = m.hosted!.billingOwnerId?.toLowerCase();
     const binding = m.hosted!;
-    return this.hostedTransaction(binding.accountId, async (c) => {
-      await c.query(
-        "INSERT INTO hosted_authorities(account_id,version,enabled) VALUES($1,$2,true) ON CONFLICT DO NOTHING",
-        [binding.accountId, binding.version],
-      );
-      const authority = (
+    if (!binding.billingOwnerId)
+      throw new HttpError(403, "Hosting plan is required");
+    return this.hostedTransaction(
+      binding.accountId,
+      async (c) => {
         await c.query(
-          "SELECT version,enabled FROM hosted_authorities WHERE account_id=$1",
-          [binding.accountId],
+          "INSERT INTO hosted_authorities(account_id,version,enabled,billing_owner_id) VALUES($1,$2,true,$3) ON CONFLICT DO NOTHING",
+          [binding.accountId, binding.version, binding.billingOwnerId],
+        );
+        const row = (
+          await c.query(
+            "SELECT version,enabled,billing_owner_id FROM hosted_authorities WHERE account_id=$1",
+            [binding.accountId],
+          )
+        ).rows[0];
+        if (
+          !row.enabled ||
+          Number(row.version) !== binding.version ||
+          (row.billing_owner_id &&
+            row.billing_owner_id !== binding.billingOwnerId)
         )
-      ).rows[0];
-      if (!authority.enabled || Number(authority.version) !== binding.version)
-        throw new HttpError(409, "Hosting authority is not current");
-      const existing = (
+          throw new HttpError(409, "Hosting authority is not current");
+        const grant = requireEntitlement(
+          (
+            await c.query(
+              "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+              [binding.billingOwnerId],
+            )
+          ).rows[0]?.data,
+          binding.accountId,
+        );
+        if (!row.billing_owner_id)
+          await c.query(
+            "UPDATE hosted_authorities SET billing_owner_id=$2 WHERE account_id=$1",
+            [binding.accountId, binding.billingOwnerId],
+          );
+        const existing = (
+          await c.query(
+            "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1 AND data->'hosted'->>'operationId'=$2 FOR UPDATE",
+            [binding.accountId, binding.operationId],
+          )
+        ).rows[0]?.data as Meeting | undefined;
+        if (existing) return reusableHostedMeeting(existing, m);
+        binding.entitlement = entitlementFor(grant, binding.accountId);
+        await c.query("INSERT INTO meetings(code,room,data) VALUES($1,$2,$3)", [
+          m.code,
+          m.room,
+          JSON.stringify(m),
+        ]);
         await c.query(
-          "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1 AND data->'hosted'->>'operationId'=$2 FOR UPDATE",
-          [binding.accountId, binding.operationId],
-        )
-      ).rows[0]?.data as Meeting | undefined;
-      if (existing) return reusableHostedMeeting(existing, m);
-      await c.query("INSERT INTO meetings(code,room,data) VALUES($1,$2,$3)", [
-        m.code,
-        m.room,
-        JSON.stringify(m),
-      ]);
-      await c.query(
-        "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,'meeting.create',$3)",
-        [m.code, `hosted:${binding.accountId}`, `version:${binding.version}`],
-      );
-      return m;
-    });
+          "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,'meeting.create',$3)",
+          [m.code, `hosted:${binding.accountId}`, `version:${binding.version}`],
+        );
+        return m;
+      },
+      binding.billingOwnerId,
+    );
+  }
+  async startMeeting<T>(
+    code: string,
+    fn: (m: Meeting) => Promise<T> | T,
+  ): Promise<T> {
+    const snapshot = await this.get(code);
+    if (!snapshot) throw new HttpError(404, "Meeting unavailable");
+    if (!snapshot.hosted?.billingOwnerId)
+      return this.change(code, async (m) => {
+        const result = await fn(m);
+        startMeetingReservation(m, []);
+        return result;
+      });
+    const binding = snapshot.hosted;
+    return this.hostedTransaction(
+      binding.accountId,
+      async (c) => {
+        const m = (
+          await c.query("SELECT data FROM meetings WHERE code=$1 FOR UPDATE", [
+            code,
+          ])
+        ).rows[0]?.data as Meeting;
+        if (!m || m.hosted?.billingOwnerId !== binding.billingOwnerId)
+          throw new HttpError(409, "Meeting ownership changed");
+        const result = await fn(m);
+        const others = (
+          await c.query(
+            "SELECT data FROM meetings WHERE data->'hosted'->>'billingOwnerId'=$1 OR data->'hosted'->>'accountId'=$2",
+            [binding.billingOwnerId, binding.accountId],
+          )
+        ).rows.map((row) => row.data as Meeting);
+        startMeetingReservation(m, others);
+        m.revision++;
+        await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+          code,
+          JSON.stringify(m),
+        ]);
+        return result;
+      },
+      binding.billingOwnerId,
+    );
   }
   async setHostedAuthority(
     input: HostedAuthority & { legacyCodes?: string[] },
   ) {
-    input = { ...input, accountId: input.accountId.toLowerCase() };
+    input = {
+      ...input,
+      accountId: input.accountId.toLowerCase(),
+      ...(input.billingOwnerId
+        ? { billingOwnerId: input.billingOwnerId.toLowerCase() }
+        : {}),
+    };
     return this.hostedTransaction(input.accountId, async (c) => {
       const row = (
         await c.query(
-          "SELECT version,enabled FROM hosted_authorities WHERE account_id=$1",
+          "SELECT version,enabled,billing_owner_id FROM hosted_authorities WHERE account_id=$1",
           [input.accountId],
         )
       ).rows[0];
@@ -413,6 +573,9 @@ export class PgStore implements Store {
             accountId: input.accountId,
             version: Number(row.version),
             enabled: row.enabled as boolean,
+            ...(row.billing_owner_id
+              ? { billingOwnerId: row.billing_owner_id }
+              : {}),
           }
         : undefined;
       const authority = nextHostedAuthority(current, input);
@@ -425,8 +588,13 @@ export class PgStore implements Store {
       if (rows.some((m) => m.hosted && m.hosted.accountId !== input.accountId))
         throw new HttpError(409, "Legacy meeting belongs to another account");
       await c.query(
-        "INSERT INTO hosted_authorities(account_id,version,enabled) VALUES($1,$2,$3) ON CONFLICT(account_id) DO UPDATE SET version=$2,enabled=$3",
-        [authority.accountId, authority.version, authority.enabled],
+        "INSERT INTO hosted_authorities(account_id,version,enabled,billing_owner_id) VALUES($1,$2,$3,$4) ON CONFLICT(account_id) DO UPDATE SET version=$2,enabled=$3,billing_owner_id=$4",
+        [
+          authority.accountId,
+          authority.version,
+          authority.enabled,
+          authority.billingOwnerId ?? null,
+        ],
       );
       const meetings: Meeting[] = [];
       for (const m of rows) {
@@ -569,10 +737,28 @@ export class PgStore implements Store {
     });
   }
   async releasePhone(callId: string, code: string, participantId: string) {
-    await this.pool.query(
-      "UPDATE phone_calls SET released=true WHERE call_id=$1 AND meeting_code=$2 AND participant_id=$3 AND NOT EXISTS (SELECT 1 FROM phone_dialogs WHERE call_id=$1)",
-      [callId, code, participantId],
-    );
+    await this.phoneTransaction(async (c) => {
+      const released = await c.query(
+        "UPDATE phone_calls SET released=true WHERE call_id=$1 AND meeting_code=$2 AND participant_id=$3 AND NOT EXISTS (SELECT 1 FROM phone_dialogs WHERE call_id=$1) RETURNING call_id",
+        [callId, code, participantId],
+      );
+      if (released.rowCount) {
+        const m = (
+          await c.query("SELECT data FROM meetings WHERE code=$1 FOR UPDATE", [
+            code,
+          ])
+        ).rows[0]?.data as Meeting | undefined;
+        const p = m?.participants.find((x) => x.id === participantId);
+        if (p?.phone?.callId === callId) {
+          p.phone.closed = true;
+          m!.revision++;
+          await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+            code,
+            JSON.stringify(m),
+          ]);
+        }
+      }
+    });
   }
   private async phoneTransaction<T>(
     fn: (client: pg.PoolClient) => Promise<T>,
@@ -875,6 +1061,13 @@ export class PgStore implements Store {
           ).rows[0]?.data
         : undefined;
       finishedPhoneParticipant(dialog, meeting);
+      if (meeting) {
+        meeting.revision++;
+        await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+          meeting.code,
+          JSON.stringify(meeting),
+        ]);
+      }
       if (dialog.binding) {
         const released = await c.query(
           "UPDATE phone_calls SET released=true WHERE call_id=$1 AND meeting_code=$2 AND participant_id=$3 RETURNING call_id",
@@ -1022,18 +1215,61 @@ export class PgStore implements Store {
 // Test adapter only; production always uses PostgreSQL transactions.
 export class MemoryStore implements Store {
   hostedAuthorities = new Map<string, HostedAuthority>();
+  hostedEntitlements = new Map<string, HostedEntitlement>();
+  async setHostedEntitlement(raw: HostedEntitlement) {
+    const input = entitlementSchema.parse(raw);
+    return this.serialize(async () => {
+      const previous = this.hostedEntitlements.get(input.billingOwnerId);
+      const grant = nextEntitlement(previous, input);
+      if (grant !== previous) {
+        const meetings = structuredClone([...this.data.values()]);
+        applyEntitlement(grant, meetings);
+        for (const m of meetings)
+          if (m.hosted?.billingOwnerId === grant.billingOwnerId) {
+            m.revision++;
+            this.data.set(m.code, m);
+          }
+        this.hostedEntitlements.set(
+          input.billingOwnerId,
+          structuredClone(grant),
+        );
+      }
+      return structuredClone(grant);
+    });
+  }
+  async startMeeting<T>(
+    code: string,
+    fn: (m: Meeting) => Promise<T> | T,
+  ): Promise<T> {
+    return this.change(code, async (m) => {
+      const result = await fn(m);
+      startMeetingReservation(m, [...this.data.values()]);
+      return result;
+    });
+  }
   async createHosted(m: Meeting) {
     m = structuredClone(m);
     m.hosted!.accountId = m.hosted!.accountId.toLowerCase();
     m.hosted!.operationId = m.hosted!.operationId?.toLowerCase();
+    m.hosted!.billingOwnerId = m.hosted!.billingOwnerId?.toLowerCase();
     return this.serialize(async () => {
       const binding = m.hosted!;
       const authority = this.hostedAuthorities.get(binding.accountId);
       if (
         authority &&
-        (!authority.enabled || authority.version !== binding.version)
+        (!authority.enabled ||
+          authority.version !== binding.version ||
+          (authority.billingOwnerId &&
+            authority.billingOwnerId !== binding.billingOwnerId))
       )
         throw new HttpError(409, "Hosting authority is not current");
+      if (!binding.billingOwnerId)
+        throw new HttpError(403, "Hosting plan is required");
+      const grant = requireEntitlement(
+        this.hostedEntitlements.get(binding.billingOwnerId),
+        binding.accountId,
+      );
+      binding.entitlement = entitlementFor(grant, binding.accountId);
       const existing = [...this.data.values()].find(
         (row) =>
           row.hosted?.accountId === binding.accountId &&
@@ -1041,14 +1277,12 @@ export class MemoryStore implements Store {
       );
       if (existing) return structuredClone(reusableHostedMeeting(existing, m));
       await this.create(m);
-      this.hostedAuthorities.set(
-        binding.accountId,
-        authority ?? {
-          accountId: binding.accountId,
-          version: binding.version,
-          enabled: true,
-        },
-      );
+      this.hostedAuthorities.set(binding.accountId, {
+        accountId: binding.accountId,
+        version: binding.version,
+        enabled: true,
+        billingOwnerId: binding.billingOwnerId,
+      });
       await this.audit(
         m.code,
         `hosted:${binding.accountId}`,
@@ -1061,7 +1295,13 @@ export class MemoryStore implements Store {
   async setHostedAuthority(
     input: HostedAuthority & { legacyCodes?: string[] },
   ) {
-    input = { ...input, accountId: input.accountId.toLowerCase() };
+    input = {
+      ...input,
+      accountId: input.accountId.toLowerCase(),
+      ...(input.billingOwnerId
+        ? { billingOwnerId: input.billingOwnerId.toLowerCase() }
+        : {}),
+    };
     return this.serialize(async () => {
       const authority = nextHostedAuthority(
         this.hostedAuthorities.get(input.accountId),
@@ -1216,8 +1456,15 @@ export class MemoryStore implements Store {
       !this.phoneDialogs.has(callId) &&
       call?.code === code &&
       call.participantId === participantId
-    )
+    ) {
       call.released = true;
+      const m = this.data.get(code);
+      const p = m?.participants.find((x) => x.id === participantId);
+      if (p?.phone?.callId === callId) {
+        p.phone.closed = true;
+        m!.revision++;
+      }
+    }
   }
   private phoneCapacity() {
     return new Set([
@@ -1424,6 +1671,10 @@ export class MemoryStore implements Store {
       dialog.state = "closed";
       bumpPhoneDialog(dialog);
       if (dialog.binding) call!.released = true;
+      if (meeting) {
+        meeting.revision++;
+        this.data.set(meeting.code, meeting);
+      }
       this.phoneDialogs.set(callId, dialog);
       return structuredClone(dialog);
     });

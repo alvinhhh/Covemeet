@@ -55,8 +55,20 @@ async function fixture(
   const app = await createApp(config, store, media);
   t.after(() => app.close());
   const accountId = randomUUID();
+  const foreignAccountId = randomUUID();
+  const billingOwnerId = randomUUID();
+  const grant = {
+    billingOwnerId,
+    revision: 1,
+    validUntil: Date.now() + 300000,
+    enabled: true,
+    hostAccountIds: [accountId, foreignAccountId],
+    limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 2 },
+  };
+  await store.setHostedEntitlement(grant);
   const input = {
     accountId,
+    billingOwnerId,
     version: 1,
     operationId: randomUUID(),
     meeting: settings,
@@ -118,6 +130,10 @@ async function fixture(
     media,
     app,
     accountId,
+    foreignAccountId,
+    billingOwnerId,
+    grant,
+    tick,
     input,
     internal,
     create,
@@ -471,7 +487,7 @@ test("legacy batches bind only unowned meetings and reject another account atomi
   );
   assert.equal((await f.store.get(current.code))!.ended, false);
   const foreign = (
-    await f.create({ accountId: randomUUID(), operationId: randomUUID() })
+    await f.create({ accountId: f.foreignAccountId, operationId: randomUUID() })
   ).json();
   const three = await legacy();
   assert.equal(
@@ -687,4 +703,462 @@ test("self-hosted portal origin authorization uses the matched route for encoded
     payload: { token: created.json().hostToken },
   });
   assert.equal(exchanged.statusCode, 403);
+});
+
+test("pool grants require machine authentication, bounded freshness and exact monotonic revisions", async (t) => {
+  const f = await fixture(t);
+  assert.equal(
+    (
+      await f.internal("entitlements", f.grant, {
+        origin,
+        "x-requested-with": "MeetingPlatform",
+      })
+    ).statusCode,
+    403,
+  );
+  assert.equal(
+    (
+      await f.internal("entitlements", {
+        ...f.grant,
+        validUntil: Date.now() + 400000,
+      })
+    ).statusCode,
+    400,
+  );
+  assert.equal(
+    (
+      await f.internal("entitlements", {
+        ...f.grant,
+        hostAccountIds: [f.accountId, f.accountId.toUpperCase()],
+      })
+    ).statusCode,
+    400,
+  );
+  assert.equal(
+    (
+      await f.internal("entitlements", {
+        ...f.grant,
+        hostAccountIds: [...f.grant.hostAccountIds].reverse(),
+      })
+    ).statusCode,
+    200,
+  );
+  assert.equal(
+    (await f.internal("entitlements", { ...f.grant, enabled: false }))
+      .statusCode,
+    409,
+  );
+  assert.equal(
+    (
+      await f.internal("entitlements", {
+        ...f.grant,
+        revision: 2,
+        enabled: false,
+      })
+    ).statusCode,
+    200,
+  );
+  const stale = await f.internal("entitlements", f.grant);
+  assert.equal(stale.json().revision, 2);
+  assert.equal((await f.create()).statusCode, 403);
+});
+
+test("new customer creation requires an allowed host and persisted fresh pool; initial owner binding cannot be replaced", async (t) => {
+  const f = await fixture(t);
+  assert.equal(
+    (await f.create({ billingOwnerId: randomUUID() })).statusCode,
+    403,
+  );
+  assert.equal((await f.create({ accountId: randomUUID() })).statusCode, 403);
+  assert.equal((await f.authority(1, true)).statusCode, 200);
+  assert.equal((await f.create()).statusCode, 200);
+  assert.equal(
+    (await f.authority(1, true, { billingOwnerId: randomUUID() })).statusCode,
+    409,
+  );
+  assert.equal(
+    f.store.hostedAuthorities.get(f.accountId)?.billingOwnerId,
+    f.billingOwnerId,
+  );
+  await f.internal("entitlements", {
+    ...f.grant,
+    revision: 2,
+    validUntil: Date.now() - 1,
+  });
+  assert.equal((await f.create({ operationId: randomUUID() })).statusCode, 403);
+});
+
+test("host exchange atomically reserves one slot per host, and closing media retains that slot", async (t) => {
+  const f = await fixture(t);
+  const one = (await f.create()).json();
+  const two = (await f.create({ operationId: randomUUID() })).json();
+  const before = (await f.store.get(one.code))!;
+  assert.equal(before.lifecycle, undefined);
+  const starts = await Promise.all(
+    [one, two].map((row) =>
+      f.browser(`/api/meetings/${row.code}/host`, { token: row.hostToken }),
+    ),
+  );
+  assert.deepEqual(starts.map((r) => r.statusCode).sort(), [200, 409]);
+  const index = starts.findIndex((r) => r.statusCode === 200);
+  const first = [one, two][index]!;
+  const second = [one, two][1 - index]!;
+  const cookie = starts[index]!.cookies.map((c) => `${c.name}=${c.value}`).join(
+    "; ",
+  );
+  const started = (await f.store.get(first.code))!.lifecycle!;
+  assert.equal(started.deadlineAt! - started.startedAt, 7200000);
+  f.media.failEnd = true;
+  const ended = await f.browser(`/api/meetings/${first.code}/end`, {}, cookie);
+  assert.equal(ended.statusCode, 202);
+  assert.deepEqual(ended.json(), { ok: true, cleanupPending: true });
+  const closing = await f.browser(
+    `/api/meetings/${first.code}/state`,
+    undefined,
+    cookie,
+  );
+  assert.equal(closing.json().meeting.ended, true);
+  assert.equal(closing.json().meeting.cleanupPending, true);
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${second.code}/host`, {
+        token: second.hostToken,
+      })
+    ).statusCode,
+    409,
+  );
+  assert.equal(
+    (await f.store.get(first.code))!.lifecycle?.cleanupConfirmed,
+    undefined,
+  );
+  f.media.failEnd = false;
+  await f.tick();
+  assert.equal(
+    (await f.store.get(first.code))!.lifecycle?.cleanupConfirmed,
+    true,
+  );
+  const completed = await f.browser(
+    `/api/meetings/${first.code}/end`,
+    {},
+    cookie,
+  );
+  assert.equal(completed.statusCode, 200);
+  assert.deepEqual(completed.json(), { ok: true, cleanupPending: false });
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${second.code}/host`, {
+        token: second.hostToken,
+      })
+    ).statusCode,
+    200,
+  );
+});
+
+test("a one-slot pool serializes different hosts and a pool decrease ends every affected active room", async (t) => {
+  const f = await fixture(t);
+  await f.internal("entitlements", {
+    ...f.grant,
+    revision: 2,
+    limits: { ...f.grant.limits, concurrentMeetings: 1 },
+  });
+  const one = (await f.create()).json();
+  const two = (
+    await f.create({ accountId: f.foreignAccountId, operationId: randomUUID() })
+  ).json();
+  const starts = await Promise.all(
+    [one, two].map((row) =>
+      f.browser(`/api/meetings/${row.code}/host`, { token: row.hostToken }),
+    ),
+  );
+  assert.deepEqual(starts.map((r) => r.statusCode).sort(), [200, 409]);
+  await f.internal("entitlements", { ...f.grant, revision: 3 });
+  const waiting = [one, two][starts.findIndex((r) => r.statusCode === 409)]!;
+  await f.exchange(waiting.code, waiting.hostToken);
+  await f.internal("entitlements", {
+    ...f.grant,
+    revision: 4,
+    limits: { ...f.grant.limits, concurrentMeetings: 1 },
+  });
+  assert.ok((await f.store.get(one.code))!.ended);
+  assert.ok((await f.store.get(two.code))!.ended);
+});
+
+test("allowed-host removal overrides stale authority and denies existing media while another member remains active", async (t) => {
+  const f = await fixture(t);
+  const one = (await f.create()).json();
+  const two = (
+    await f.create({ accountId: f.foreignAccountId, operationId: randomUUID() })
+  ).json();
+  const host = await f.exchange(one.code, one.hostToken);
+  await f.exchange(two.code, two.hostToken);
+  const token = (
+    await f.browser(`/api/meetings/${one.code}/media`, {}, host)
+  ).json().token;
+  await f.media.authorize(token);
+  await f.internal("entitlements", {
+    ...f.grant,
+    revision: 2,
+    hostAccountIds: [f.foreignAccountId],
+  });
+  assert.equal((await f.store.get(one.code))!.ended, true);
+  assert.equal((await f.store.get(two.code))!.ended, false);
+  assert.equal((await f.authority(1, true)).json().version, 1);
+  assert.equal((await f.create({ operationId: randomUUID() })).statusCode, 403);
+  await assert.rejects(f.media.authorize(token));
+});
+
+test("grant renewal never extends the meeting deadline; expiry blocks tokens and phone renewal before the worker", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const cookie = await f.exchange(made.code, made.hostToken);
+  const deadline = (await f.store.get(made.code))!.lifecycle!.deadlineAt;
+  await f.internal("entitlements", {
+    ...f.grant,
+    revision: 2,
+    validUntil: Date.now() + 310000,
+  });
+  assert.equal((await f.store.get(made.code))!.lifecycle!.deadlineAt, deadline);
+  const access = (
+    await f.browser(`/api/meetings/${made.code}/phone`, {}, cookie)
+  ).json();
+  const callId = randomUUID();
+  const call = (
+    await f.gateway("calls", {
+      callId,
+      trunkId: "fixture",
+      locator: access.locator,
+      pin: access.pin,
+    })
+  ).json();
+  const jwt = (
+    await f.browser(`/api/meetings/${made.code}/media`, {}, cookie)
+  ).json().token;
+  await f.store.change(made.code, (m) => {
+    m.lifecycle!.deadlineAt = Date.now() - 1;
+    m.recordingAllowed = true;
+    m.hostEmailVerified = true;
+  });
+  assert.equal(
+    (await f.browser(`/api/meetings/${made.code}/media`, {}, cookie))
+      .statusCode,
+    410,
+  );
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/join`, {
+        name: "Late",
+        password: settings.password,
+      })
+    ).statusCode,
+    410,
+  );
+  await assert.rejects(f.media.authorize(jwt));
+  const polled = await f.gateway(`calls/${made.code}/${call.participantId}`, {
+    callId,
+    sessionToken: call.sessionToken,
+    action: "poll",
+  });
+  assert.equal(polled.json().state, "ended");
+  assert.equal(polled.json().grant, undefined);
+  assert.equal(await f.store.hasPhoneReservations(made.code), true);
+  await f.tick();
+  assert.equal((await f.store.get(made.code))!.ended, true);
+  assert.equal(
+    (await f.store.get(made.code))!.lifecycle?.cleanupConfirmed,
+    undefined,
+  );
+});
+
+test("hosted webinar uses 100 total places including host, pending removal and phone callers", async (t) => {
+  const f = await fixture(t);
+  const made = (
+    await f.create({ meeting: { ...settings, mode: "webinar" } })
+  ).json();
+  const cookie = await f.exchange(made.code, made.hostToken);
+  const access = (
+    await f.browser(`/api/meetings/${made.code}/phone`, {}, cookie)
+  ).json();
+  await f.store.change(made.code, (m) => {
+    const sample = m.participants[0]!;
+    for (let i = 0; i < 99; i++)
+      m.participants.push({
+        ...sample,
+        id: randomUUID(),
+        role: "viewer",
+        status: i === 98 ? "left" : "waiting",
+        tokenHash: "",
+        enforcementPending: i === 98,
+      });
+  });
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/join`, {
+        name: "Extra",
+        password: settings.password,
+      })
+    ).statusCode,
+    409,
+  );
+  assert.equal(
+    (
+      await f.gateway("calls", {
+        callId: randomUUID(),
+        trunkId: "fixture",
+        locator: access.locator,
+        pin: access.pin,
+      })
+    ).statusCode,
+    409,
+  );
+  const state = await f.browser(
+    `/api/meetings/${made.code}/state`,
+    undefined,
+    cookie,
+  );
+  assert.equal(state.json().meeting.participantLimit, 100);
+  await f.store.change(made.code, (m) => {
+    m.participants.at(-1)!.enforcementPending = false;
+  });
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/join`, {
+        name: "Last place",
+        password: settings.password,
+      })
+    ).statusCode,
+    200,
+  );
+});
+
+test("ordinary completion retains finished recording credentials and cannot release a busy recorder slot", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const cookie = await f.exchange(made.code, made.hostToken);
+  const id = randomUUID();
+  await f.store.change(made.code, (m) => {
+    m.recordings.push({
+      id: "finished",
+      status: "ready",
+      createdAt: Date.now(),
+      tokenHash: "retained-download",
+      passwordHash: "retained-password",
+    });
+    m.recordings.push({
+      id,
+      status: "recording",
+      createdAt: Date.now(),
+      egressId: "owned-job",
+    });
+  });
+  await f.store.withRecordingLock(made.code, id, async () => {
+    const ended = await f.browser(`/api/meetings/${made.code}/end`, {}, cookie);
+    assert.equal(ended.statusCode, 202);
+    assert.equal(ended.json().cleanupPending, true);
+  });
+  const stopped = (await f.store.get(made.code))!;
+  assert.equal(stopped.recordings[0]!.tokenHash, "retained-download");
+  assert.equal(stopped.recordings[0]!.passwordHash, "retained-password");
+  assert.equal(stopped.hosted?.revoked, undefined);
+  assert.equal(stopped.lifecycle?.cleanupConfirmed, undefined);
+  await f.store.change(made.code, (m) => {
+    m.recordings[1]!.status = "failed";
+  });
+  await f.tick();
+  assert.equal(
+    (await f.store.get(made.code))!.lifecycle?.cleanupConfirmed,
+    true,
+  );
+});
+
+test("new plan bindings and pool expiry leave old unbound operator rooms unchanged", async (t) => {
+  const f = await fixture(t);
+  const legacy = (
+    await f.browser("/api/meetings", { ...settings, creationKey })
+  ).json();
+  const host = await f.exchange(legacy.code, legacy.hostToken);
+  await f.authority(1, true, { billingOwnerId: f.billingOwnerId });
+  await f.internal("entitlements", { ...f.grant, revision: 2, enabled: false });
+  await f.tick();
+  assert.equal((await f.store.get(legacy.code))!.ended, false);
+  assert.equal(
+    (await f.browser(`/api/meetings/${legacy.code}/media`, {}, host))
+      .statusCode,
+    200,
+  );
+});
+
+test("self-hosted numeric limits need no hosted entitlement and keep a fixed configured duration", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  f.config.meetingParticipantLimit = 2;
+  f.config.meetingDurationSeconds = 60;
+  const made = (
+    await f.browser("/api/meetings", { ...settings, creationKey })
+  ).json();
+  await f.exchange(made.code, made.hostToken);
+  const m = (await f.store.get(made.code))!;
+  assert.equal(m.hosted, undefined);
+  assert.equal(m.lifecycle!.deadlineAt! - m.lifecycle!.startedAt, 60000);
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/join`, {
+        name: "Guest",
+        password: settings.password,
+      })
+    ).statusCode,
+    200,
+  );
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/join`, {
+        name: "Extra",
+        password: settings.password,
+      })
+    ).statusCode,
+    409,
+  );
+  assert.throws(() =>
+    loadConfig({
+      SESSION_SECRET: "x".repeat(32),
+      MEETING_DURATION_SECONDS: "-1",
+    }),
+  );
+  assert.throws(() =>
+    loadConfig({
+      SESSION_SECRET: "x".repeat(32),
+      MEETING_PARTICIPANT_LIMIT: "1.5",
+    }),
+  );
+});
+
+test("breakout and reconnect grants preserve the original start reservation and deadline", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const cookie = await f.exchange(made.code, made.hostToken);
+  const initial = (await f.store.get(made.code))!;
+  await f.browser(
+    `/api/meetings/${made.code}/breakouts`,
+    { name: "Side room" },
+    cookie,
+  );
+  const room = (await f.store.get(made.code))!.breakouts[0]!;
+  assert.equal(
+    (
+      await f.browser(
+        `/api/meetings/${made.code}/move`,
+        { participantId: initial.participants[0]!.id, breakoutId: room.id },
+        cookie,
+      )
+    ).statusCode,
+    200,
+  );
+  for (let i = 0; i < 2; i++)
+    assert.equal(
+      (await f.browser(`/api/meetings/${made.code}/media`, {}, cookie))
+        .statusCode,
+      200,
+    );
+  const moved = (await f.store.get(made.code))!;
+  assert.deepEqual(moved.lifecycle, initial.lifecycle);
+  assert.equal(moved.participants.length, 1);
+  assert.equal(moved.participants[0]!.id, initial.participants[0]!.id);
 });

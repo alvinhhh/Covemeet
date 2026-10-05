@@ -286,3 +286,48 @@ test("another API cannot recover an in-flight start, and stop intent survives it
   assert.equal(f.jobs.length, 1);
   assert.deepEqual(f.stops, [f.jobs[0]!.egressId]);
 });
+
+test("hosted deadline and stale plan snapshots prevent recorder startup using an older authorized request", async (t) => {
+  const f = await fixture(t);
+  const accountId = randomUUID();
+  const policy = {
+    revision: 1,
+    validUntil: Date.now() + 300000,
+    enabled: true,
+    allowed: true,
+    limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 1 },
+  };
+  for (const reason of [
+    "deadline",
+    "grant",
+    "membership",
+    "missing",
+  ] as const) {
+    await f.store.change(f.meeting.code, (m) => {
+      m.hosted = {
+        accountId,
+        billingOwnerId: accountId,
+        version: 1,
+        entitlement: structuredClone(policy),
+      };
+      m.lifecycle = {
+        startedAt: Date.now() - 1000,
+        deadlineAt: Date.now() + 1000,
+      };
+      if (reason === "deadline") m.lifecycle.deadlineAt = Date.now() - 1;
+      if (reason === "grant") m.hosted.entitlement!.validUntil = Date.now() - 1;
+      if (reason === "membership") m.hosted.entitlement!.allowed = false;
+      if (reason === "missing") delete m.hosted.entitlement;
+    });
+    await assert.rejects(
+      f.service.start(f.meeting),
+      (error: unknown) => error instanceof HttpError && error.status === 403,
+    );
+    assert.equal(f.jobs.length, 0, reason);
+    assert.equal(
+      (await f.store.get(f.meeting.code))!.recordings.length,
+      0,
+      reason,
+    );
+  }
+});

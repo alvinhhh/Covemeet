@@ -1,3 +1,8 @@
+import {
+  meetingAllowed,
+  meetingDeadline,
+  requireMeetingSeat,
+} from "./meeting-limits.js";
 import { randomInt, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Config } from "./config.js";
@@ -137,7 +142,7 @@ export class PhoneService {
       this.config.phoneMaxCalls,
       (m) => {
         if (
-          m.ended ||
+          !meetingAllowed(m) ||
           m.locked ||
           !m.phoneAccess?.enabled ||
           m.phoneAccess.locator !== body.locator ||
@@ -147,20 +152,12 @@ export class PhoneService {
           throw new HttpError(403, "Phone access unavailable");
         if (callerHash && m.bans.caller?.includes(callerHash))
           throw new HttpError(403, "Phone access unavailable");
-        const occupied = m.participants.filter(
-          (p) =>
-            ["waiting", "admitted"].includes(p.status) &&
-            p.expiresAt > Date.now(),
-        );
-        if (
-          m.mode === "meeting"
-            ? occupied.length >= 100
-            : occupied.filter((p) => p.role === "viewer").length >= 1000
-        )
-          throw new HttpError(409, "Meeting capacity is full");
+        requireMeetingSeat(m);
         const current = Date.now();
-        const callExpiresAt =
-          current + this.config.phoneMaxDurationSeconds * 1000;
+        const callExpiresAt = Math.min(
+          current + this.config.phoneMaxDurationSeconds * 1000,
+          m.lifecycle?.deadlineAt ?? Infinity,
+        );
         const p: Participant = {
           id: participantId,
           name: `Phone caller ${participantId.slice(0, 4).toUpperCase()}`,
@@ -184,7 +181,10 @@ export class PhoneService {
             callerHash,
             muted: true,
             handRaised: false,
-            leaseExpiresAt: current + PHONE_LEASE_MS,
+            leaseExpiresAt: Math.min(
+              current + PHONE_LEASE_MS,
+              meetingDeadline(m),
+            ),
             callExpiresAt,
           },
         };
@@ -221,7 +221,7 @@ export class PhoneService {
       const ended =
         body.action === "leave" ||
         !this.config.phoneEnabled ||
-        m.ended ||
+        !meetingAllowed(m) ||
         !m.phoneAccess?.enabled ||
         p.expiresAt <= now ||
         p.phone.leaseExpiresAt <= now ||
@@ -235,7 +235,11 @@ export class PhoneService {
         }
         p.phone.leaseExpiresAt = 0;
       } else {
-        p.phone.leaseExpiresAt = Math.min(p.expiresAt, now + PHONE_LEASE_MS);
+        p.phone.leaseExpiresAt = Math.min(
+          p.expiresAt,
+          meetingDeadline(m),
+          now + PHONE_LEASE_MS,
+        );
         if (
           body.action === "toggle-mute" &&
           p.status === "admitted" &&

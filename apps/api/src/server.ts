@@ -27,6 +27,17 @@ import {
 import { RecordingService } from "./recordings.js";
 import { PhoneService, revokePhoneParticipants } from "./phone.js";
 import { PhoneDialogService } from "./phone-dialogs.js";
+import {
+  endMeeting,
+  entitlementSchema,
+  meetingAllowed,
+  participantLimit,
+  occupiesMeetingSeat,
+  requireWebinarViewerSeat,
+  webinarViewerLimit,
+  requireMeetingAccess,
+  requireMeetingSeat,
+} from "./meeting-limits.js";
 
 const name = z.string().trim().min(1).max(80),
   password = z.string().min(8).max(256);
@@ -43,9 +54,7 @@ const hostedUuid = z
   .uuid()
   .transform((value) => value.toLowerCase());
 const hostedVersion = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const meetingLimit = 100,
-  webinarViewerLimit = 1000,
-  webinarPresenterLimit = 10;
+const webinarPresenterLimit = 10;
 const occupiesSeat = (p: Participant) =>
   (p.status === "admitted" || p.status === "waiting") &&
   p.expiresAt > Date.now();
@@ -223,7 +232,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     return p;
   }
   function active(m: Meeting) {
-    if (m.ended) throw new HttpError(410, "Meeting ended");
+    requireMeetingAccess(m);
   }
   const codeOf = (req: FastifyRequest) =>
     normalizeCode((req.params as any).code ?? "");
@@ -507,6 +516,13 @@ export async function createApp(config: Config, store: Store, media: Media) {
       passwordHash: await passwordHash(body.password),
       hostTokenHash: digest(hostToken),
       hostTokenExpiresAt: Date.now() + 30 * 60000,
+      limits: {
+        participants:
+          body.mode === "meeting"
+            ? config.meetingParticipantLimit
+            : config.webinarParticipantLimit,
+        durationSeconds: config.meetingDurationSeconds,
+      },
       participants: [],
       bans: { ip: [], device: [] },
       breakouts: [],
@@ -534,6 +550,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const body = z
       .object({
         accountId: hostedUuid,
+        billingOwnerId: hostedUuid,
         version: hostedVersion,
         operationId: hostedUuid,
         meeting: meetingInput,
@@ -553,6 +570,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       config.secret,
       JSON.stringify([
         "hosted-create-request-v1",
+        body.billingOwnerId,
         body.accountId,
         body.version,
         body.operationId,
@@ -565,6 +583,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const candidate = await buildMeeting(body.meeting, hostToken);
     candidate.hosted = {
       accountId: body.accountId,
+      billingOwnerId: body.billingOwnerId,
       version: body.version,
       operationId: body.operationId,
       requestHash,
@@ -582,7 +601,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       guestUrl: `${config.origin}/join/${m.code}`,
     };
   });
-  async function cleanupHosted(m: Meeting) {
+  async function cleanupMeeting(m: Meeting) {
     let failed = false;
     try {
       await recordings.stopAll(m);
@@ -593,8 +612,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       if (!media.available) throw new Error("Media cleanup is unavailable");
       await media.end(m);
       await store.change(m.code, (state) => {
-        if (!state.hosted?.revoked)
-          throw new Error("Hosted revocation changed");
+        if (!state.ended) throw new Error("Meeting completion changed");
         for (const p of state.participants) {
           p.enforcementPending = false;
           delete p.previousRoom;
@@ -615,15 +633,24 @@ export async function createApp(config: Config, store: Store, media: Media) {
       failed = true;
     if (!failed)
       await store.change(m.code, (state) => {
-        if (!state.hosted?.revoked)
-          throw new Error("Hosted revocation changed");
-        state.hosted.cleanupConfirmed = true;
+        if (!state.ended) throw new Error("Meeting completion changed");
+        state.cleanupPending = false;
+        if (state.hosted?.revoked) state.hosted.cleanupConfirmed = true;
+        if (state.lifecycle) state.lifecycle.cleanupConfirmed = true;
       });
+    return !failed;
   }
+  app.post("/api/internal/hosted/entitlements", async (req) => {
+    const grant = await store.setHostedEntitlement(
+      entitlementSchema.parse(req.body),
+    );
+    return { ok: true, revision: grant.revision };
+  });
   app.post("/api/internal/hosted/authority", async (req, reply) => {
     const body = z
       .object({
         accountId: hostedUuid,
+        billingOwnerId: hostedUuid.optional(),
         version: hostedVersion,
         enabled: z.boolean(),
         legacyCodes: z
@@ -677,7 +704,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
   app.post("/api/meetings/:code/host", async (req, reply) => {
     const { token } = z.object({ token: z.string().max(256) }).parse(req.body);
     const session = randomToken();
-    const id = await store.change(codeOf(req), (m) => {
+    const id = await store.startMeeting(codeOf(req), (m) => {
       active(m);
       if (
         !m.hostTokenHash ||
@@ -715,16 +742,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           m.bans.ip.includes(ids.ipHash)
         )
           throw new HttpError(403, "Entry is blocked for this meeting");
-        const occupied = m.participants.filter(occupiesSeat);
-        if (m.mode === "webinar") {
-          if (
-            occupied.filter((p) => p.role === "viewer").length >=
-            webinarViewerLimit
-          )
-            throw new HttpError(409, "Webinar audience is full");
-        } else if (occupied.length >= meetingLimit) {
-          throw new HttpError(409, "Meeting is full");
-        }
+        requireMeetingSeat(m);
         const p: Participant = {
           id: randomUUID(),
           name: body.name,
@@ -797,11 +815,18 @@ export async function createApp(config: Config, store: Store, media: Media) {
                     (x) => occupiesSeat(x) && x.role === "viewer",
                   ).length,
                   presenterLimit: webinarPresenterLimit,
-                  viewerLimit: webinarViewerLimit,
+                  viewerLimit: Math.min(
+                    webinarViewerLimit,
+                    participantLimit(m) - 1,
+                  ),
                 }
               : undefined,
           locked: m.locked,
-          ended: m.ended,
+          ended: !meetingAllowed(m),
+          cleanupPending: !!m.cleanupPending,
+          participantLimit: participantLimit(m),
+          startedAt: m.lifecycle?.startedAt,
+          deadlineAt: m.lifecycle?.deadlineAt,
           recordingAllowed: m.recordingAllowed,
           createdAt: m.createdAt,
           hostEmailVerified:
@@ -907,7 +932,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           body.action === "promote" ? "viewer" : "participant";
         if (p.role !== expectedRole)
           throw new HttpError(409, "Participant already has this role");
-        const occupied = m.participants.filter(occupiesSeat);
+        const occupied = m.participants.filter(occupiesMeetingSeat);
         if (
           body.action === "promote" &&
           occupied.filter((x) => x.role !== "viewer").length >=
@@ -917,12 +942,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
             409,
             "Webinar stage is full (10 including the host)",
           );
-        if (
-          body.action === "demote" &&
-          occupied.filter((x) => x.role === "viewer").length >=
-            webinarViewerLimit
-        )
-          throw new HttpError(409, "Webinar audience is full");
+        if (body.action === "demote") requireWebinarViewerSeat(m);
       }
       if (body.action === "admit") {
         if (p.status !== "waiting")
@@ -997,27 +1017,17 @@ export async function createApp(config: Config, store: Store, media: Media) {
     await store.audit(m.code, actor(req, m, true).id, "meeting.policy");
     return { ok: true };
   });
-  app.post("/api/meetings/:code/end", async (req) => {
+  app.post("/api/meetings/:code/end", async (req, reply) => {
     const m = await store.change(codeOf(req), (m) => {
       actor(req, m, true);
-      m.ended = true;
-      m.locked = true;
-      for (const p of m.participants) {
-        p.mediaVersion++;
-        p.enforcementPending = true;
-      }
-      for (const r of m.recordings)
-        if (["starting", "recording", "stopping"].includes(r.status))
-          r.status = "stopping";
+      endMeeting(m);
       return structuredClone(m);
     });
-    try {
-      await recordings.stopAll(m);
-    } finally {
-      await media.end(m);
-    }
+    const complete = await cleanupMeeting(m);
     await store.audit(m.code, "host", "meeting.end");
-    return { ok: true };
+    return reply
+      .code(complete ? 200 : 202)
+      .send({ ok: true, cleanupPending: !complete });
   });
   app.post("/api/meetings/:code/leave", async (req) => {
     let who!: Participant;
@@ -1267,8 +1277,17 @@ export async function createApp(config: Config, store: Store, media: Media) {
     ticking = true;
     try {
       for (let m of await store.all()) {
-        if (m.hosted?.revoked && !m.hosted.cleanupConfirmed) {
-          await cleanupHosted(m).catch(() => {});
+        if (!m.ended && !meetingAllowed(m)) {
+          m = await store.change(m.code, (state) => {
+            if (!meetingAllowed(state)) endMeeting(state);
+            return structuredClone(state);
+          });
+        }
+        if (
+          m.cleanupPending ||
+          (m.hosted?.revoked && !m.hosted.cleanupConfirmed)
+        ) {
+          await cleanupMeeting(m).catch(() => {});
           continue;
         }
         if (

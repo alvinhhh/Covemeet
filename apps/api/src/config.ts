@@ -127,7 +127,37 @@ export function loadConfig(env = process.env) {
   ) {
     throw new Error("RECORDING_MAX_BYTES must be between 93 bytes and 64 GiB");
   }
+  const meetingLimit = (
+    key: string,
+    fallback: number,
+    maximum: number,
+    minimum = 1,
+  ) => {
+    const value = Number(env[key] ?? fallback);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum)
+      throw new Error(`${key} must be between ${minimum} and ${maximum}`);
+    return value;
+  };
+  const meetingParticipantLimit = meetingLimit(
+    "MEETING_PARTICIPANT_LIMIT",
+    100,
+    1000,
+  );
+  const webinarParticipantLimit = meetingLimit(
+    "WEBINAR_PARTICIPANT_LIMIT",
+    1010,
+    1010,
+  );
+  const meetingDurationSeconds = meetingLimit(
+    "MEETING_DURATION_SECONDS",
+    0,
+    86400,
+    0,
+  );
   return {
+    meetingParticipantLimit,
+    webinarParticipantLimit,
+    meetingDurationSeconds,
     secret,
     origin,
     portalOrigin,
