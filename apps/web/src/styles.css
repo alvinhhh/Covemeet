@@ -2759,6 +2759,40 @@ input[type="checkbox"] {
 }
 .conference .video-tile.is-speaking {
   border-color: #ffffff;
+  box-shadow: 0 0 0 3px #ffffff;
+}
+.conference .speaking-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: #171717;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+.conference .speaking-badge.tile {
+  position: absolute;
+  z-index: 2;
+  top: 12px;
+  right: 12px;
+  background: #ffffff;
+  color: #171717;
+  pointer-events: none;
+}
+.conference .speaking-badge.dock {
+  margin-left: 9px;
+  background: #ffffff;
+  color: #171717;
+}
+.conference .participant-row.is-speaking {
+  box-shadow: inset 3px 0 #171717;
+  background: #f2f2f2;
+}
+.conference .participant-row .speaking-badge.list {
+  margin-top: 4px;
 }
 .conference .video-tile video {
   position: absolute;

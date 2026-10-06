@@ -18,11 +18,11 @@ export function audioSignal(input: {
 }): AudioSignal {
   const microphoneOn =
     input.connected && input.allowed && input.microphoneEnabled;
-  const speaking = microphoneOn && input.isSpeaking;
-  const level =
-    speaking && Number.isFinite(input.audioLevel)
-      ? Math.min(1, Math.max(0, input.audioLevel))
-      : 0;
+  const measuredLevel = Number.isFinite(input.audioLevel)
+    ? Math.min(1, Math.max(0, input.audioLevel))
+    : 0;
+  const speaking = microphoneOn && (input.isSpeaking || measuredLevel >= 0.08);
+  const level = speaking ? measuredLevel : 0;
   return {
     microphoneOn,
     speaking,

@@ -47,6 +47,7 @@ import { DeviceCheck } from "./device-check";
 import { Chat } from "./chat";
 import { ChatUnread } from "./chat-state";
 import { Whiteboard } from "./whiteboard";
+import { SpeakingBadge } from "./speaking-badge";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
 let initialHostToken = location.pathname.startsWith("/host/")
@@ -925,6 +926,9 @@ function Conference({
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
   >(null);
   const [boardOpen, setBoardOpen] = useState(false);
+  const [audioSignals, setAudioSignals] = useState<Map<string, AudioSignal>>(
+    new Map(),
+  );
   const chatButton = useRef<HTMLButtonElement>(null);
   const chatRead = useRef(new ChatUnread());
   const [unreadChat, setUnreadChat] = useState(0);
@@ -1052,6 +1056,8 @@ function Conference({
             participants={state.participants}
             mode={state.meeting.mode}
             boardOpen={boardOpen}
+            signals={audioSignals}
+            setSignals={setAudioSignals}
             board={
               <Whiteboard
                 key={`${code}:${state.me.breakoutId ?? "main"}`}
@@ -1199,6 +1205,7 @@ function Conference({
             {panel === "participants" ? (
               <Participants
                 state={state}
+                signals={audioSignals}
                 busy={busy}
                 openPhone={
                   host && config.phoneAvailable
@@ -1243,6 +1250,10 @@ function Conference({
               ? "Viewer"
               : "Participant"}
           <span> · {state.me.name}</span>
+          <SpeakingBadge
+            surface="dock"
+            signal={audioSignals.get(participantMediaIdentity(state.me))}
+          />
         </span>
         <div className="meeting-dock">
           <div className="stage-controls">
@@ -1437,12 +1448,16 @@ function MediaStage({
   mode,
   boardOpen,
   board,
+  signals,
+  setSignals,
 }: {
   me: Participant;
   participants: Participant[];
   mode: "meeting" | "webinar";
   boardOpen: boolean;
   board: ReactNode;
+  signals: Map<string, AudioSignal>;
+  setSignals: (signals: Map<string, AudioSignal>) => void;
 }) {
   const room = useRoomContext();
   const [page, setPage] = useState(0);
@@ -1484,7 +1499,6 @@ function MediaStage({
     .map(participantMediaIdentity)
     .sort()
     .join(",");
-  const [signals, setSignals] = useState<Map<string, AudioSignal>>(new Map());
   const otherSpeakers = participants.filter(
     (participant) =>
       selection.eligibleIds.has(participantMediaIdentity(participant)) &&
@@ -1495,16 +1509,18 @@ function MediaStage({
           track.participant.identity === participantMediaIdentity(participant),
       ),
   );
-  useEffect(
-    () =>
-      observeAudioSignals(
-        room,
-        new Set(eligibleIds.split(",")),
-        new Set(allowedAudioIds.split(",")),
-        setSignals,
-      ),
-    [room, eligibleIds, allowedAudioIds],
-  );
+  useEffect(() => {
+    const stop = observeAudioSignals(
+      room,
+      new Set(eligibleIds.split(",")),
+      new Set(allowedAudioIds.split(",")),
+      setSignals,
+    );
+    return () => {
+      stop();
+      setSignals(new Map());
+    };
+  }, [room, eligibleIds, allowedAudioIds, setSignals]);
   useEffect(() => {
     const selected = new Set(selectedVideoIds.split(","));
     const eligible = new Set(eligibleIds.split(","));
@@ -1619,6 +1635,7 @@ function MediaStage({
                   data-speaking={signal?.speaking ? "true" : "false"}
                   key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
                 >
+                  <SpeakingBadge surface="tile" signal={signal} />
                   {isTrackReference(track) && !track.publication.isMuted ? (
                     <VideoTrack trackRef={track} manageSubscription={false} />
                   ) : (
@@ -1973,11 +1990,13 @@ function PhoneAccessPanel({ code }: { code: string }) {
 
 function Participants({
   state,
+  signals,
   busy,
   action,
   openPhone,
 }: {
   state: MeetingState;
+  signals: Map<string, AudioSignal>;
   busy: boolean;
   action: (id: string, data: object) => Promise<boolean>;
   openPhone?: () => void;
@@ -2060,7 +2079,9 @@ function Participants({
       <div className="section-label">IN MEETING</div>
       {admitted.map((p) => (
         <div className="participant-entry" key={p.id}>
-          <div className="participant-row">
+          <div
+            className={`participant-row ${signals.get(participantMediaIdentity(p))?.speaking ? "is-speaking" : ""}`}
+          >
             <span
               className={`avatar small-avatar ${p.role === "host" ? "host-avatar" : ""}`}
             >
@@ -2071,6 +2092,10 @@ function Participants({
                 {p.name}
                 {p.id === state.me.id ? " (you)" : ""}
               </strong>
+              <SpeakingBadge
+                surface="list"
+                signal={signals.get(participantMediaIdentity(p))}
+              />
               <small>
                 {p.transport === "phone" && "Phone caller · "}
                 {p.role === "host"

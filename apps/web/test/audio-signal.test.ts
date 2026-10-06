@@ -24,12 +24,16 @@ test("speaking indication follows real SDK speech and bounded audio levels", () 
     level: 0.25,
     bars: 2,
   });
-  assert.deepEqual(audioSignal({ ...active, isSpeaking: false }), {
-    microphoneOn: true,
-    speaking: false,
-    level: 0,
-    bars: 0,
-  });
+  assert.deepEqual(
+    audioSignal({ ...active, isSpeaking: false, audioLevel: 0.03 }),
+    {
+      microphoneOn: true,
+      speaking: false,
+      level: 0,
+      bars: 0,
+    },
+  );
+  assert.equal(audioSignal({ ...active, isSpeaking: false }).speaking, true);
   assert.equal(audioSignal({ ...active, audioLevel: 0 }).bars, 0);
   assert.equal(audioSignal({ ...active, audioLevel: 9 }).bars, 4);
   for (const audioLevel of [-1, NaN, Infinity])
