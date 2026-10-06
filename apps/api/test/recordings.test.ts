@@ -310,7 +310,9 @@ test("a revoked download stops before its next plaintext frame, including across
   const next = frames.next();
   await Promise.race([
     gate.entered,
-    next.then(() => assert.fail("Second plaintext frame escaped authorization")),
+    next.then(() =>
+      assert.fail("Second plaintext frame escaped authorization"),
+    ),
   ]);
   try {
     await otherInstance.revoke(f.meeting, f.recording.id);
@@ -349,7 +351,9 @@ test("an active download stops if current recording authority is unavailable", a
   const next = frames.next();
   await Promise.race([
     gate.entered,
-    next.then(() => assert.fail("Second plaintext frame escaped authorization")),
+    next.then(() =>
+      assert.fail("Second plaintext frame escaped authorization"),
+    ),
   ]);
   gate.fail();
   gate.release();
@@ -357,7 +361,7 @@ test("an active download stops if current recording authority is unavailable", a
   assert.equal(stream.destroyed, true);
 });
 
-test("email failure revokes the newly generated download credentials", async (t) => {
+test("email failure retains one encrypted password intent for an exact retry", async (t) => {
   const f = await fixture(t);
   const failingMail = {
     sendMail: async () => {
@@ -370,9 +374,327 @@ test("email failure revokes the newly generated download credentials", async (t)
     (error) => error instanceof HttpError && error.status === 503,
   );
   const row = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.ok(row.tokenHash);
+  assert.ok(row.passwordHash);
+  assert.ok(row.expiresAt);
+  assert.ok(row.delivery?.password?.wrappedKey.ciphertext);
+  assert.equal(JSON.stringify(row).includes("Synthetic SMTP failure"), false);
+});
+
+test("completed recording issues one recoverable link, emails only the password, and purges its envelope", async (t) => {
+  const f = await fixture(t);
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.autoLinkPending = true;
+    meeting.recordings[0]!.readyAt = Date.now();
+  });
+  const service = new RecordingService(
+    { ...f.config, recordingEnabled: false },
+    f.store,
+    f.mail,
+  );
+  await service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  await service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  assert.equal(f.emails.length, 1);
+  const row = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(row.autoLinkPending, false);
+  assert.ok(row.delivery?.sentAt);
+  assert.equal(row.delivery?.password, undefined);
+  assert.ok(row.delivery?.token.wrappedKey.ciphertext);
+  assert.equal(row.delivery?.mode, "auto");
+  const link = await service.currentLink(f.meeting, f.recording.id);
+  assert.equal(new URL(link.url).pathname, `/download/${f.meeting.code}`);
+  assert.ok(!f.emails[0]!.text.includes(link.url));
+  assert.ok(!f.emails[0]!.text.includes(new URL(link.url).hash.slice(1)));
+  const app = await f.app();
+  const url = `/api/meetings/${f.meeting.code}/recordings/${f.recording.id}/link`;
+  const guest = await app.inject({
+    method: "GET",
+    url,
+    headers: { cookie: `mp_${f.meeting.code}=${f.guestSession}` },
+  });
+  assert.equal(guest.statusCode, 403);
+  const host = await app.inject({
+    method: "GET",
+    url,
+    headers: { cookie: `mp_${f.meeting.code}=${f.hostSession}` },
+  });
+  assert.equal(host.statusCode, 200);
+  assert.equal(host.json().url, link.url);
+  assert.equal(host.headers["cache-control"], "no-store");
+  await service.revoke(f.meeting, f.recording.id);
+  await assert.rejects(service.currentLink(f.meeting, f.recording.id));
+  const revoked = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(revoked.delivery, undefined);
+});
+
+test("ambiguous password mail retries the same message and credentials without reminting", async (t) => {
+  const f = await fixture(t);
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.autoLinkPending = true;
+  });
+  const delivered: Record<string, any>[] = [];
+  let first = true;
+  f.mail.sendMail = (async (message: Record<string, any>) => {
+    delivered.push(message);
+    if (first) {
+      first = false;
+      throw new Error("Accepted before response was lost");
+    }
+    return { messageId: "synthetic" };
+  }) as typeof f.mail.sendMail;
+  await f.service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  const pending = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  const originalHash = pending.tokenHash;
+  const originalIntent = pending.delivery?.id;
+  assert.ok(pending.delivery?.password);
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.delivery!.nextAttemptAt = 0;
+  });
+  await f.service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  await f.service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  const finished = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(delivered.length, 2);
+  assert.equal(delivered[0]!.messageId, delivered[1]!.messageId);
+  assert.equal(delivered[0]!.text, delivered[1]!.text);
+  assert.equal(finished.tokenHash, originalHash);
+  assert.equal(finished.delivery?.id, originalIntent);
+  assert.equal(finished.delivery?.password, undefined);
+});
+
+test("one damaged delivery cannot starve a later recording in the same room", async (t) => {
+  const f = await fixture(t);
+  f.mail.sendMail = (async () => {
+    throw new Error("Synthetic initial outage");
+  }) as typeof f.mail.sendMail;
+  await assert.rejects(f.service.link(f.meeting, f.recording.id));
+  const laterId = randomUUID();
+  await f.store.change(f.meeting.code, (meeting) => {
+    const first = meeting.recordings[0]!;
+    first.delivery!.password!.wrappedKey.ciphertext = "invalid";
+    first.delivery!.nextAttemptAt = 0;
+    meeting.recordings.push({
+      id: laterId,
+      status: "ready",
+      createdAt: Date.now(),
+      readyAt: Date.now(),
+      autoLinkPending: true,
+    });
+  });
+  const delivered: Record<string, any>[] = [];
+  f.mail.sendMail = (async (message: Record<string, any>) => {
+    delivered.push(message);
+    return { messageId: "synthetic" };
+  }) as typeof f.mail.sendMail;
+  await f.service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  await f.service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  assert.equal(delivered.length, 1);
+  assert.match(delivered[0]!.text, new RegExp(`Recording: ${laterId}`));
+  assert.ok(
+    (await f.store.get(f.meeting.code))!.recordings[1]!.delivery?.sentAt,
+  );
+});
+
+test("changing the verified host email cancels an in-flight password delivery and its link", async (t) => {
+  const f = await fixture(t);
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.autoLinkPending = true;
+  });
+  let entered!: () => void;
+  let release!: () => void;
+  const sending = new Promise<void>((resolve) => (entered = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  f.mail.sendMail = (async (message: Record<string, any>) => {
+    if (message.subject === "Recording download password") {
+      entered();
+      await gate;
+    }
+    f.emails.push(message);
+    return { messageId: "synthetic" };
+  }) as typeof f.mail.sendMail;
+  const pending = f.service.reconcileDelivery(
+    (await f.store.get(f.meeting.code))!,
+  );
+  await sending;
+  try {
+    const app = await f.app();
+    const changed = await app.inject({
+      method: "POST",
+      url: `/api/meetings/${f.meeting.code}/host-email`,
+      headers: {
+        origin,
+        "x-requested-with": "MeetingPlatform",
+        cookie: `mp_${f.meeting.code}=${f.hostSession}`,
+      },
+      payload: { email: "replacement@example.test" },
+    });
+    assert.equal(changed.statusCode, 200);
+  } finally {
+    release();
+    await pending;
+  }
+  const row = (await f.store.get(f.meeting.code))!.recordings[0]!;
   assert.equal(row.tokenHash, undefined);
   assert.equal(row.passwordHash, undefined);
-  assert.equal(row.expiresAt, undefined);
+  assert.equal(row.delivery, undefined);
+  assert.equal(row.autoLinkPending, false);
+  assert.equal(await f.service.findToken("A".repeat(43), f.meeting.code), null);
+});
+
+test("host revoke invalidates a link before a blocked password send returns", async (t) => {
+  const f = await fixture(t);
+  let entered!: () => void;
+  let release!: () => void;
+  const sending = new Promise<void>((resolve) => (entered = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  f.mail.sendMail = (async (message: Record<string, any>) => {
+    if (message.subject === "Recording download password") {
+      entered();
+      await gate;
+    }
+    return { messageId: "synthetic" };
+  }) as typeof f.mail.sendMail;
+  const app = await f.app();
+  const path = `/api/meetings/${f.meeting.code}/recordings/${f.recording.id}`;
+  const issue = app.inject({
+    method: "POST",
+    url: `${path}/link`,
+    headers: {
+      origin,
+      "x-requested-with": "MeetingPlatform",
+      cookie: `mp_${f.meeting.code}=${f.hostSession}`,
+    },
+    payload: {},
+  });
+  await sending;
+  try {
+    const revoke = app.inject({
+      method: "POST",
+      url: `${path}/revoke`,
+      headers: {
+        origin,
+        "x-requested-with": "MeetingPlatform",
+        cookie: `mp_${f.meeting.code}=${f.hostSession}`,
+      },
+      payload: {},
+    });
+    const quick = await Promise.race([
+      revoke.then((response) => response.statusCode),
+      new Promise<number>((resolve) => setTimeout(() => resolve(0), 250)),
+    ]);
+    assert.equal(quick, 200, "Revoke must not wait for SMTP");
+  } finally {
+    release();
+  }
+  assert.equal((await issue).statusCode, 403);
+  const row = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(row.tokenHash, undefined);
+  assert.equal(row.delivery, undefined);
+});
+
+test("revoke during a KMS wrap prevents a late link commit", async (t) => {
+  const f = await fixture(t);
+  const key = Buffer.from(f.config.recordingKek, "base64");
+  const local = new LocalKeyProvider({ keyId: "operator-kek-v1", key });
+  let entered!: () => void;
+  let release!: () => void;
+  const wrapping = new Promise<void>((resolve) => (entered = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let first = true;
+  const provider: KeyProvider = {
+    wrapKey: async (secret, binding) => {
+      if (first) {
+        first = false;
+        entered();
+        await gate;
+      }
+      return local.wrapKey(secret, binding);
+    },
+    unwrapKey: (wrapped, binding) => local.unwrapKey(wrapped, binding),
+  };
+  const service = new RecordingService(f.config, f.store, f.mail, undefined, {
+    keyProvider: provider,
+  });
+  const pending = service.link(f.meeting, f.recording.id);
+  await wrapping;
+  try {
+    await service.revoke(f.meeting, f.recording.id);
+    assert.equal(
+      (await f.store.get(f.meeting.code))!.recordings[0]!.linkGeneration,
+      1,
+    );
+  } finally {
+    release();
+  }
+  await assert.rejects(pending, (error: any) => error.status === 409);
+  const row = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(row.tokenHash, undefined);
+  assert.equal(row.delivery, undefined);
+  assert.equal(f.emails.length, 0);
+  local.destroy();
+  key.fill(0);
+});
+
+test("host link read rechecks the cookie after asynchronous token recovery", async (t) => {
+  const f = await fixture(t);
+  await f.link();
+  const app = await f.app();
+  const get = f.store.get.bind(f.store);
+  let reads = 0;
+  let entered!: () => void;
+  let release!: () => void;
+  const recovering = new Promise<void>((resolve) => (entered = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  f.store.get = async (code) => {
+    const snapshot = await get(code);
+    if (code === f.meeting.code && ++reads === 2) {
+      entered();
+      await gate;
+    }
+    return snapshot;
+  };
+  const response = app.inject({
+    method: "GET",
+    url: `/api/meetings/${f.meeting.code}/recordings/${f.recording.id}/link`,
+    headers: { cookie: `mp_${f.meeting.code}=${f.hostSession}` },
+  });
+  await recovering;
+  try {
+    await f.store.change(f.meeting.code, (meeting) => {
+      meeting.participants[0]!.tokenHash = digest("replacement-host-cookie");
+    });
+  } finally {
+    release();
+  }
+  assert.equal((await response).statusCode, 401);
+});
+
+test("expired delivery purges both envelopes without a mail or key provider", async (t) => {
+  const f = await fixture(t);
+  f.mail.sendMail = (async () => {
+    throw new Error("Synthetic outage");
+  }) as typeof f.mail.sendMail;
+  await assert.rejects(f.service.link(f.meeting, f.recording.id));
+  const link = await f.service.currentLink(f.meeting, f.recording.id);
+  assert.ok(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.delivery?.password,
+  );
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.expiresAt = Date.now() - 1;
+  });
+  const disabled = new RecordingService(
+    { ...f.config, recordingEnabled: false, recordingLocalKeys: {} },
+    f.store,
+    undefined,
+  );
+  await disabled.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  const row = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(row.tokenHash, undefined);
+  assert.equal(row.passwordHash, undefined);
+  assert.equal(row.delivery, undefined);
+  assert.equal(
+    await f.service.findToken(new URL(link.url).hash.slice(1), f.meeting.code),
+    null,
+  );
 });
 
 test("SES configuration enables recording links without an SMTP host", async (t) => {
@@ -732,7 +1054,7 @@ test("retention removes expired encrypted data and revoked access", async (t) =>
   );
 });
 
-test("recording off and unverified host email fail closed", async (t) => {
+test("new capture can be disabled while retained links still require a verified host email", async (t) => {
   const f = await fixture(t);
   const disabled = new RecordingService(
     { ...f.config, recordingEnabled: false },
@@ -744,15 +1066,13 @@ test("recording off and unverified host email fail closed", async (t) => {
     disabled.start(f.meeting),
     (error) => error instanceof HttpError && error.status === 503,
   );
-  await assert.rejects(
-    disabled.link(f.meeting, f.recording.id),
-    (error) => error instanceof HttpError && error.status === 503,
-  );
+  const retained = await disabled.link(f.meeting, f.recording.id);
+  assert.match(retained.url, /#.+/);
   await f.store.change(f.meeting.code, (meeting) => {
     meeting.hostEmailVerified = false;
   });
   await assert.rejects(f.link(), forbidden);
-  assert.equal(f.emails.length, 0);
+  assert.equal(f.emails.length, 1);
 });
 
 /** Service-boundary fake; actual S3 command and ciphertext tests live in the recording package. */
@@ -1457,6 +1777,7 @@ test("operator rotation preserves S3 identity and recovery works after old key i
     objectStorage: storage,
   });
   await service.reconcile((await f.store.get(f.meeting.code))!);
+  const link = await service.link(f.meeting, f.recording.id);
   const before = structuredClone(
     (await f.store.get(f.meeting.code))!.recordings[0]!.metadata,
   );
@@ -1466,6 +1787,11 @@ test("operator rotation preserves S3 identity and recovery works after old key i
   assert.equal(after.wrappedKey.keyId, "operator-kek-v2");
   assert.deepEqual(after.storage, before.storage);
   assert.equal(after.recordingKeyId, before.recordingKeyId);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.delivery?.token
+      .wrappedKey.keyId,
+    "operator-kek-v2",
+  );
   const recovered = new RecordingService(
     { ...config, recordingLocalKeys: { "operator-kek-v2": newKey } },
     f.store,
@@ -1473,7 +1799,56 @@ test("operator rotation preserves S3 identity and recovery works after old key i
     undefined,
     { objectStorage: storage },
   );
+  assert.deepEqual(
+    await recovered.currentLink(f.meeting, f.recording.id),
+    link,
+  );
   assert.deepEqual(await collectFromService(recovered, f), f.plaintext);
+});
+
+test("rotation rewraps pending password delivery before the old key is retired", async (t) => {
+  const f = await fixture(t);
+  const newKey = randomBytes(32).toString("base64");
+  const config = {
+    ...f.config,
+    recordingActiveKeyId: "operator-kek-v2",
+    recordingLocalKeys: {
+      ...f.config.recordingLocalKeys,
+      "operator-kek-v2": newKey,
+    },
+  };
+  f.mail.sendMail = (async () => {
+    throw new Error("Synthetic SMTP outage");
+  }) as typeof f.mail.sendMail;
+  const service = new RecordingService(config, f.store, f.mail);
+  await assert.rejects(service.link(f.meeting, f.recording.id));
+  const original = await service.currentLink(f.meeting, f.recording.id);
+  await service.rotateKey(f.meeting, f.recording.id);
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.delivery!.nextAttemptAt = 0;
+  });
+  const messages: Record<string, any>[] = [];
+  const deliveredMail = {
+    sendMail: async (message: Record<string, any>) => {
+      messages.push(message);
+      return { messageId: "synthetic" };
+    },
+  } as unknown as Transporter;
+  const recovered = new RecordingService(
+    { ...config, recordingLocalKeys: { "operator-kek-v2": newKey } },
+    f.store,
+    deliveredMail,
+  );
+  await recovered.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  assert.equal(messages.length, 1);
+  assert.deepEqual(
+    await recovered.currentLink(f.meeting, f.recording.id),
+    original,
+  );
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.delivery?.password,
+    undefined,
+  );
 });
 
 test("failed rotation recovery does not replace the known-good envelope", async (t) => {

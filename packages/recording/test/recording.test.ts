@@ -8,7 +8,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import test from "node:test";
 import {
-  LocalKeyProvider, RecordingIntegrityError, createDownloadCredentials,
+  LocalKeyProvider, RecordingIntegrityError, createDownloadCredentials, createDownloadCredentialsFromSecrets,
   decryptRecordingToStream, digestDownloadToken, encryptRecording,
   rotateRecordingKey, verifyRecordingPassword,
   type EncryptedRecordingMetadata, type RecordingContext,
@@ -193,6 +193,54 @@ test("download credentials are random, hashed and password verification is bound
   assert.equal(await verifyRecordingPassword(a.passwordHash, "x".repeat(257)), false);
   assert.equal(await verifyRecordingPassword(a.passwordHash.replace("m=65536", "m=999999999"), a.password), false);
   assert.throws(() => digestDownloadToken("short"), TypeError);
+});
+
+test("download credentials recover from distinct 32-byte secrets", async () => {
+  const tokenSecret = Buffer.alloc(32, 1);
+  const passwordSecret = Buffer.alloc(32, 2);
+  const credentials = await createDownloadCredentialsFromSecrets(
+    tokenSecret,
+    passwordSecret,
+  );
+  assert.equal(credentials.token, tokenSecret.toString("base64url"));
+  assert.equal(
+    credentials.password,
+    passwordSecret.subarray(0, 18).toString("base64url"),
+  );
+  assert.equal(credentials.tokenDigest, digestDownloadToken(credentials.token));
+  assert.equal(
+    await verifyRecordingPassword(
+      credentials.passwordHash,
+      credentials.password,
+    ),
+    true,
+  );
+  await assert.rejects(
+    createDownloadCredentialsFromSecrets(
+      tokenSecret.subarray(1),
+      passwordSecret,
+    ),
+    TypeError,
+  );
+  await assert.rejects(
+    createDownloadCredentialsFromSecrets(tokenSecret, Buffer.alloc(33)),
+    TypeError,
+  );
+  await assert.rejects(
+    createDownloadCredentialsFromSecrets(tokenSecret, tokenSecret),
+    TypeError,
+  );
+  await assert.rejects(
+    createDownloadCredentialsFromSecrets(tokenSecret, Buffer.from(tokenSecret)),
+    TypeError,
+  );
+  await assert.rejects(
+    createDownloadCredentialsFromSecrets(
+      tokenSecret,
+      Buffer.concat([tokenSecret.subarray(0, 18), Buffer.alloc(14, 3)]),
+    ),
+    TypeError,
+  );
 });
 
 test("local envelope authenticates each context component and key identity", async () => {

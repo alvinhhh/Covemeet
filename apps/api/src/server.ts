@@ -11,10 +11,12 @@ import staticFiles from "@fastify/static";
 import { existsSync } from "node:fs";
 import { randomUUID, randomInt } from "node:crypto";
 import { createMailBudget, createMailTransport } from "@meeting-platform/mail";
+import { digestDownloadToken } from "@meeting-platform/recording";
 import { z } from "zod";
 import { whiteboardInput } from "./whiteboard.js";
 import type { Config } from "./config.js";
 import type { ChatMessage, Meeting, Participant, Store } from "./store.js";
+import { clearRecordingLink } from "./store.js";
 import type { Media } from "./media.js";
 import { LiveMedia } from "./media.js";
 import {
@@ -1687,6 +1689,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
       const otpHash = keyedDigest(config.secret, `${m.code}:${otp}`);
       const expiresAt = Date.now() + 600000;
       await store.change(m.code, (m) => {
+        actor(req, m, true);
+        for (const recording of m.recordings) clearRecordingLink(recording);
         m.hostEmail = email;
         m.hostEmailVerified = false;
         m.emailOtpHash = otpHash;
@@ -1759,14 +1763,53 @@ export async function createApp(config: Config, store: Store, media: Media) {
     await recordings.stop(m, (req.params as any).id);
     return { ok: true };
   });
+  async function extendRecordingHostLink(
+    req: FastifyRequest,
+    m: Meeting,
+    participantId: string,
+    id: string,
+    link: { url: string; expiresAt: number },
+  ) {
+    const hash = digestDownloadToken(new URL(link.url).hash.slice(1));
+    await store.change(m.code, (state) => {
+      const host = actor(req, state, true);
+      const recording = state.recordings.find((row) => row.id === id);
+      if (
+        host.id !== participantId ||
+        state.hosted?.revoked ||
+        !recording ||
+        recording.status !== "ready" ||
+        !recording.tokenHash ||
+        !safeEqual(recording.tokenHash, hash) ||
+        recording.expiresAt !== link.expiresAt ||
+        link.expiresAt <= Date.now()
+      )
+        throw new HttpError(403, "Recording link is unavailable");
+      host.expiresAt = Math.max(host.expiresAt, link.expiresAt);
+    });
+  }
   app.post("/api/meetings/:code/recordings/:id/link", async (req, reply) => {
     const m = await find(req);
     const p = actor(req, m, true);
-    const link = await recordings.link(m, (req.params as any).id);
-    await store.change(m.code, (state) => {
-      const host = state.participants.find((x) => x.id === p.id)!;
-      host.expiresAt = Math.max(host.expiresAt, link.expiresAt);
+    const id = (req.params as any).id;
+    const link = await recordings.link(m, id, (state) => {
+      if (actor(req, state, true).id !== p.id)
+        throw new HttpError(403, "Host session is unavailable");
     });
+    await extendRecordingHostLink(req, m, p.id, id, link);
+    reply.setCookie(authCookie(m.code), req.cookies[authCookie(m.code)]!, {
+      ...cookieOpts,
+      maxAge: 86400,
+    });
+    return link;
+  });
+  app.get("/api/meetings/:code/recordings/:id/link", async (req, reply) => {
+    const m = await find(req);
+    const p = actor(req, m, true);
+    const id = (req.params as any).id;
+    const link = await recordings.currentLink(m, id);
+    await extendRecordingHostLink(req, m, p.id, id, link);
+    reply.header("Cache-Control", "no-store");
     reply.setCookie(authCookie(m.code), req.cookies[authCookie(m.code)]!, {
       ...cookieOpts,
       maxAge: 86400,
@@ -1775,8 +1818,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
   });
   app.post("/api/meetings/:code/recordings/:id/revoke", async (req) => {
     const m = await find(req);
-    actor(req, m, true);
-    await recordings.revoke(m, (req.params as any).id);
+    const p = actor(req, m, true);
+    await recordings.revoke(m, (req.params as any).id, (state) => {
+      if (actor(req, state, true).id !== p.id)
+        throw new HttpError(403, "Host session is unavailable");
+    });
     return { ok: true };
   });
   app.post(
@@ -1839,8 +1885,27 @@ export async function createApp(config: Config, store: Store, media: Media) {
   }
   let controlPass: Promise<void> | undefined;
   let filesPass: Promise<void> | undefined;
+  let deliveryPass: Promise<void> | undefined;
+  let deliveryCursor = 0;
   let closing = false;
   const timer = setInterval(() => {
+    if (!closing && !deliveryPass)
+      deliveryPass = (async () => {
+        const meetings = await store.all();
+        const count = Math.min(meetings.length, 4);
+        for (let index = 0; index < count; index++)
+          await recordings
+            .reconcileDelivery(
+              meetings[(deliveryCursor + index) % meetings.length]!,
+            )
+            .catch(() => {});
+        if (meetings.length)
+          deliveryCursor = (deliveryCursor + count) % meetings.length;
+      })()
+        .catch(() => {})
+        .finally(() => {
+          deliveryPass = undefined;
+        });
     if (controlPass || closing) return;
     controlPass = (async () => {
       for (let m of await store.all()) {
@@ -1925,7 +1990,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     closing = true;
     clearInterval(timer);
     media.close();
-    await Promise.all([controlPass, filesPass]);
+    await Promise.all([controlPass, filesPass, deliveryPass]);
     try {
       await mail?.close();
     } finally {

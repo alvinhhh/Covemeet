@@ -110,6 +110,84 @@ test(
 );
 
 test(
+  "two PostgreSQL workers issue and deliver only one automatic recording link",
+  { skip: !databaseUrl, timeout: 15000 },
+  async (t) => {
+    const first = new PgStore(fixtureUrl());
+    const second = new PgStore(fixtureUrl());
+    await first.init();
+    const code = randomUUID();
+    const id = randomUUID();
+    t.after(async () => {
+      await first.pool.query("DELETE FROM meetings WHERE code=$1", [code]);
+      await first.close();
+      await second.close();
+    });
+    const config = loadConfig({
+      NODE_ENV: "test",
+      SESSION_SECRET:
+        "recording-delivery-session-secret-more-than-32-characters",
+      RECORDING_ENABLED: "false",
+      RECORDING_KEK: randomBytes(32).toString("base64"),
+      SMTP_HOST: "unused.test",
+      SMTP_FROM: "test@example.test",
+    });
+    const meeting: Meeting = {
+      id: randomUUID(),
+      code,
+      room: randomUUID(),
+      title: "Delivery fixture",
+      mode: "meeting",
+      locked: false,
+      ended: false,
+      recordingAllowed: false,
+      createdAt: Date.now(),
+      revision: 1,
+      passwordHash: "unused",
+      hostTokenExpiresAt: 0,
+      participants: [],
+      bans: { ip: [], device: [] },
+      breakouts: [],
+      messages: [],
+      hostEmail: "host@example.test",
+      hostEmailVerified: true,
+      recordings: [
+        {
+          id,
+          status: "ready",
+          createdAt: Date.now(),
+          readyAt: Date.now(),
+          autoLinkPending: true,
+        },
+      ],
+    };
+    await first.create(meeting);
+    const sent: Record<string, any>[] = [];
+    const mail = {
+      sendMail: async (message: Record<string, any>) => {
+        sent.push(message);
+        return { messageId: "synthetic" };
+      },
+    } as unknown as Transporter;
+    const workers = [
+      new RecordingService(config, first, mail),
+      new RecordingService(config, second, mail),
+    ];
+    const snapshot = (await first.get(code))!;
+    await Promise.all(
+      workers.map((worker) => worker.reconcileDelivery(snapshot)),
+    );
+    await workers[1]!.reconcileDelivery((await second.get(code))!);
+    const row = (await second.get(code))!.recordings[0]!;
+    assert.equal(sent.length, 1);
+    assert.equal(row.autoLinkPending, false);
+    assert.ok(row.delivery?.sentAt);
+    assert.equal(row.delivery?.password, undefined);
+    assert.ok(row.tokenHash && row.passwordHash);
+  },
+);
+
+test(
   "PostgreSQL connection loss fences a stale encryptor and preserves the winning output",
   { skip: !databaseUrl, timeout: 15000 },
   async (t) => {

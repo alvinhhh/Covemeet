@@ -1,10 +1,10 @@
 import { meetingAllowed, recordingIncluded } from "./meeting-limits.js";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { lstat, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { addAbortSignal, Readable } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
-import { hasMail, type MailTransport } from "@meeting-platform/mail";
+import { hasMail, mailbox, type MailTransport } from "@meeting-platform/mail";
 import {
   EgressClient,
   EgressStatus,
@@ -25,7 +25,7 @@ import {
   encryptRecording,
   readEncryptionReceipt,
   decryptRecordingToStream,
-  createDownloadCredentials,
+  createDownloadCredentialsFromSecrets,
   digestDownloadToken,
   verifyRecordingPassword,
 } from "@meeting-platform/recording";
@@ -37,6 +37,7 @@ import type {
   RecordingStorageAttempt,
   Store,
 } from "./store.js";
+import { clearRecordingLink } from "./store.js";
 import { activePhone } from "./phone.js";
 import { HttpError, safeEqual } from "./security.js";
 
@@ -60,6 +61,7 @@ export class RecordingService {
   private provider?: KeyProvider;
   private objectStorage?: RecordingObjectStorage;
   private client: RecorderClient;
+  private deliveryOffsets = new Map<string, number>();
   constructor(
     private config: Config,
     private store: Store,
@@ -329,6 +331,7 @@ export class RecordingService {
               (entry) => entry.id === row.id,
             )!;
             saved.status = "failed";
+            saved.autoLinkPending = false;
             saved.rawCleanupPending = true;
             saved.error = "Recording exceeded the stored-file allowance";
           });
@@ -429,8 +432,10 @@ export class RecordingService {
     await this.cleanupStorage(m, row, lock, this.keptStorage(row));
     await lock.change((state) => {
       const saved = state.recordings.find((entry) => entry.id === row.id)!;
-      if (saved.status === "encrypting" && saved.metadata)
+      if (saved.status === "encrypting" && saved.metadata) {
         saved.status = "ready";
+        saved.readyAt ??= Date.now();
+      }
     });
     await lock.audit("recorder", "recording.encrypted", r.id);
   }
@@ -503,8 +508,10 @@ export class RecordingService {
     }
     await lock.change((state) => {
       const current = state.recordings.find((entry) => entry.id === r.id)!;
-      if (current.status === "encrypting" && current.metadata)
+      if (current.status === "encrypting" && current.metadata) {
         current.status = "ready";
+        current.readyAt ??= Date.now();
+      }
     });
     await lock.audit("recorder", "recording.encrypted", r.id);
   }
@@ -560,6 +567,36 @@ export class RecordingService {
           this.provider!,
           this.provider!,
         );
+        const previousDelivery = structuredClone(snapshot.delivery);
+        const rewrap = async (
+          envelope: NonNullable<Recording["delivery"]>["token"],
+        ) => {
+          const binding = {
+            context: this.context(m, snapshot),
+            recordingKeyId: envelope.bindingId,
+          };
+          const secret = await this.provider!.unwrapKey(
+            envelope.wrappedKey,
+            binding,
+          );
+          try {
+            return {
+              bindingId: envelope.bindingId,
+              wrappedKey: await this.provider!.wrapKey(secret, binding),
+            };
+          } finally {
+            secret.fill(0);
+          }
+        };
+        const rotatedDelivery = previousDelivery
+          ? {
+              ...previousDelivery,
+              token: await rewrap(previousDelivery.token),
+              password: previousDelivery.password
+                ? await rewrap(previousDelivery.password)
+                : undefined,
+            }
+          : undefined;
         for await (const plaintext of await this.openEncrypted(
           m,
           snapshot,
@@ -571,7 +608,8 @@ export class RecordingService {
           if (
             !row ||
             row.status !== "ready" ||
-            JSON.stringify(row.metadata) !== JSON.stringify(previous)
+            !isDeepStrictEqual(row.metadata, previous) ||
+            !isDeepStrictEqual(row.delivery, previousDelivery)
           ) {
             throw new HttpError(
               409,
@@ -579,6 +617,7 @@ export class RecordingService {
             );
           }
           row.metadata = rotated;
+          if (rotatedDelivery) row.delivery = rotatedDelivery;
         });
         await lock.audit("operator", "recording.key.rotate", id);
       },
@@ -694,6 +733,7 @@ export class RecordingService {
       id: randomUUID(),
       status: "starting",
       createdAt: Date.now(),
+      autoLinkPending: true,
     };
     await this.store.withRecordingLock(meeting.code, r.id, async (lock) => {
       await lock.reserveRecording(
@@ -848,9 +888,7 @@ export class RecordingService {
       await lock.change((state) => {
         const row = state.recordings.find((entry) => entry.id === r.id)!;
         row.status = "deleting";
-        delete row.tokenHash;
-        delete row.passwordHash;
-        delete row.expiresAt;
+        clearRecordingLink(row);
       });
       await lock.audit("recorder", "recording.revoke", r.id);
       if (r.storage) {
@@ -1034,6 +1072,7 @@ export class RecordingService {
                     row.status = "encrypting";
                   else {
                     row.status = "failed";
+                    row.autoLinkPending = false;
                     row.rawCleanupPending = true;
                     row.error = info.error?.includes(
                       "Start signal not received",
@@ -1080,56 +1119,343 @@ export class RecordingService {
       }
     }
   }
-  async link(m: Meeting, id: string) {
-    if (!this.available || !this.mail)
-      throw new HttpError(503, "Recording is not configured");
-    const credentials = await createDownloadCredentials();
-    let expiresAt = Date.now() + 86400000;
-    const email = await this.store.change(m.code, (state) => {
-      if (state.hosted?.revoked)
-        throw new HttpError(403, "Recording unavailable");
-      const r = state.recordings.find((x) => x.id === id);
-      if (!r || r.status !== "ready" || r.createdAt <= Date.now() - retentionMs)
-        throw new HttpError(409, "Recording is not ready");
-      expiresAt = Math.min(expiresAt, r.createdAt + retentionMs);
-      if (!state.hostEmailVerified || !state.hostEmail)
-        throw new HttpError(403, "Verify the host email first");
-      r.tokenHash = credentials.tokenDigest;
-      r.passwordHash = credentials.passwordHash;
-      r.expiresAt = expiresAt;
-      return state.hostEmail;
-    });
+  private async issueLink(
+    lock: RecordingLock,
+    code: string,
+    id: string,
+    mode: "auto" | "manual",
+    authorize?: (meeting: Meeting) => void,
+  ) {
+    if (!this.provider)
+      throw new HttpError(503, "Recording keys are not configured");
+    const meeting = await lock.get();
+    const row = meeting?.recordings.find((recording) => recording.id === id);
+    if (
+      !meeting ||
+      meeting.hosted?.revoked ||
+      !row ||
+      row.status !== "ready" ||
+      row.createdAt <= Date.now() - retentionMs
+    )
+      throw new HttpError(409, "Recording is not ready");
+    if (!meeting.hostEmailVerified || !meeting.hostEmail)
+      throw new HttpError(403, "Verify the host email first");
+    authorize?.(meeting);
+    const recipient = meeting.hostEmail;
+    const generation = row.linkGeneration ?? 0;
+    const tokenSecret = randomBytes(32);
+    const passwordSecret = randomBytes(32);
+    const tokenBindingId = randomBytes(16).toString("hex");
+    const passwordBindingId = randomBytes(16).toString("hex");
+    const intentId = randomUUID().replaceAll("-", "");
+    let credentials;
+    let tokenWrapped;
+    let passwordWrapped;
     try {
-      await this.mail.sendMail({
-        from: this.config.smtpFrom,
-        to: email,
-        subject: "Recording download password",
-        text: `Recording: ${id}\nPassword: ${credentials.password}\nExpires: ${new Date(expiresAt).toISOString()}\nThe download link is available in the meeting host panel. This email does not include the link.`,
+      credentials = await createDownloadCredentialsFromSecrets(
+        tokenSecret,
+        passwordSecret,
+      );
+      tokenWrapped = await this.provider.wrapKey(tokenSecret, {
+        context: this.context(meeting, row),
+        recordingKeyId: tokenBindingId,
       });
-    } catch {
-      await this.store.change(m.code, (state) => {
-        const r = state.recordings.find((x) => x.id === id)!;
-        if (r.tokenHash === credentials.tokenDigest) {
-          delete r.tokenHash;
-          delete r.passwordHash;
-          delete r.expiresAt;
-        }
+      passwordWrapped = await this.provider.wrapKey(passwordSecret, {
+        context: this.context(meeting, row),
+        recordingKeyId: passwordBindingId,
       });
-      throw new HttpError(503, "Password email failed. Request a new link.");
+    } finally {
+      tokenSecret.fill(0);
+      passwordSecret.fill(0);
     }
-    await this.store.audit(m.code, "host", "recording.link", id);
+    const expiresAt = Math.min(
+      Date.now() + 86400000,
+      row.createdAt + retentionMs,
+    );
+    const domain = mailbox(this.config.smtpFrom).split("@")[1]!;
+    await lock.change((state) => {
+      const current = state.recordings.find((recording) => recording.id === id);
+      if (
+        state.hosted?.revoked ||
+        (current?.linkGeneration ?? 0) !== generation ||
+        !state.hostEmailVerified ||
+        state.hostEmail !== recipient ||
+        !current ||
+        current.status !== "ready" ||
+        current.createdAt <= Date.now() - retentionMs
+      )
+        throw new HttpError(409, "Recording or host email changed; retry");
+      authorize?.(state);
+      current.tokenHash = credentials.tokenDigest;
+      current.passwordHash = credentials.passwordHash;
+      current.expiresAt = expiresAt;
+      current.autoLinkPending = false;
+      current.delivery = {
+        id: intentId,
+        mode,
+        recipient,
+        messageId: `<recording-${intentId}@${domain}>`,
+        token: { bindingId: tokenBindingId, wrappedKey: tokenWrapped },
+        password: { bindingId: passwordBindingId, wrappedKey: passwordWrapped },
+        attempts: 0,
+        nextAttemptAt: Date.now(),
+      };
+    });
     return {
-      url: `${this.config.origin}/download/${m.code}#${credentials.token}`,
+      url: `${this.config.origin}/download/${code}#${credentials.token}`,
       expiresAt,
     };
   }
-  async revoke(m: Meeting, id: string) {
+  private async deliverPassword(
+    lock: RecordingLock,
+    id: string,
+  ): Promise<"skipped" | "failed" | "sent"> {
+    if (!this.mail || !this.provider) return "skipped";
+    const meeting = await lock.get();
+    const row = meeting?.recordings.find((recording) => recording.id === id);
+    const delivery = row?.delivery;
+    if (!meeting || !row || !delivery?.password) return "skipped";
+    if (
+      meeting.hosted?.revoked ||
+      row.status !== "ready" ||
+      !row.tokenHash ||
+      !row.passwordHash ||
+      !row.expiresAt ||
+      row.expiresAt <= Date.now() ||
+      !meeting.hostEmailVerified ||
+      meeting.hostEmail !== delivery.recipient
+    ) {
+      await lock.change((state) => {
+        const current = state.recordings.find(
+          (recording) => recording.id === id,
+        );
+        if (current?.delivery?.id === delivery.id) clearRecordingLink(current);
+      });
+      return "skipped";
+    }
+    if (delivery.nextAttemptAt > Date.now()) return "skipped";
+    await lock.change((state) => {
+      const current = state.recordings.find((recording) => recording.id === id);
+      if (current?.delivery?.id !== delivery.id || !current.delivery.password)
+        throw new HttpError(409, "Recording link changed");
+      current.delivery.attempts++;
+      current.delivery.nextAttemptAt =
+        Date.now() +
+        Math.max(
+          45_000,
+          Math.min(
+            3600000,
+            5000 * 2 ** Math.min(current.delivery.attempts, 10),
+          ),
+        );
+    });
+    const passwordBytes = await this.provider.unwrapKey(
+      delivery.password.wrappedKey,
+      {
+        context: this.context(meeting, row),
+        recordingKeyId: delivery.password.bindingId,
+      },
+    );
+    let password: string;
+    try {
+      if (passwordBytes.length !== 32)
+        throw new Error("Invalid password envelope");
+      password = Buffer.from(passwordBytes.subarray(0, 18)).toString(
+        "base64url",
+      );
+    } finally {
+      passwordBytes.fill(0);
+    }
+    // Room-row revocation is allowed while this advisory owner unwraps keys.
+    // A send already in progress cannot be recalled, but its link is invalid.
+    const current = await this.store.get(meeting.code);
+    const active = current?.recordings.find((recording) => recording.id === id);
+    if (
+      current?.hosted?.revoked ||
+      !current?.hostEmailVerified ||
+      current.hostEmail !== delivery.recipient ||
+      active?.status !== "ready" ||
+      active.delivery?.id !== delivery.id ||
+      active.tokenHash !== row.tokenHash ||
+      !active.expiresAt ||
+      active.expiresAt <= Date.now()
+    )
+      return "skipped";
+    try {
+      await this.mail.sendMail({
+        from: this.config.smtpFrom,
+        to: delivery.recipient,
+        messageId: delivery.messageId,
+        subject: "Recording download password",
+        text: `Recording: ${id}\nPassword: ${password}\nExpires: ${new Date(row.expiresAt).toISOString()}\nThe download link is available in the meeting host panel. This email does not include the link.`,
+      });
+    } catch {
+      return "failed";
+    }
+    await lock.change((state) => {
+      const current = state.recordings.find((recording) => recording.id === id);
+      if (current?.delivery?.id === delivery.id && current.delivery.password) {
+        delete current.delivery.password;
+        current.delivery.sentAt = Date.now();
+      }
+    });
+    await lock.audit("recorder", "recording.password.delivered", id);
+    return "sent";
+  }
+  async reconcileDelivery(snapshot: Meeting) {
+    if (!snapshot.recordings.length) return;
+    const start = this.deliveryOffsets.get(snapshot.code) ?? 0;
+    if (this.deliveryOffsets.size > 1024) this.deliveryOffsets.clear();
+    this.deliveryOffsets.set(
+      snapshot.code,
+      (start + 1) % snapshot.recordings.length,
+    );
+    for (
+      let index = 0;
+      index < Math.min(4, snapshot.recordings.length);
+      index++
+    ) {
+      const candidate =
+        snapshot.recordings[(start + index) % snapshot.recordings.length]!;
+      if (
+        !candidate.autoLinkPending &&
+        !candidate.delivery?.password &&
+        !(candidate.expiresAt && candidate.expiresAt <= Date.now())
+      )
+        continue;
+      try {
+        const result = await this.store.withRecordingLock(
+          snapshot.code,
+          candidate.id,
+          async (lock) => {
+            const meeting = await lock.get();
+            const row = meeting?.recordings.find((r) => r.id === candidate.id);
+            if (!meeting || !row) return;
+            if (
+              (row.expiresAt && row.expiresAt <= Date.now()) ||
+              row.createdAt <= Date.now() - retentionMs ||
+              meeting.hosted?.revoked ||
+              ["deleting", "deleted", "failed"].includes(row.status)
+            ) {
+              await lock.change((state) => {
+                const current = state.recordings.find(
+                  (r) => r.id === candidate.id,
+                );
+                if (current) clearRecordingLink(current);
+              });
+              return;
+            }
+            if (row.status === "ready" && row.autoLinkPending) {
+              if (!meeting.hostEmailVerified || !meeting.hostEmail) {
+                await lock.change((state) => {
+                  state.recordings.find(
+                    (r) => r.id === candidate.id,
+                  )!.autoLinkPending = false;
+                });
+                return;
+              }
+              if (!this.provider || !this.mail) return;
+              await this.issueLink(lock, snapshot.code, candidate.id, "auto");
+            }
+            return this.deliverPassword(lock, candidate.id);
+          },
+        );
+        if (
+          result.acquired &&
+          result.value !== "skipped" &&
+          result.value !== undefined
+        )
+          return;
+      } catch {
+        // Keep the committed intent for a later pass; never mint a replacement.
+        return;
+      }
+    }
+  }
+  async link(m: Meeting, id: string, authorize?: (meeting: Meeting) => void) {
+    if (!this.provider || !this.mail || !hasMail(this.config))
+      throw new HttpError(503, "Recording is not configured");
+    const result = await this.store.withRecordingLock(
+      m.code,
+      id,
+      async (lock) => {
+        const link = await this.issueLink(
+          lock,
+          m.code,
+          id,
+          "manual",
+          authorize,
+        );
+        if ((await this.deliverPassword(lock, id)) !== "sent")
+          throw new HttpError(
+            503,
+            "Password email is pending. Try again later.",
+          );
+        await lock.audit("host", "recording.link", id);
+        return link;
+      },
+    );
+    if (!result.acquired) throw new HttpError(409, "Recording is busy; retry");
+    return result.value;
+  }
+  async currentLink(m: Meeting, id: string) {
+    if (!this.provider)
+      throw new HttpError(503, "Recording keys are not configured");
+    const meeting = await this.store.get(m.code);
+    const row = meeting?.recordings.find((recording) => recording.id === id);
+    if (
+      !meeting ||
+      meeting.hosted?.revoked ||
+      !row ||
+      row.status !== "ready" ||
+      !row.tokenHash ||
+      !row.expiresAt ||
+      row.expiresAt <= Date.now() ||
+      row.createdAt <= Date.now() - retentionMs ||
+      !row.delivery?.token
+    )
+      throw new HttpError(404, "Recording link unavailable");
+    const tokenBytes = await this.provider.unwrapKey(
+      row.delivery.token.wrappedKey,
+      {
+        context: this.context(meeting, row),
+        recordingKeyId: row.delivery.token.bindingId,
+      },
+    );
+    let token: string;
+    try {
+      if (tokenBytes.length !== 32) throw new Error("Invalid token envelope");
+      token = Buffer.from(tokenBytes).toString("base64url");
+    } finally {
+      tokenBytes.fill(0);
+    }
+    const current = (await this.store.get(m.code))?.recordings.find(
+      (r) => r.id === id,
+    );
+    if (
+      !current ||
+      current.status !== "ready" ||
+      !current.tokenHash ||
+      !safeEqual(current.tokenHash, digestDownloadToken(token)) ||
+      !current.expiresAt ||
+      current.expiresAt <= Date.now() ||
+      current.delivery?.id !== row.delivery.id
+    )
+      throw new HttpError(404, "Recording link unavailable");
+    return {
+      url: `${this.config.origin}/download/${m.code}#${token}`,
+      expiresAt: current.expiresAt,
+    };
+  }
+  async revoke(m: Meeting, id: string, authorize?: (meeting: Meeting) => void) {
+    // Invalidate immediately even if a KMS or SMTP call holds ownership.
+    // Its eventual issue commit must compare linkGeneration, and its mail ACK
+    // is conditional on the old intent ID.
     await this.store.change(m.code, (state) => {
+      authorize?.(state);
       const r = state.recordings.find((x) => x.id === id);
       if (!r) throw new HttpError(404, "Recording unavailable");
-      delete r.tokenHash;
-      delete r.passwordHash;
-      delete r.expiresAt;
+      clearRecordingLink(r);
     });
     await this.store.audit(m.code, "host", "recording.revoke", id);
   }

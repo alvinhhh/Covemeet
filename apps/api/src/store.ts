@@ -14,6 +14,7 @@ import {
   type RecordingStorageProof,
   type RecordingStorageRelease,
 } from "./recording-storage-quota.js";
+import type { WrappedKey } from "@meeting-platform/recording";
 export type {
   RecordingStorageAttempt,
   RecordingStoragePlan,
@@ -133,6 +134,20 @@ export type Recording = {
   tokenHash?: string;
   passwordHash?: string;
   expiresAt?: number;
+  linkGeneration?: number;
+  readyAt?: number;
+  autoLinkPending?: boolean;
+  delivery?: {
+    id: string;
+    mode: "auto" | "manual";
+    recipient: string;
+    messageId: string;
+    token: { bindingId: string; wrappedKey: WrappedKey };
+    password?: { bindingId: string; wrappedKey: WrappedKey };
+    attempts: number;
+    nextAttemptAt: number;
+    sentAt?: number;
+  };
   error?: string;
 };
 export type ChatMessage = {
@@ -147,6 +162,14 @@ export type ChatMessage = {
   recipientId?: string;
   deleted?: boolean;
 };
+export function clearRecordingLink(r: Recording) {
+  r.linkGeneration = (r.linkGeneration ?? 0) + 1;
+  delete r.tokenHash;
+  delete r.passwordHash;
+  delete r.expiresAt;
+  delete r.delivery;
+  r.autoLinkPending = false;
+}
 export type Meeting = {
   meetingMeter?: MeetingMeter;
   hostReentryRevision?: number;
@@ -570,9 +593,7 @@ function revokeHostedMeeting(m: Meeting) {
   for (const r of m.recordings) {
     if (["starting", "recording", "stopping"].includes(r.status))
       r.status = "stopping";
-    delete r.tokenHash;
-    delete r.passwordHash;
-    delete r.expiresAt;
+    clearRecordingLink(r);
   }
   m.revision++;
   return true;

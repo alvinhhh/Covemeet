@@ -922,10 +922,10 @@ export function digestDownloadToken(token: string): string {
     .digest("hex");
 }
 
-/** Raw values are transient: deliver the password separately from the link. */
-export async function createDownloadCredentials(): Promise<DownloadCredentials> {
-  const token = randomBytes(32).toString("base64url");
-  const password = randomBytes(18).toString("base64url");
+async function credentialsFor(
+  token: string,
+  password: string,
+): Promise<DownloadCredentials> {
   const passwordHash = await argon2.hash(password, {
     type: argon2.argon2id,
     memoryCost: 65_536,
@@ -940,6 +940,35 @@ export async function createDownloadCredentials(): Promise<DownloadCredentials> 
     password,
     passwordHash,
   };
+}
+
+/** Derive recoverable credentials from two separately wrapped random secrets. */
+export async function createDownloadCredentialsFromSecrets(
+  tokenSecret: Uint8Array,
+  passwordSecret: Uint8Array,
+): Promise<DownloadCredentials> {
+  if (
+    !(tokenSecret instanceof Uint8Array) ||
+    !(passwordSecret instanceof Uint8Array) ||
+    tokenSecret.byteLength !== 32 ||
+    passwordSecret.byteLength !== 32 ||
+    timingSafeEqual(tokenSecret.subarray(0, 18), passwordSecret.subarray(0, 18))
+  )
+    throw new TypeError(
+      "Download credentials require two distinct 32-byte secrets",
+    );
+  return credentialsFor(
+    Buffer.from(tokenSecret).toString("base64url"),
+    Buffer.from(passwordSecret.subarray(0, 18)).toString("base64url"),
+  );
+}
+
+/** Raw values are transient: deliver the password separately from the link. */
+export async function createDownloadCredentials(): Promise<DownloadCredentials> {
+  return credentialsFor(
+    randomBytes(32).toString("base64url"),
+    randomBytes(18).toString("base64url"),
+  );
 }
 
 /** Apply rate/concurrency limits before invoking this deliberately expensive check. */

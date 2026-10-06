@@ -2663,7 +2663,7 @@ function Recordings({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
-  const [link, setLink] = useState<{ url: string; expiresAt: string }>();
+  const [link, setLink] = useState<{ url: string; expiresAt: number }>();
   const code = state.meeting.code;
   const active = state.recordings.some((r) =>
     ["starting", "recording", "active", "stopping"].includes(r.status),
@@ -2680,9 +2680,9 @@ function Recordings({
     setNotice("");
     setBusy(true);
     try {
-      const result = await api<{ url?: string; expiresAt?: string }>(
+      const result = await api<{ url?: string; expiresAt?: number }>(
         meetingPath(code, suffix),
-        body,
+        method === "GET" ? undefined : body,
         method,
       );
       refresh();
@@ -2784,8 +2784,8 @@ function Recordings({
             </form>
           )}
           <p className="panel-note">
-            Download links expire after 24 hours. A separate password is emailed
-            to the verified host.
+            A link is issued when the recording is ready. It expires after 24
+            hours. The password is emailed to the verified host.
           </p>
           {recordingUsage && (
             <p className="panel-note" role="status">
@@ -2888,12 +2888,27 @@ function Recordings({
                 onClick={async () => {
                   const result = await request(
                     `/recordings/${encodeURIComponent(recording.id)}/link`,
+                    {},
+                    "GET",
                   );
                   if (result?.url && result.expiresAt)
                     setLink({ url: result.url, expiresAt: result.expiresAt });
                 }}
               >
-                Create 24-hour link
+                Show download link
+              </Button>
+              <Button
+                className="small"
+                disabled={busy}
+                onClick={async () => {
+                  const result = await request(
+                    `/recordings/${encodeURIComponent(recording.id)}/link`,
+                  );
+                  if (result?.url && result.expiresAt)
+                    setLink({ url: result.url, expiresAt: result.expiresAt });
+                }}
+              >
+                Create new 24-hour link
               </Button>
               <button
                 className="text-button danger-text"
