@@ -6,7 +6,7 @@ import {
 } from "./media-identity.js";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
-import rateLimit from "@fastify/rate-limit";
+import rateLimit, { normalizeIP } from "@fastify/rate-limit";
 import staticFiles from "@fastify/static";
 import { existsSync } from "node:fs";
 import { randomUUID, randomInt } from "node:crypto";
@@ -259,11 +259,14 @@ export async function createApp(config: Config, store: Store, media: Media) {
     maxAge: 43200,
   };
   const authCookie = (code: string) => `mp_${code}`;
-  function actor(req: FastifyRequest, m: Meeting, host = false) {
-    const token = req.cookies[authCookie(m.code)] ?? "";
-    const p = m.participants.find(
-      (x) => safeEqual(x.tokenHash, digest(token)) && x.expiresAt > Date.now(),
+  function sessionParticipant(req: FastifyRequest, m: Meeting) {
+    const tokenHash = digest(req.cookies[authCookie(m.code)] ?? "");
+    return m.participants.find(
+      (x) => safeEqual(x.tokenHash, tokenHash) && x.expiresAt > Date.now(),
     );
+  }
+  function actor(req: FastifyRequest, m: Meeting, host = false) {
+    const p = sessionParticipant(req, m);
     if (!p) throw new HttpError(401, "Join this meeting first");
     if (p.transport === "phone")
       throw new HttpError(403, "Phone sessions use the phone gateway");
@@ -288,6 +291,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
   }
   const codeOf = (req: FastifyRequest) =>
     normalizeCode((req.params as any).code ?? "");
+  const browserRateKey = (req: FastifyRequest) =>
+    verifyDevice(config.secret, req.cookies.mp_device) ?? normalizeIP(req.ip);
   async function find(req: FastifyRequest) {
     const m = await store.get(codeOf(req));
     if (!m) throw new HttpError(404, "Meeting unavailable");
@@ -883,7 +888,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       // Password work must not hold the meeting lock needed by host controls.
       if (!(await checkPassword(found.passwordHash, body.password)))
         throw new HttpError(403, "Meeting credentials are invalid");
-      const id = await store.change(code, (m) => {
+      const joined = await store.change(code, (m) => {
         active(m);
         if (m.locked) throw new HttpError(403, "Meeting is locked");
         if (m.passwordHash !== found.passwordHash)
@@ -894,6 +899,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
           m.bans.ip.includes(ids.ipHash)
         )
           throw new HttpError(403, "Entry is blocked for this meeting");
+        const current = sessionParticipant(req, m);
+        if (current && current.transport !== "phone" && occupiesSeat(current))
+          return { id: current.id, created: false };
         requireMeetingSeat(m);
         const p: Participant = {
           id: randomUUID(),
@@ -909,10 +917,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
           breakoutId: null,
         };
         m.participants.push(p);
-        return p.id;
+        return { id: p.id, created: true };
       });
-      reply.setCookie(authCookie(code), session, cookieOpts);
-      return { participantId: id };
+      if (joined.created) reply.setCookie(authCookie(code), session, cookieOpts);
+      return { participantId: joined.id };
     },
   );
   app.get(
@@ -922,8 +930,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         rateLimit: {
           max: 90,
           timeWindow: "1 minute",
-          keyGenerator: (req: FastifyRequest) =>
-            digest(req.cookies[authCookie(codeOf(req))] ?? req.ip),
+          keyGenerator: browserRateKey,
         },
       },
     },
@@ -1273,9 +1280,6 @@ export async function createApp(config: Config, store: Store, media: Media) {
         return { ok: true };
       },
     );
-  const whiteboardRateKey = (req: FastifyRequest) => {
-    return verifyDevice(config.secret, req.cookies.mp_device) ?? req.ip;
-  };
   app.get(
     "/api/meetings/:code/whiteboard",
     {
@@ -1283,7 +1287,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         rateLimit: {
           max: 90,
           timeWindow: "1 minute",
-          keyGenerator: whiteboardRateKey,
+          keyGenerator: browserRateKey,
         },
       },
     },
@@ -1310,7 +1314,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         rateLimit: {
           max: 120,
           timeWindow: "1 minute",
-          keyGenerator: whiteboardRateKey,
+          keyGenerator: browserRateKey,
         },
       },
       bodyLimit: 8192,

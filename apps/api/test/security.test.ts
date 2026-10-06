@@ -248,6 +248,69 @@ test("lobby admission is enforced before media and guests cannot moderate or unl
   assert.equal(f.media.issued.at(-1)?.participant.status, "admitted");
 });
 
+test("repeated browser joins preserve the existing participant and cookie even when the room is full", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  const cookie = guest.client.cookie;
+  const retry = () =>
+    guest.client.request("POST", `/api/meetings/${m.code}/join`, {
+      name: "Replacement name",
+      password,
+    });
+  for (const status of ["waiting", "admitted"]) {
+    if (status === "admitted") {
+      await f.action(m.code, guest.id, "admit");
+      await f.action(m.code, guest.id, "block-audio");
+      await f.action(m.code, guest.id, "block-video");
+      await f.store.change(m.code, (meeting) => {
+        meeting.limits = { participants: 2, durationSeconds: 3600 };
+      });
+    }
+    const before = (await f.store.get(m.code))!;
+    assert.equal(
+      before.participants.find((p) => p.id === guest.id)!.status,
+      status,
+    );
+    const responses = await Promise.all([retry(), retry(), retry()]);
+    for (const response of responses) {
+      ok(response);
+      assert.equal(
+        response.json().participantId,
+        guest.id,
+        "Retry allocated another participant",
+      );
+    }
+    assert.equal(
+      guest.client.cookie,
+      cookie,
+      "Retry replaced the browser session",
+    );
+    assert.deepEqual(
+      (await f.store.get(m.code))!.participants,
+      before.participants,
+      "Retry changed participant identity, authority, expiry, or occupied seats",
+    );
+  }
+  const before = (await f.store.get(m.code))!;
+  const hostCookie = f.host.cookie;
+  const hostRetry = await f.host.request(
+    "POST",
+    `/api/meetings/${m.code}/join`,
+    {
+      name: "Guest name",
+      password,
+    },
+  );
+  ok(hostRetry);
+  assert.equal(hostRetry.json().participantId, m.hostId);
+  assert.equal(f.host.cookie, hostCookie);
+  assert.deepEqual(
+    (await f.store.get(m.code))!.participants,
+    before.participants,
+  );
+});
+
 test("kick invalidates the old session but permits a fresh lobby admission", async (t) => {
   const f = await fixture(t);
   const m = await f.meeting();
@@ -1090,4 +1153,55 @@ test("six admitted participants behind one NAT can each poll meeting state norma
         `Shared-NAT state polling failed: ${response.body}`,
       );
   }
+});
+
+test("poll limits reject forged cookie and code rotation before further store reads", async (t) => {
+  const f = await fixture(t);
+  const stateReads = t.mock.method(f.store, "get");
+  const boardReads = t.mock.method(f.store, "readWhiteboard");
+  const cases = [
+    { route: "state", ipv6: false },
+    { route: "state", ipv6: true },
+    { route: "whiteboard", ipv6: true },
+  ];
+  const observed = [];
+  for (const { route, ipv6 } of cases) {
+    const reads = route === "state" ? stateReads.mock : boardReads.mock;
+    const before = reads.callCount();
+    const statuses = [];
+    let atLimit = 0;
+    for (let i = 0; i < 92; i++) {
+      const code = String(i + 1).padStart(26, "A");
+      const ip = ipv6
+        ? `2001:db8:1234:5678::${(i + 1).toString(16)}`
+        : "198.51.100.121";
+      const client = new Client(f.app, ip);
+      client.cookie = `mp_${code}=forged-${i}; mp_device=device-${i}.invalid`;
+      const response = await client.request(
+        "GET",
+        `/api/meetings/${code}/${route}`,
+      );
+      statuses.push(response.statusCode);
+      if (i === 89) atLimit = reads.callCount();
+    }
+    observed.push({
+      route,
+      ipv6,
+      initialLookupsDenied: statuses.slice(0, 90).every((status) => status === 404),
+      limitedStatuses: statuses.slice(90),
+      storeReads: atLimit - before,
+      readsAfterLimit: reads.callCount() - atLimit,
+    });
+  }
+  assert.deepEqual(
+    observed,
+    cases.map(({ route, ipv6 }) => ({
+      route,
+      ipv6,
+      initialLookupsDenied: true,
+      limitedStatuses: [429, 429],
+      storeReads: 90,
+      readsAfterLimit: 0,
+    })),
+  );
 });
