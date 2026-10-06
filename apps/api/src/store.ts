@@ -139,6 +139,7 @@ export type Meeting = {
   hosted?: {
     accountId: string;
     billingOwnerId?: string;
+    brandingProfileId?: string;
     entitlement?: MeetingEntitlement;
     version: number;
     operationId?: string;
@@ -444,6 +445,7 @@ export type HostedAuthority = {
 function reusableHostedMeeting(existing: Meeting, incoming: Meeting) {
   if (
     existing.hosted?.requestHash !== incoming.hosted?.requestHash ||
+    existing.hosted?.brandingProfileId !== incoming.hosted?.brandingProfileId ||
     existing.hosted?.version !== incoming.hosted?.version
   )
     throw new HttpError(

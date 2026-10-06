@@ -222,6 +222,78 @@ test("background cleanup isolates room failures and retries them next pass", asy
     });
 });
 
+test("meeting branding is a machine-bound public profile, never a browser-selected tenant", async (t) => {
+  const f = await fixture(t, "hosted", "https://covemeet.com");
+  f.config.production = true;
+  const brandingProfileId = randomUUID();
+  const payload = { ...f.input, brandingProfileId };
+  const denied = await f.app.inject({
+    method: "POST",
+    url: "/api/internal/hosted/meetings",
+    headers: { origin, "x-requested-with": "MeetingPlatform" },
+    payload,
+  });
+  assert.equal(denied.statusCode, 403);
+  assert.equal(
+    (
+      await f.browser("/api/meetings", {
+        ...settings,
+        creationKey,
+        brandingProfileId,
+      })
+    ).statusCode,
+    400,
+  );
+  assert.equal(
+    (await f.create({ brandingProfileId: "not-a-profile" })).statusCode,
+    400,
+  );
+  const first = await f.create({
+    brandingProfileId: brandingProfileId.toUpperCase(),
+  });
+  assert.equal(first.statusCode, 200, first.body);
+  const code = first.json().code;
+  assert.equal(
+    (await f.store.get(code))!.hosted!.brandingProfileId,
+    brandingProfileId,
+  );
+  assert.deepEqual(
+    (await f.create({ brandingProfileId })).json(),
+    first.json(),
+  );
+  assert.equal(
+    (await f.create({ brandingProfileId: randomUUID() })).statusCode,
+    409,
+  );
+  assert.equal((await f.create()).statusCode, 409);
+  const branding = await f.app.inject({
+    url: `/api/meetings/${code}/branding`,
+  });
+  assert.equal(branding.statusCode, 200);
+  assert.deepEqual(branding.json(), { brandingProfileId });
+  assert.equal(branding.headers["cache-control"], "no-store");
+  assert.equal(branding.headers["set-cookie"], undefined);
+  assert.match(
+    String(branding.headers["content-security-policy"]),
+    /img-src 'self' blob: data: https:\/\/covemeet\.com;/,
+  );
+  assert.equal(
+    (await f.app.inject({ url: `/api/meetings/${"A".repeat(26)}/branding` }))
+      .statusCode,
+    404,
+  );
+  const legacy = await f.create({ operationId: randomUUID() });
+  assert.equal(legacy.statusCode, 200, legacy.body);
+  assert.deepEqual(
+    (
+      await f.app.inject({
+        url: `/api/meetings/${legacy.json().code}/branding`,
+      })
+    ).json(),
+    { brandingProfileId: null },
+  );
+});
+
 test("scheduled codes are machine-assigned and replay only their unchanged unused host bootstrap", async (t) => {
   const f = await fixture(t),
     scheduledCode = randomUUID().replaceAll("-", "").toUpperCase() + "AB";

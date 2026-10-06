@@ -3273,3 +3273,29 @@ input[type="checkbox"] {
     max-height: 44px;
   }
 }
+
+.company-join {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: 28px clamp(20px, 5vw, 80px);
+  background-size: cover;
+  background-position: center;
+}
+.company-join > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+.company-join-card {
+  width: min(100%, 520px);
+  margin: auto;
+  padding: clamp(24px, 5vw, 44px);
+  display: grid;
+  gap: 24px;
+}
+.company-join > footer {
+  margin-top: 36px;
+}

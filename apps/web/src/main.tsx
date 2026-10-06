@@ -2,6 +2,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -40,6 +41,7 @@ import { Icon } from "./icons";
 import "./styles.css";
 import { brandLogo } from "./brand";
 import { scheduledMeetingPending } from "./scheduled-status";
+import { companySlug, routeBranding } from "./team-branding";
 import { BrandingEditor } from "./branding";
 import { selectStage } from "./stage-policy";
 import {
@@ -174,61 +176,102 @@ function Logo({ name, small = false }: { name: string; small?: boolean }) {
 }
 
 function App() {
-  const [path, setPath] = useState(location.pathname);
-  const [config, setConfig] = useState<Config>();
+  const [route, setRoute] = useState({ path: location.pathname });
+  const path = route.path;
+  const [installation, setConfig] = useState<Config>();
+  const [brandRefresh, setBrandRefresh] = useState("");
+  const [routeBrand, setRouteBrand] = useState<{
+    route: typeof route;
+    refresh: string;
+    branding?: Branding;
+  }>();
+  const company = installation?.edition === "hosted" && Boolean(companySlug(path));
+  const resolvedBrand =
+    routeBrand?.route === route && routeBrand.refresh === brandRefresh
+      ? routeBrand
+      : undefined;
+  const branding = company
+    ? resolvedBrand?.branding
+    : resolvedBrand?.branding ?? installation?.branding;
+  const config = installation && {
+    ...installation,
+    branding,
+    brandName: branding?.brandName || (company ? "Covemeet" : installation.brandName),
+  };
+  useEffect(() => {
+    if (!installation) return;
+    const controller = new AbortController();
+    void routeBranding(installation, path, controller.signal).then(
+      (branding) => {
+        if (!controller.signal.aborted)
+          setRouteBrand({ route, refresh: brandRefresh, branding });
+      },
+    );
+    return () => controller.abort();
+  }, [installation, route, brandRefresh]);
   const [error, setError] = useState("");
   const [configAttempt, setConfigAttempt] = useState(0);
-  useEffect(() => {
-    if (!config) return;
-    const logo = brandLogo(
-      config.branding?.brandName || config.brandName,
-      config.branding?.logoUrl,
-    );
-    const existing = document.querySelector<HTMLLinkElement>("#brand-favicon");
-    if (!logo) {
-      existing?.remove();
-      return;
+  useLayoutEffect(() => {
+    if (!installation) return;
+    const b = branding;
+    const neutralName = company ? "Covemeet" : installation.brandName;
+    const logo = brandLogo(b?.brandName || neutralName, b?.logoUrl);
+    document.querySelector("#brand-favicon")?.remove();
+    if (logo) {
+      const icon = document.createElement("link");
+      icon.id = "brand-favicon";
+      icon.rel = "icon";
+      icon.href = logo;
+      document.head.append(icon);
     }
-    const icon = existing || document.createElement("link");
-    icon.id = "brand-favicon";
-    icon.rel = "icon";
-    icon.href = logo;
-    if (!existing) document.head.append(icon);
-  }, [config]);
-  useEffect(() => {
-    if (!config?.branding) return;
-    const b = config.branding;
     const style = document.documentElement.style;
-    style.setProperty("--accent", b.accentColor);
-    style.setProperty("--page-background", b.backgroundColor);
-    style.setProperty(
-      "--radius",
-      b.borderRadius === "square"
-        ? "2px"
-        : b.borderRadius === "pill"
-          ? "24px"
-          : "14px",
-    );
-    style.setProperty(
-      "--button-radius",
-      b.borderRadius === "square"
-        ? "2px"
-        : b.borderRadius === "pill"
-          ? "24px"
-          : "8px",
-    );
-    style.setProperty(
-      "--font",
-      b.font === "serif"
-        ? "Georgia, serif"
-        : b.font === "system"
-          ? "system-ui, sans-serif"
-          : "Inter, system-ui, sans-serif",
-    );
-    document.title = b.brandName;
-  }, [config]);
+    if (b) {
+      style.setProperty("--accent", b.accentColor);
+      style.setProperty("--page-background", b.backgroundColor);
+      style.setProperty(
+        "--radius",
+        b.borderRadius === "square"
+          ? "2px"
+          : b.borderRadius === "pill"
+            ? "24px"
+            : "14px",
+      );
+      style.setProperty(
+        "--button-radius",
+        b.borderRadius === "square"
+          ? "2px"
+          : b.borderRadius === "pill"
+            ? "24px"
+            : "8px",
+      );
+      style.setProperty(
+        "--font",
+        b.font === "serif"
+          ? "Georgia, serif"
+          : b.font === "system"
+            ? "system-ui, sans-serif"
+            : "Inter, system-ui, sans-serif",
+      );
+    }
+    document.title = b?.brandName || neutralName;
+    return () => {
+      for (const property of [
+        "--accent",
+        "--page-background",
+        "--radius",
+        "--button-radius",
+        "--font",
+      ])
+        style.removeProperty(property);
+      document.querySelector("#brand-favicon")?.remove();
+      document.title = neutralName;
+    };
+  }, [branding, installation, company]);
   useEffect(() => {
-    const changed = () => setPath(location.pathname);
+    const changed = () => {
+      setBrandRefresh("");
+      setRoute({ path: location.pathname });
+    };
     window.addEventListener("popstate", changed);
     return () => window.removeEventListener("popstate", changed);
   }, []);
@@ -275,8 +318,28 @@ function App() {
         key={room[2]}
         code={decodeURIComponent(room[2])}
         hostEntry={room[1] === "host"}
+        onAvailable={() => setBrandRefresh(path)}
         config={config}
       />
+    );
+  else if (company)
+    view = !resolvedBrand ? (
+      <Center>
+        <Logo name="Covemeet" />
+        <div className="spinner" />
+        <p>Loading company page…</p>
+      </Center>
+    ) : !resolvedBrand.branding ? (
+      <Center>
+        <Logo name="Covemeet" />
+        <h1>Company page unavailable</h1>
+        <Button onClick={() => setBrandRefresh(crypto.randomUUID())}>
+          Retry
+        </Button>
+        <Button onClick={() => navigate("/")}>Meetings</Button>
+      </Center>
+    ) : (
+      <Home key={path} config={config} company />
     );
   else if (path === "/branding" && config.edition === "self-hosted")
     view = (
@@ -309,7 +372,13 @@ function Center({ children }: { children: ReactNode }) {
   );
 }
 
-function Home({ config }: { config: Config }) {
+function Home({
+  config,
+  company = false,
+}: {
+  config: Config;
+  company?: boolean;
+}) {
   const showCreationForm =
     config.edition === "self-hosted" &&
     config.branding?.showHostButton !== false;
@@ -379,6 +448,66 @@ function Home({ config }: { config: Config }) {
         "Enter a valid meeting code or a meeting link from this installation.",
       );
   }
+  const joinForm = (
+    <form onSubmit={join} className="form-stack">
+      <Field label="Meeting code or link">
+        <input
+          value={joinCode}
+          onChange={(e) => setJoinCode(e.target.value)}
+          placeholder="Paste a meeting code or link"
+          required
+          autoComplete="off"
+          spellCheck={false}
+        />
+      </Field>
+      <Button type="submit" className="full-width">
+        Continue
+        <Icon name="arrow" size={17} />
+      </Button>
+    </form>
+  );
+  if (company)
+    return (
+      <main
+        className="company-join"
+        style={
+          config.branding?.backgroundUrl
+            ? {
+                backgroundImage: `linear-gradient(var(--page-background), transparent), url(${JSON.stringify(config.branding.backgroundUrl)})`,
+              }
+            : undefined
+        }
+      >
+        <header>
+          <Logo name={config.brandName} />
+          {config.branding?.showHostButton !== false && (
+            <a className="button" href={homeHref()}>
+              Host a meeting
+            </a>
+          )}
+        </header>
+        <section className="company-join-card card">
+          <h1>{config.branding?.headline || "Join a meeting"}</h1>
+          {config.branding?.description && (
+            <p className="muted">{config.branding.description}</p>
+          )}
+          {error && <Notice>{error}</Notice>}
+          {joinForm}
+        </section>
+        <footer className="dashboard-footer">
+          <span>{config.branding?.footerText || config.brandName}</span>
+          {config.branding?.supportUrl && (
+            <a
+              href={config.branding.supportUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {config.branding.supportLabel || "Support"}
+            </a>
+          )}
+        </footer>
+      </main>
+    );
   return (
     <div
       className="dashboard"
@@ -556,22 +685,7 @@ function Home({ config }: { config: Config }) {
                     <p>Use a meeting code or direct link.</p>
                   </div>
                 </div>
-                <form onSubmit={join} className="form-stack">
-                  <Field label="Meeting code or link">
-                    <input
-                      value={joinCode}
-                      onChange={(e) => setJoinCode(e.target.value)}
-                      placeholder="Paste a meeting code or link"
-                      required
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                  </Field>
-                  <Button type="submit" className="full-width">
-                    Continue
-                    <Icon name="arrow" size={17} />
-                  </Button>
-                </form>
+                {joinForm}
               </section>
               <section className="access-card">
                 <div className="access-graphic">
@@ -624,10 +738,12 @@ function Home({ config }: { config: Config }) {
 function Meeting({
   code,
   hostEntry,
+  onAvailable,
   config,
 }: {
   code: string;
   hostEntry: boolean;
+  onAvailable: () => void;
   config: Config;
 }) {
   const [state, setState] = useState<MeetingState>();
@@ -671,6 +787,7 @@ function Meeting({
     const controller = new AbortController();
     let timeout: ReturnType<typeof setTimeout>;
     async function poll() {
+      let nextPollMs = 2000;
       try {
         const data = await api<MeetingState>(
           meetingPath(code, "/state"),
@@ -678,12 +795,15 @@ function Meeting({
           undefined,
           controller.signal,
         );
+        if (controller.signal.aborted) return;
+        onAvailable();
         setState(data);
         setNeedsJoin(false);
         setError("");
       } catch (e) {
         if (controller.signal.aborted) return;
         if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
+          onAvailable();
           setNeedsJoin(true);
           setState(undefined);
         } else {
@@ -695,9 +815,10 @@ function Meeting({
           );
           if (controller.signal.aborted) return;
           setError(pending ? "Meeting has not started" : messageOf(e));
+          if (pending) nextPollMs = 10000;
         }
       }
-      if (!controller.signal.aborted) timeout = setTimeout(poll, 2000);
+      if (!controller.signal.aborted) timeout = setTimeout(poll, nextPollMs);
     }
     void poll();
     return () => {

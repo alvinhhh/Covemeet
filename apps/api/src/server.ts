@@ -183,7 +183,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     if (config.production)
       reply.header(
         "Content-Security-Policy",
-        `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' wss:${config.edition === "hosted" ? ` ${config.portalOrigin}` : ""}; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'`,
+        `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:${config.edition === "hosted" ? ` ${config.portalOrigin}` : ""}; media-src 'self' blob:; connect-src 'self' wss:${config.edition === "hosted" ? ` ${config.portalOrigin}` : ""}; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'`,
       );
     // Security dispatch must use the matched route, including decoded static segments.
     const route = req.routeOptions.url;
@@ -623,11 +623,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
     });
     return m;
   }
+  app.get("/api/meetings/:code/branding", async (req) => {
+    const meeting = await find(req);
+    return { brandingProfileId: meeting.hosted?.brandingProfileId ?? null };
+  });
   app.post("/api/internal/hosted/meetings", async (req) => {
     const body = z
       .object({
         accountId: hostedUuid,
         billingOwnerId: hostedUuid,
+        brandingProfileId: hostedUuid.optional(),
         version: hostedVersion,
         operationId: hostedUuid,
         scheduledCode: z
@@ -660,6 +665,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
         body.meeting.password,
         body.meeting.mode,
         ...(body.scheduledCode ? [body.scheduledCode] : []),
+        ...(body.brandingProfileId
+          ? [{ brandingProfileId: body.brandingProfileId }]
+          : []),
       ]),
     );
     // Only this machine-authenticated route accepts a preassigned scheduled
@@ -672,6 +680,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
     candidate.hosted = {
       accountId: body.accountId,
       billingOwnerId: body.billingOwnerId,
+      ...(body.brandingProfileId
+        ? { brandingProfileId: body.brandingProfileId }
+        : {}),
       version: body.version,
       operationId: body.operationId,
       requestHash,

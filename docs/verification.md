@@ -12,3 +12,9 @@ Verified against the first Covemeet implementation on the local development stac
 The initial recorder attempt failed because the running SFU had not loaded the newly generated internal ICE-candidate setting. Restarting the SFU fixed it. Regenerating runtime configuration requires restarting the affected service.
 
 These checks establish local behavior only. They do not demonstrate 100-person or 1,000-viewer capacity, remote TURN behavior, phone/SIP, multi-region resilience, production SMTP delivery, or compliance with an entire control framework. See security-controls.md for release gates.
+
+### Hosted team presentation
+
+`hosted-authority.test.ts` checks machine-only `brandingProfileId` binding, unchanged replay, different-profile conflict, and the public `/api/meetings/:code/branding` response. The response contains only the stored profile ID; it does not grant access to a meeting. `team-branding.test.ts` checks company pages, meeting-bound and scheduled pre-start lookup, omitted credentials, fixed portal/image origins, response size limits and canceled lookups. Self-hosted installations retain `/api/config` branding.
+
+Hosted `/t/<slug>` routes render a company join form. After code entry, the meeting's stored profile replaces the company hint. Route changes reset document branding; missing/unpublished profiles use installation defaults. Actual cross-origin rendering, browser history, pending schedules starting, and guest entry still require the paired hosted release and browser verification.
