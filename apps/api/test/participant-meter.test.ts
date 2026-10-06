@@ -105,6 +105,62 @@ async function fixture(
   };
 }
 
+test("legacy recording inventory cannot block meeting admission or ongoing media", async (t) => {
+  const f = await fixture(t, 360000, now, "meeting");
+  await f.store.setHostedEntitlement({
+    ...f.grant,
+    revision: 2,
+    quota: {
+      ...f.grant.quota!,
+      recordingSecondsPerMonth: null,
+      storageBytes: 5_000_000_000,
+    },
+  });
+  await f.store.change(f.m.code, (m) => {
+    m.recordingAllowed = true;
+  });
+  await f.act(f.host, "host-connection", "claim");
+  await f.act(f.host, "host-connection", "connected");
+  await f.store.create({
+    ...structuredClone(f.m),
+    id: randomUUID(),
+    code: randomUUID(),
+    room: randomUUID(),
+    ended: true,
+    participants: [],
+    lifecycle: { startedAt: now - 86400000, cleanupConfirmed: true },
+    recordings: [
+      { id: randomUUID(), status: "deleted", createdAt: now - 86400000 },
+    ],
+  });
+
+  // These are the store entry points used by host exchange/admission/media
+  // issuance and by the signaling gateway's claims and heartbeat.
+  await f.store.checkUsage(f.m.code);
+  await f.act(f.guest, "guest-connection", "claim");
+  await f.act(f.guest, "guest-connection", "connected");
+  t.mock.timers.tick(5000);
+  await f.act(f.host, "host-connection", "heartbeat");
+  assert.equal(
+    f.store.usageLedgers.get(f.owner)!.windows[0]!.meetingUsedMs,
+    5000,
+  );
+
+  await assert.rejects(f.usage(), /Recording storage inventory is unavailable/);
+  const recording = {
+    id: randomUUID(),
+    status: "starting",
+    createdAt: Date.now(),
+  };
+  await assert.rejects(
+    f.store.withRecordingLock(f.m.code, recording.id, (lock) =>
+      lock.reserveRecording(recording, () => {}, { maxBytes: 1000, copies: 1 }),
+    ),
+    /Recording storage inventory is unavailable/,
+  );
+  assert.equal((await f.store.get(f.m.code))!.recordings.length, 0);
+});
+
 test("UTC monthly windows clamp the original anniversary without February drift", () => {
   const anchor = Date.UTC(2024, 0, 31, 9, 12, 30, 123);
   assert.deepEqual(usageWindow(anchor, Date.UTC(2024, 1, 29, 10)), {

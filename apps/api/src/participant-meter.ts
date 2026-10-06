@@ -319,7 +319,13 @@ export function requireUsage(
   participant?: Participant,
   meeting?: Meeting,
 ) {
-  const view = usageView(ledger, grant, meetings, now);
+  // Unknown recording inventory blocks capture and its usage display, not an
+  // independently funded meeting or its existing media connections.
+  const window = usageWindow(ledger.anchorAt, now);
+  const available =
+    (grant?.quota?.participantSecondsPerMonth ?? 0) * 1000 -
+    usedTime(ledger, window.start) -
+    held(ledger, meetings, window.start);
   const meter =
     ledger.metering === "meeting" ? meeting?.meetingMeter : participant?.meter;
   const prepaid = meter && meter.phase !== "closing" && meter.fundedUntil > now;
@@ -329,8 +335,8 @@ export function requireUsage(
     !grant.quota ||
     grant.validUntil <= now ||
     quotaOverdrawn(ledger, grant, meetings, now) ||
-    (view.blocked && !continuing) ||
-    (!prepaid && view.participantSeconds.available <= 0)
+    (usageBlocked(grant, meetings, now) && !continuing) ||
+    (!prepaid && available < 1000)
   )
     throw new HttpError(
       409,
