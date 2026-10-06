@@ -562,6 +562,21 @@ textarea:focus {
 .center-card .field {
   text-align: left;
 }
+.recording-recovery-page .center-card {
+  width: min(640px, 100%);
+  align-items: stretch;
+  text-align: left;
+}
+.recording-recovery-page .brand {
+  align-self: center;
+}
+.recording-recovery-page h1,
+.recording-recovery-page > .center-card > .muted {
+  text-align: center;
+}
+.recording-recovery-page .recordings-panel {
+  width: 100%;
+}
 .spinner {
   width: 29px;
   height: 29px;

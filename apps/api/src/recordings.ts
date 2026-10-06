@@ -45,7 +45,7 @@ export type RecorderClient = Pick<
   EgressClient,
   "startRoomCompositeEgress" | "stopEgress" | "listEgress"
 >;
-const retentionMs = 7 * 86400000;
+export const retentionMs = 7 * 86400000;
 const ownedChunkSize = 1024 * 1024;
 const encryptedSize = (rawBytes: number) =>
   93 + rawBytes + Math.ceil(rawBytes / ownedChunkSize) * 25;
@@ -1287,7 +1287,7 @@ export class RecordingService {
         to: delivery.recipient,
         messageId: delivery.messageId,
         subject: "Recording download password",
-        text: `Recording: ${id}\nPassword: ${password}\nExpires: ${new Date(row.expiresAt).toISOString()}\nThe download link is available in the meeting host panel. This email does not include the link.`,
+        text: `Recording: ${id}\nPassword: ${password}\nExpires: ${new Date(row.expiresAt).toISOString()}\nThe download link is available on the Recordings page. This email does not include the link.`,
       });
     } catch {
       return "failed";

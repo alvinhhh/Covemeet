@@ -2224,3 +2224,544 @@ test("recording refuses public or redirected spool directories and over-limit so
   await symlink(redirected, path.dirname(f.raw));
   await assert.rejects(service.start(f.meeting), /private directories/);
 });
+
+test("recording recovery opens ended files without restoring room or media authority", async (t) => {
+  const f = await fixture(t);
+  const link = await f.link();
+  await f.store.change(f.meeting.code, (m) => {
+    m.ended = true;
+    m.participants[0]!.status = "left";
+    m.participants[0]!.expiresAt = Date.now() - 1;
+  });
+  const before = (await f.store.get(f.meeting.code))!;
+  const app = await f.app(),
+    base = `/api/meetings/${f.meeting.code}`;
+  const post = (suffix: string, payload: object, cookie = "") =>
+    app.inject({
+      method: "POST",
+      url: base + suffix,
+      headers: { origin, "x-requested-with": "MeetingPlatform", cookie },
+      payload,
+    });
+  const requested = await post("/recording-access/request", {});
+  assert.equal(requested.statusCode, 202);
+  const challenge = requested.cookies.find((c) =>
+    c.name.startsWith("mp_recording_recovery_"),
+  )!;
+  const challengeCookie = `${challenge.name}=${challenge.value}`;
+  assert.equal(f.emails.at(-1)!.to, before.hostEmail);
+  const otp = /Verification code: (\d{6})/.exec(f.emails.at(-1)!.text)![1]!;
+  // An unrelated browser cannot consume or exhaust this browser's challenge.
+  assert.equal(
+    (await post("/recording-access/verify", { otp })).statusCode,
+    403,
+  );
+  const verified = await post(
+    "/recording-access/verify",
+    { otp },
+    challengeCookie,
+  );
+  assert.equal(verified.statusCode, 200, verified.body);
+  const c = verified.cookies.find((c) => c.name.startsWith("mp_recordings_"))!;
+  const cookie = `${c.name}=${c.value}`;
+  assert.equal(c.httpOnly, true);
+  assert.equal(c.sameSite, "Strict");
+  assert.equal(
+    (await post("/recording-access/verify", { otp }, challengeCookie))
+      .statusCode,
+    403,
+  );
+  const list = await app.inject({
+    url: base + "/recordings",
+    headers: { cookie },
+  });
+  assert.equal(list.statusCode, 200);
+  assert.equal(list.headers["cache-control"], "no-store");
+  assert.deepEqual(Object.keys(list.json()).sort(), ["recordings", "title"]);
+  assert.equal(list.json().recordings[0].id, f.recording.id);
+  assert.ok(!list.body.includes(before.hostEmail!));
+  assert.ok(!list.body.includes(before.participants[0]!.tokenHash));
+  const current = await app.inject({
+    url: `${base}/recordings/${f.recording.id}/link`,
+    headers: { cookie },
+  });
+  assert.equal(current.statusCode, 200, current.body);
+  assert.equal(
+    current.json().url,
+    link.url,
+    "Opening files must not rotate the existing link",
+  );
+  const download = await post(
+    "/download",
+    { token: link.token, password: link.password },
+    cookie,
+  );
+  assert.equal(download.statusCode, 200, download.body);
+  assert.deepEqual(download.rawPayload, f.plaintext);
+  assert.equal(
+    (await post("/download", { token: link.token, password: "wrong" }, cookie))
+      .statusCode,
+    403,
+  );
+  for (const [suffix, body] of [
+    ["/host-email", { email: "other@example.test" }],
+    ["/recordings", {}],
+    [`/recordings/${f.recording.id}/stop`, {}],
+    ["/messages", { text: "not allowed" }],
+    ["/media", {}],
+  ] as const)
+    assert.notEqual((await post(suffix, body, cookie)).statusCode, 200, suffix);
+  assert.equal(
+    (await app.inject({ url: base + "/state", headers: { cookie } }))
+      .statusCode,
+    401,
+  );
+  const after = (await f.store.get(f.meeting.code))!;
+  assert.deepEqual(after.participants, before.participants);
+  assert.deepEqual(after.lifecycle, before.lifecycle);
+  assert.equal(after.ended, true);
+  assert.deepEqual(f.endedRooms, []);
+  // A changed verified recipient invalidates the recovered session immediately.
+  await f.store.change(f.meeting.code, (m) => {
+    m.hostEmail = "replacement@example.test";
+  });
+  assert.equal(
+    (await app.inject({ url: base + "/recordings", headers: { cookie } }))
+      .statusCode,
+    401,
+  );
+});
+
+test("recording recovery challenge is purpose-bound, rate bounded and has an atomic five-attempt limit", async (t) => {
+  const f = await fixture(t),
+    app = await f.app(),
+    base = `/api/meetings/${f.meeting.code}`;
+  const post = (suffix: string, payload: object, cookie = "") =>
+    app.inject({
+      method: "POST",
+      url: base + suffix,
+      headers: { origin, "x-requested-with": "MeetingPlatform", cookie },
+      payload,
+    });
+  assert.equal(
+    (
+      await post("/recording-access/request", {
+        email: "attacker@example.test",
+      })
+    ).statusCode,
+    400,
+  );
+  const first = await post("/recording-access/request", {});
+  const c = first.cookies.find((c) =>
+    c.name.startsWith("mp_recording_recovery_"),
+  )!;
+  const cookie = `${c.name}=${c.value}`;
+  const otp = /Verification code: (\d{6})/.exec(f.emails.at(-1)!.text)![1]!;
+  const wrong = otp === "111111" ? "222222" : "111111";
+  const results = await Promise.all(
+    Array.from({ length: 5 }, () =>
+      post("/recording-access/verify", { otp: wrong }, cookie),
+    ),
+  );
+  assert.ok(results.every((r) => r.statusCode === 403));
+  assert.equal(
+    (await post("/recording-access/verify", { otp }, cookie)).statusCode,
+    403,
+  );
+  assert.equal((await f.store.get(f.meeting.code))!.recordingAccess, undefined);
+  assert.equal((await f.store.get(f.meeting.code))!.hostEmailVerified, true);
+  assert.equal(f.emails.length, 1);
+  // A resend within the durable room cooldown does not replace the challenge.
+  const again = await post("/recording-access/request", {}, cookie);
+  assert.equal(again.statusCode, 202);
+  assert.equal(
+    again.cookies.find((item) => item.name === c.name)?.value,
+    c.value,
+  );
+  assert.equal(f.emails.length, 1);
+});
+
+test("original ended or left host cookie can read files while guests cannot", async (t) => {
+  const f = await fixture(t),
+    app = await f.app();
+  await f.store.change(f.meeting.code, (m) => {
+    m.ended = true;
+    m.participants[0]!.status = "left";
+  });
+  const url = `/api/meetings/${f.meeting.code}/recordings`;
+  assert.equal(
+    (
+      await app.inject({
+        url,
+        headers: { cookie: `mp_${f.meeting.code}=${f.hostSession}` },
+      })
+    ).statusCode,
+    200,
+  );
+  assert.equal(
+    (
+      await app.inject({
+        url,
+        headers: { cookie: `mp_${f.meeting.code}=${f.guestSession}` },
+      })
+    ).statusCode,
+    403,
+  );
+});
+
+test("hosted recording tickets use current creator authority, survive ordinary end, and replace only recording access", async (t) => {
+  const f = await fixture(t);
+  f.config.edition = "hosted";
+  const accountId = randomUUID(),
+    billingOwnerId = randomUUID();
+  await f.store.change(f.meeting.code, (m) => {
+    m.hosted = { accountId, billingOwnerId, version: 1 };
+    m.ended = true;
+    m.lifecycle = { startedAt: Date.now() - day, cleanupConfirmed: true };
+    m.participants[0]!.status = "left";
+    m.participants[0]!.expiresAt = Date.now() - 1;
+  });
+  await f.store.setHostedAuthority({
+    accountId,
+    billingOwnerId,
+    version: 1,
+    enabled: true,
+  });
+  const before = (await f.store.get(f.meeting.code))!;
+  const app = await f.app(),
+    base = `/api/meetings/${f.meeting.code}`;
+  const internal = (payload: object) =>
+    app.inject({
+      method: "POST",
+      url: `/api/internal/hosted/meetings/${f.meeting.code}/recording-access`,
+      headers: {
+        "x-requested-with": "MeetingPlatformHosted",
+        authorization: `Bearer ${creationKey}`,
+      },
+      payload,
+    });
+  const post = (suffix: string, payload: object, cookie = "") =>
+    app.inject({
+      method: "POST",
+      url: base + suffix,
+      headers: { origin, "x-requested-with": "MeetingPlatform", cookie },
+      payload,
+    });
+  assert.equal(
+    (await internal({ accountId: randomUUID(), version: 1 })).statusCode,
+    403,
+  );
+  assert.equal((await internal({ accountId, version: 2 })).statusCode, 403);
+  assert.equal(
+    (await internal({ accountId, version: 1, billingOwnerId })).statusCode,
+    400,
+  );
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordings = [];
+  });
+  assert.equal(
+    (await internal({ accountId: randomUUID(), version: 1 })).statusCode,
+    403,
+  );
+  const empty = await internal({ accountId, version: 1 });
+  assert.equal(empty.statusCode, 200, empty.body);
+  assert.deepEqual(empty.json(), {
+    code: f.meeting.code,
+    recordingsAvailable: false,
+  });
+  assert.equal((await f.store.get(f.meeting.code))!.recordingAccess, undefined);
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordings = before.recordings;
+  });
+  const expired = await internal({ accountId, version: 1 });
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordingAccess!.ticket!.expiresAt = Date.now() - 1;
+  });
+  assert.equal(
+    (
+      await post("/recording-access/exchange", {
+        ticket: expired.json().ticket,
+      })
+    ).statusCode,
+    403,
+  );
+  const issued = await internal({ accountId, version: 1 });
+  assert.equal(issued.statusCode, 200, issued.body);
+  const otherCode = "ANOTHERRECORDINGMEETINGCODE";
+  await f.store.create({
+    ...structuredClone(before),
+    id: randomUUID(),
+    code: otherCode,
+  });
+  const wrongRoom = await app.inject({
+    method: "POST",
+    url: `/api/meetings/${otherCode}/recording-access/exchange`,
+    headers: { origin, "x-requested-with": "MeetingPlatform" },
+    payload: { ticket: issued.json().ticket },
+  });
+  assert.equal(wrongRoom.statusCode, 403);
+  const first = await post("/recording-access/exchange", {
+    ticket: issued.json().ticket,
+  });
+  assert.equal(first.statusCode, 200, first.body);
+  const cookieOf = (r: typeof first) => {
+    const c = r.cookies.find((c) => c.name.startsWith("mp_recordings_"))!;
+    return `${c.name}=${c.value}`;
+  };
+  const cookie = cookieOf(first);
+  assert.equal(
+    (await post("/recording-access/exchange", { ticket: issued.json().ticket }))
+      .statusCode,
+    403,
+  );
+  assert.equal(
+    (await app.inject({ url: base + "/recordings", headers: { cookie } }))
+      .statusCode,
+    200,
+  );
+  const renewed = await internal({ accountId, version: 1 });
+  const second = await post("/recording-access/exchange", {
+    ticket: renewed.json().ticket,
+  });
+  assert.equal(second.statusCode, 200);
+  assert.equal(
+    (await app.inject({ url: base + "/recordings", headers: { cookie } }))
+      .statusCode,
+    401,
+  );
+  const cookie2 = cookieOf(second);
+  assert.equal(
+    (await app.inject({ url: base + "/state", headers: { cookie: cookie2 } }))
+      .statusCode,
+    401,
+  );
+  const requested = await post("/recording-access/request", {});
+  assert.equal(requested.statusCode, 202);
+  assert.equal(
+    f.emails.length,
+    0,
+    "Hosted accounts cannot fall back to email OTP recovery",
+  );
+  const after = (await f.store.get(f.meeting.code))!;
+  assert.deepEqual(after.participants, before.participants);
+  assert.deepEqual(after.lifecycle, before.lifecycle);
+  assert.equal(after.hostTokenHash, before.hostTokenHash);
+  // No hosting grant was installed; artifact tickets must not require or reserve one.
+  await assert.rejects(
+    f.store.hostedUsage(billingOwnerId),
+    (error: unknown) => error instanceof HttpError && error.status === 404,
+  );
+  const stale = await internal({ accountId, version: 1 });
+  await f.store.setHostedAuthority({
+    accountId,
+    billingOwnerId,
+    version: 2,
+    enabled: false,
+  });
+  assert.equal(
+    (await post("/recording-access/exchange", { ticket: stale.json().ticket }))
+      .statusCode,
+    403,
+  );
+  assert.equal(
+    (
+      await app.inject({
+        url: base + "/recordings",
+        headers: { cookie: cookie2 },
+      })
+    ).statusCode,
+    401,
+  );
+});
+
+test("recording-only credentials cannot act in an active room", async (t) => {
+  const f = await fixture(t),
+    token = randomBytes(32).toString("base64url");
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordingAccess = {
+      identity: { email: m.hostEmail! },
+      session: { hash: digest(token), expiresAt: Date.now() + day },
+    };
+  });
+  const app = await f.app(),
+    base = `/api/meetings/${f.meeting.code}`;
+  const cookie = `mp_recordings_${f.meeting.code}=${token}`,
+    host = `mp_${f.meeting.code}=${f.hostSession}`;
+  for (const suffix of ["/state", "/whiteboard"]) {
+    assert.equal(
+      (await app.inject({ url: base + suffix, headers: { cookie } }))
+        .statusCode,
+      401,
+      suffix,
+    );
+    assert.equal(
+      (await app.inject({ url: base + suffix, headers: { cookie: host } }))
+        .statusCode,
+      200,
+      suffix,
+    );
+  }
+  for (const [suffix, payload] of [
+    ["/media", {}],
+    ["/host-email", { email: "other@example.test" }],
+    ["/recordings", {}],
+    [`/recordings/${f.recording.id}/stop`, {}],
+    ["/messages", { text: "forbidden" }],
+    ["/end", {}],
+  ] as const) {
+    const result = await app.inject({
+      method: "POST",
+      url: base + suffix,
+      headers: { origin, "x-requested-with": "MeetingPlatform", cookie },
+      payload,
+    });
+    assert.equal(result.statusCode, 401, `${suffix}: ${result.body}`);
+  }
+  const policy = (credential: string) =>
+    app.inject({
+      method: "PATCH",
+      url: base,
+      headers: {
+        origin,
+        "x-requested-with": "MeetingPlatform",
+        cookie: credential,
+      },
+      payload: { locked: true },
+    });
+  assert.equal((await policy(cookie)).statusCode, 401);
+  assert.equal((await policy(host)).statusCode, 200);
+  assert.equal(
+    (
+      await app.inject({
+        method: "POST",
+        url: base + "/media",
+        headers: {
+          origin,
+          "x-requested-with": "MeetingPlatform",
+          cookie: host,
+        },
+        payload: {},
+      })
+    ).statusCode,
+    200,
+  );
+  assert.equal(
+    (await app.inject({ url: base + "/recordings", headers: { cookie } }))
+      .statusCode,
+    200,
+  );
+  assert.equal((await f.store.get(f.meeting.code))!.ended, false);
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordingAccess!.session!.expiresAt = Date.now() - 1;
+  });
+  assert.equal(
+    (await app.inject({ url: base + "/recordings", headers: { cookie } }))
+      .statusCode,
+    401,
+  );
+});
+
+test("recording recovery expiration and failed email leave no usable capability", async (t) => {
+  const f = await fixture(t),
+    app = await f.app(),
+    base = `/api/meetings/${f.meeting.code}`;
+  const request = (code = f.meeting.code) =>
+    app.inject({
+      method: "POST",
+      url: `/api/meetings/${code}/recording-access/request`,
+      headers: { origin, "x-requested-with": "MeetingPlatform" },
+      payload: {},
+    });
+  const unknown = await request("UNKNOWNRECORDINGMEETINGCODE");
+  const known = await request();
+  assert.equal(unknown.statusCode, 202);
+  assert.equal(unknown.body, known.body);
+  const c = known.cookies.find((c) =>
+    c.name.startsWith("mp_recording_recovery_"),
+  )!;
+  const otp = /Verification code: (\d{6})/.exec(f.emails.at(-1)!.text)![1]!;
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordingRecovery!.expiresAt = Date.now() - 1;
+  });
+  const invalid = await app.inject({
+    method: "POST",
+    url: base + "/recording-access/verify",
+    headers: {
+      origin,
+      "x-requested-with": "MeetingPlatform",
+      cookie: `${c.name}=${c.value}`,
+    },
+    payload: { otp },
+  });
+  assert.equal(invalid.statusCode, 403);
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordingRecoveryRequestedAt = 0;
+  });
+  f.mail.sendMail = (async () => {
+    throw new Error("synthetic SMTP failure");
+  }) as typeof f.mail.sendMail;
+  const failed = await request();
+  assert.equal(failed.statusCode, 202);
+  const state = (await f.store.get(f.meeting.code))!;
+  assert.equal(state.recordingRecovery, undefined);
+  assert.equal(
+    state.recordingRecoveryRequestedAt,
+    undefined,
+    "Failed delivery permits a rate-limited retry",
+  );
+  assert.equal(state.recordingAccess, undefined);
+  assert.equal(state.hostEmailVerified, true);
+});
+
+test("recording recovery has a fixed 24-hour lifetime even when links are renewed late", async (t) => {
+  const f = await fixture(t),
+    issuedAt = Date.now(),
+    token = randomBytes(32).toString("base64url");
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordingAccess = {
+      identity: { email: m.hostEmail! },
+      session: { hash: digest(token), expiresAt: issuedAt + day },
+    };
+  });
+  let now = issuedAt + 23 * 3600000;
+  t.mock.method(Date, "now", () => now);
+  const app = await f.app(),
+    base = `/api/meetings/${f.meeting.code}`;
+  const cookie = `mp_recordings_${f.meeting.code}=${token}`;
+  const renewed = await app.inject({
+    method: "POST",
+    url: `${base}/recordings/${f.recording.id}/link`,
+    headers: { origin, "x-requested-with": "MeetingPlatform", cookie },
+    payload: {},
+  });
+  assert.equal(renewed.statusCode, 200, renewed.body);
+  assert.equal(renewed.json().expiresAt, now + day);
+  assert.equal(
+    renewed.cookies.length,
+    0,
+    "Link renewal must not renew the recording cookie",
+  );
+  const read = await app.inject({
+    url: `${base}/recordings/${f.recording.id}/link`,
+    headers: { cookie },
+  });
+  assert.equal(read.statusCode, 200);
+  assert.equal(read.cookies.length, 0);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordingAccess!.session!.expiresAt,
+    issuedAt + day,
+  );
+  now = issuedAt + day + 1;
+  assert.equal(
+    (await app.inject({ url: base + "/recordings", headers: { cookie } }))
+      .statusCode,
+    401,
+  );
+  assert.ok(
+    await f.service.findToken(
+      new URL(renewed.json().url).hash.slice(1),
+      f.meeting.code,
+    ),
+    "The separately valid link still exists for the next recovered session",
+  );
+});

@@ -54,12 +54,24 @@ test("company lookup and meeting lookup use only the fixed portal and stored mee
     `/api/meetings/${code}/branding`,
     `${config.portalOrigin}/api/public/team-branding/${id}`,
   ]);
+  for (const path of [`/recordings/${code}`, `/download/${code}`]) {
+    calls.length = 0;
+    assert.equal(
+      (await routeBranding(config, path, signal(), fetcher))?.brandName,
+      brand.brandName,
+    );
+    assert.deepEqual(calls, [
+      `/api/meetings/${code}/branding`,
+      `${config.portalOrigin}/api/public/team-branding/${id}`,
+    ]);
+  }
   calls.length = 0;
   for (const path of [
     "/",
     "/branding",
     "/t/evil%2fpath",
     `/join/${code}?team=example`,
+    `/recordings/${code}?team=example`,
   ])
     assert.equal(
       await routeBranding(config, path, signal(), fetcher),

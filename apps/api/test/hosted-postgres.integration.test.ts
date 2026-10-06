@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import pg from "pg";
 import { loadConfig } from "../src/config.js";
+import { digest, keyedDigest } from "../src/security.js";
 import { createApp } from "../src/server.js";
 import { PgStore, type Meeting, type Participant } from "../src/store.js";
 import { LiveMedia, type Media } from "../src/media.js";
@@ -1432,5 +1433,164 @@ test(
       (await f.stores[0].hostedUsage(otherOwner)).recordingStorageBytes,
       { limit: 0, used: 0, reserved: 0, available: 0 },
     );
+  },
+);
+
+test(
+  "PostgreSQL recording recovery tickets are single-use across instances without reopening the room",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account();
+    const made = await f.create(0, owner, randomUUID());
+    assert.equal(made.statusCode, 200);
+    const { code } = made.json();
+    await f.stores[0].change(code, (m) => {
+      m.ended = true;
+      m.lifecycle = { startedAt: Date.now() - 60000, cleanupConfirmed: true };
+      m.recordings.push({
+        id: randomUUID(),
+        status: "ready",
+        createdAt: Date.now(),
+      });
+      m.participants[0]!.status = "left";
+    });
+    const before = (await f.stores[0].get(code))!;
+    const issue = (index: number) =>
+      f.apps[index]!.inject({
+        method: "POST",
+        url: `/api/internal/hosted/meetings/${code}/recording-access`,
+        headers: internalHeaders,
+        payload: { accountId: owner, version: 1 },
+      });
+    const exchange = (index: number, ticket: string) =>
+      f.apps[index]!.inject({
+        method: "POST",
+        url: `/api/meetings/${code}/recording-access/exchange`,
+        headers: browserHeaders,
+        payload: { ticket },
+      });
+    const issued = await issue(0);
+    assert.equal(issued.statusCode, 200, issued.body);
+    const consumed = await Promise.all([
+      exchange(0, issued.json().ticket),
+      exchange(1, issued.json().ticket),
+    ]);
+    assert.deepEqual(consumed.map((r) => r.statusCode).sort(), [200, 403]);
+    const c = consumed
+      .find((r) => r.statusCode === 200)!
+      .cookies.find((c) => c.name.startsWith("mp_recordings_"))!;
+    const cookie = `${c.name}=${c.value}`;
+    for (const app of f.apps)
+      assert.equal(
+        (
+          await app.inject({
+            url: `/api/meetings/${code}/recordings`,
+            headers: { cookie },
+          })
+        ).statusCode,
+        200,
+      );
+    const after = (await f.stores[1].get(code))!;
+    assert.deepEqual(after.participants, before.participants);
+    assert.deepEqual(after.lifecycle, before.lifecycle);
+    assert.equal(after.hostTokenHash, before.hostTokenHash);
+    const outstanding = await issue(1);
+    const revoked = await f.authority(0, owner, 2, false);
+    assert.ok([200, 202].includes(revoked.statusCode));
+    assert.equal(
+      (await exchange(1, outstanding.json().ticket)).statusCode,
+      403,
+    );
+    for (const app of f.apps)
+      assert.equal(
+        (
+          await app.inject({
+            url: `/api/meetings/${code}/recordings`,
+            headers: { cookie },
+          })
+        ).statusCode,
+        401,
+      );
+  },
+);
+
+test(
+  "PostgreSQL recording recovery OTP attempts and consumption serialize across instances",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account();
+    const made = await f.create(0, owner, randomUUID());
+    assert.equal(made.statusCode, 200);
+    const { code } = made.json();
+    // Use the same fixture's two APIs with a synthetic self-hosted room. Both keep
+    // the real PostgreSQL change lock; no mail or media provider is instantiated.
+    f.config.edition = "self-hosted";
+    const challenge = randomUUID(),
+      otp = "123456",
+      email = "recovery@example.test",
+      expiresAt = Date.now() + 600000;
+    t.after(async () => {
+      const cleanup = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+      try {
+        await cleanup.query("DELETE FROM audit_events WHERE meeting_code=$1", [
+          code,
+        ]);
+        await cleanup.query("DELETE FROM meetings WHERE code=$1", [code]);
+      } finally {
+        await cleanup.end();
+      }
+    });
+    const seed = async () =>
+      f.stores[0].change(code, (m) => {
+        delete m.hosted;
+        m.ended = true;
+        m.hostEmail = email;
+        m.hostEmailVerified = true;
+        m.recordings = [
+          { id: randomUUID(), status: "ready", createdAt: Date.now() },
+        ];
+        m.recordingRecovery = {
+          email,
+          challengeHash: digest(challenge),
+          expiresAt,
+          attempts: 0,
+          otpHash: keyedDigest(
+            f.config.secret,
+            JSON.stringify([
+              "recording-recovery-v1",
+              m.id,
+              code,
+              email,
+              challenge,
+              expiresAt,
+              otp,
+            ]),
+          ),
+        };
+      });
+    await seed();
+    const verify = (index: number, value: string) =>
+      f.apps[index]!.inject({
+        method: "POST",
+        url: `/api/meetings/${code}/recording-access/verify`,
+        headers: {
+          ...browserHeaders,
+          cookie: `mp_recording_recovery_${code}=${challenge}`,
+        },
+        payload: { otp: value },
+      });
+    const failures = await Promise.all(
+      Array.from({ length: 5 }, (_, i) => verify(i % 2, "000000")),
+    );
+    assert.ok(failures.every((r) => r.statusCode === 403));
+    assert.equal((await verify(1, otp)).statusCode, 403);
+    assert.equal((await f.stores[1].get(code))!.recordingAccess, undefined);
+    await seed();
+    const success = await Promise.all([verify(0, otp), verify(1, otp)]);
+    assert.deepEqual(success.map((r) => r.statusCode).sort(), [200, 403]);
+    assert.equal((await f.stores[1].get(code))!.recordingRecovery, undefined);
+    assert.ok((await f.stores[0].get(code))!.recordingAccess?.session);
   },
 );

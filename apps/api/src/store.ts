@@ -170,7 +170,23 @@ export function clearRecordingLink(r: Recording) {
   delete r.delivery;
   r.autoLinkPending = false;
 }
+export type RecordingIdentity =
+  | { email: string }
+  | { accountId: string; version: number; billingOwnerId: string };
 export type Meeting = {
+  recordingAccess?: {
+    identity: RecordingIdentity;
+    ticket?: { hash: string; expiresAt: number };
+    session?: { hash: string; expiresAt: number };
+  };
+  recordingRecoveryRequestedAt?: number;
+  recordingRecovery?: {
+    email: string;
+    challengeHash: string;
+    otpHash: string;
+    expiresAt: number;
+    attempts: number;
+  };
   meetingMeter?: MeetingMeter;
   hostReentryRevision?: number;
   hostReentry?: {
@@ -384,6 +400,10 @@ export interface Store {
   reconcileParticipantMeters(code: string): Promise<void>;
   createHosted(m: Meeting): Promise<Meeting>;
   withHostedReentry<T>(code: string, change: (m: Meeting) => T): Promise<T>;
+  withHostedRecordingAccess<T>(
+    code: string,
+    change: (m: Meeting) => T,
+  ): Promise<T>;
   setHostedEntitlement(input: HostedEntitlement): Promise<HostedEntitlement>;
   startMeeting<T>(
     code: string,
@@ -482,6 +502,22 @@ export type HostedAuthority = {
   enabled: boolean;
 };
 
+function requireCurrentHostedRecordingAccess(
+  m: Meeting,
+  authority: HostedAuthority | undefined,
+) {
+  const binding = m.hosted;
+  if (
+    !binding?.billingOwnerId ||
+    binding.revoked ||
+    !authority?.enabled ||
+    authority.accountId !== binding.accountId ||
+    authority.version !== binding.version ||
+    authority.billingOwnerId !== binding.billingOwnerId
+  )
+    throw new HttpError(403, "Recording access is unavailable");
+}
+
 function requireCurrentHostedReentry(
   m: Meeting,
   authority: HostedAuthority | undefined,
@@ -573,6 +609,8 @@ function nextHostedAuthority(
 function revokeHostedMeeting(m: Meeting) {
   if (m.hosted!.revoked) return false;
   m.hosted!.revoked = true;
+  delete m.recordingAccess;
+  delete m.recordingRecovery;
   m.cleanupPending = true;
   m.ended = true;
   m.locked = true;
@@ -1107,9 +1145,19 @@ export class PgStore implements Store {
       binding.billingOwnerId,
     );
   }
-  async withHostedReentry<T>(
+  withHostedReentry<T>(code: string, change: (m: Meeting) => T): Promise<T> {
+    return this.withHostedAccess(code, change, "host");
+  }
+  withHostedRecordingAccess<T>(
     code: string,
     change: (m: Meeting) => T,
+  ): Promise<T> {
+    return this.withHostedAccess(code, change, "recordings");
+  }
+  private async withHostedAccess<T>(
+    code: string,
+    change: (m: Meeting) => T,
+    purpose: "host" | "recordings",
   ): Promise<T> {
     const snapshot = await this.get(code);
     const binding = snapshot?.hosted;
@@ -1141,13 +1189,15 @@ export class PgStore implements Store {
           enabled: authorityRow.enabled as boolean,
           billingOwnerId: authorityRow.billing_owner_id as string | undefined,
         };
-        const grant = (
-          await c.query(
-            "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
-            [binding.billingOwnerId],
-          )
-        ).rows[0]?.data as HostedEntitlement | undefined;
-        requireCurrentHostedReentry(m, authority, grant);
+        if (purpose === "host") {
+          const grant = (
+            await c.query(
+              "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+              [binding.billingOwnerId],
+            )
+          ).rows[0]?.data as HostedEntitlement | undefined;
+          requireCurrentHostedReentry(m, authority, grant);
+        } else requireCurrentHostedRecordingAccess(m, authority);
         const result = change(m);
         m.revision++;
         await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
@@ -2392,19 +2442,32 @@ export class MemoryStore implements Store {
       return structuredClone(m);
     });
   }
-  async withHostedReentry<T>(
+  withHostedReentry<T>(code: string, change: (m: Meeting) => T): Promise<T> {
+    return this.withHostedAccess(code, change, "host");
+  }
+  withHostedRecordingAccess<T>(
     code: string,
     change: (m: Meeting) => T,
+  ): Promise<T> {
+    return this.withHostedAccess(code, change, "recordings");
+  }
+  private async withHostedAccess<T>(
+    code: string,
+    change: (m: Meeting) => T,
+    purpose: "host" | "recordings",
   ): Promise<T> {
     return this.serialize(async () => {
       const m = structuredClone(this.data.get(code));
       if (!m?.hosted?.billingOwnerId)
         throw new HttpError(404, "Meeting unavailable");
-      requireCurrentHostedReentry(
-        m,
-        this.hostedAuthorities.get(m.hosted.accountId),
-        this.hostedEntitlements.get(m.hosted.billingOwnerId),
-      );
+      const authority = this.hostedAuthorities.get(m.hosted.accountId);
+      if (purpose === "host")
+        requireCurrentHostedReentry(
+          m,
+          authority,
+          this.hostedEntitlements.get(m.hosted.billingOwnerId),
+        );
+      else requireCurrentHostedRecordingAccess(m, authority);
       const result = change(m);
       m.revision++;
       this.data.set(code, m);

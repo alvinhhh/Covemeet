@@ -107,7 +107,9 @@ export async function routeBranding(
   let endpoint: string, expectedId: string | undefined;
   if (company) endpoint = `/api/public/team-pages/${company}`;
   else {
-    const room = path.match(/^\/(?:meet|join|host)\/([A-Za-z0-9-]{6,48})\/?$/);
+    const room = path.match(
+      /^\/(?:meet|join|host|recordings|download)\/([A-Za-z0-9-]{6,48})\/?$/,
+    );
     if (!room) return;
     const code = room[1].replaceAll("-", "").toUpperCase();
     const result = await publicJson(

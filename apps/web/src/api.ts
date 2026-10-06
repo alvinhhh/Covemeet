@@ -123,6 +123,17 @@ export type MeetingState = {
   revision: number;
 };
 
+export type RecordingArchive = {
+  title: string;
+  recordings: {
+    id: string;
+    status: string;
+    createdAt: number;
+    expiresAt?: number;
+    error?: string;
+  }[];
+};
+
 export class ApiError extends Error {
   constructor(
     message: string,

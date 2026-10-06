@@ -33,6 +33,7 @@ import {
   participantMediaIdentity,
   type Config,
   type MeetingState,
+  type RecordingArchive,
   type Participant,
   type Branding,
   type PhoneAccess,
@@ -63,7 +64,10 @@ let initialHostToken = location.pathname.startsWith("/host/")
 let initialDownloadToken = location.pathname.startsWith("/download/")
   ? location.hash.slice(1)
   : "";
-if (initialHostToken || initialDownloadToken)
+let initialRecordingTicket = location.pathname.startsWith("/recordings/")
+  ? location.hash.slice(1)
+  : "";
+if (initialHostToken || initialDownloadToken || initialRecordingTicket)
   history.replaceState(null, "", location.pathname + location.search);
 
 const roomOptions = { adaptiveStream: true, dynacast: true };
@@ -309,9 +313,18 @@ function App() {
     );
   const room = path.match(/^\/(meet|join|host)\/([^/]+)\/?$/);
   const download = path.match(/^\/download\/([^/]+)\/?$/);
+  const recordings = path.match(/^\/recordings\/([^/]+)\/?$/);
   let view: ReactNode;
   if (download)
     view = <Download code={decodeURIComponent(download[1])} config={config} />;
+  else if (recordings)
+    view = (
+      <RecordingRecovery
+        key={recordings[1]}
+        code={decodeURIComponent(recordings[1])}
+        config={config}
+      />
+    );
   else if (room)
     view = (
       <Meeting
@@ -428,8 +441,7 @@ function Home({
       setBusy(false);
     }
   }
-  function join(event: FormEvent) {
-    event.preventDefault();
+  function openCode(destination: "join" | "recordings") {
     let code = joinCode.trim();
     const meetingOrigin = config.meetingOrigin || location.origin;
     try {
@@ -441,7 +453,7 @@ function Home({
     }
     if (/^[A-Za-z0-9_-]{3,100}$/.test(code))
       navigate(
-        new URL(`/join/${encodeURIComponent(code)}`, meetingOrigin).href,
+        new URL(`/${destination}/${encodeURIComponent(code)}`, meetingOrigin).href,
       );
     else
       setError(
@@ -449,7 +461,13 @@ function Home({
       );
   }
   const joinForm = (
-    <form onSubmit={join} className="form-stack">
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        openCode("join");
+      }}
+      className="form-stack"
+    >
       <Field label="Meeting code or link">
         <input
           value={joinCode}
@@ -464,6 +482,15 @@ function Home({
         Continue
         <Icon name="arrow" size={17} />
       </Button>
+      {config.edition === "self-hosted" && (
+        <Button
+          type="button"
+          className="full-width"
+          onClick={() => openCode("recordings")}
+        >
+          Recordings
+        </Button>
+      )}
     </form>
   );
   if (company)
@@ -907,6 +934,14 @@ function Meeting({
         {state.me.status === "kicked" && !state.meeting.ended && (
           <Button onClick={() => setNeedsJoin(true)}>Request admission</Button>
         )}
+        {state.me.role === "host" &&
+          (state.me.status === "left" || state.meeting.ended) && (
+            <Button
+              onClick={() => navigate(`/recordings/${encodeURIComponent(code)}`)}
+            >
+              Recordings
+            </Button>
+          )}
         <Button className="primary" onClick={() => navigate("/")}>
           {homeLabel()}
         </Button>
@@ -2645,6 +2680,171 @@ function Breakouts({
   );
 }
 
+function RecordingRecovery({
+  code,
+  config,
+}: {
+  code: string;
+  config: Config;
+}) {
+  const [archive, setArchive] = useState<RecordingArchive>();
+  const [loading, setLoading] = useState(true);
+  const [accessRequired, setAccessRequired] = useState(false);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [requested, setRequested] = useState(false);
+  const [otp, setOtp] = useState("");
+  const ticket = useRef(initialRecordingTicket);
+
+  async function load(exchangeTicket = false) {
+    if (!archive) setLoading(true);
+    setError("");
+    if (exchangeTicket && ticket.current) {
+      try {
+        await api(meetingPath(code, "/recording-access/exchange"), {
+          ticket: ticket.current,
+        });
+        ticket.current = "";
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 403) ticket.current = "";
+        // An exchange can succeed even when its response is lost. Read access
+        // decides whether the cookie was set before offering recovery.
+      }
+    }
+    try {
+      const data = await api<RecordingArchive>(meetingPath(code, "/recordings"));
+      ticket.current = "";
+      setArchive(data);
+      setAccessRequired(false);
+    } catch (e) {
+      setArchive(undefined);
+      setAccessRequired(
+        e instanceof ApiError && (e.status === 401 || e.status === 403),
+      );
+      if (!(e instanceof ApiError && (e.status === 401 || e.status === 403)))
+        setError(messageOf(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    initialRecordingTicket = "";
+    void load(true);
+  }, [code]);
+
+  async function requestCode() {
+    setError("");
+    setBusy(true);
+    try {
+      await api(meetingPath(code, "/recording-access/request"), {});
+      setRequested(true);
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function verifyCode(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      await api(meetingPath(code, "/recording-access/verify"), { otp });
+      setOtp("");
+      await load();
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="center-page recording-recovery-page">
+      <div className="center-card">
+        <Logo name={config.brandName} />
+        <h1>Recordings</h1>
+        {loading && !archive ? (
+          <div className="spinner" aria-label="Loading recordings" />
+        ) : archive ? (
+          <>
+            <p className="muted">{archive.title}</p>
+            {error && <Notice>{error}</Notice>}
+            <Button className="small" onClick={() => void load()}>
+              Refresh
+            </Button>
+            <div className="recordings-panel">
+              <RecordingList
+                code={code}
+                recordings={archive.recordings}
+                refresh={() => void load()}
+              />
+            </div>
+          </>
+        ) : (
+          <>
+            {error && <Notice>{error}</Notice>}
+            {accessRequired && config.edition === "self-hosted" ? (
+              <>
+                <Button disabled={busy} onClick={() => void requestCode()}>
+                  Send code
+                </Button>
+                {requested && (
+                  <Notice kind="info">
+                    If access is available, a code will be sent to the verified
+                    host email.
+                  </Notice>
+                )}
+                {requested && (
+                  <form className="form-stack" onSubmit={verifyCode}>
+                    <Field label="Verification code">
+                      <input
+                        value={otp}
+                        onChange={(event) => setOtp(event.target.value)}
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        pattern="[0-9]{6}"
+                        maxLength={6}
+                        required
+                      />
+                    </Field>
+                    <Button disabled={busy} type="submit">
+                      Verify code
+                    </Button>
+                  </form>
+                )}
+              </>
+            ) : accessRequired ? (
+              <Notice kind="info">
+                Open this meeting from the Meetings list to access recordings.
+              </Notice>
+            ) : null}
+            <Button onClick={() => void load(Boolean(ticket.current))}>
+              Try again
+            </Button>
+          </>
+        )}
+        <Button
+          onClick={() =>
+            config.edition === "hosted"
+              ? location.assign(
+                  new URL(
+                    "/meetings",
+                    config.portalOrigin || controlPanelOrigin,
+                  ).href,
+                )
+              : navigate("/")
+          }
+        >
+          {config.edition === "hosted" ? "Meetings" : homeLabel()}
+        </Button>
+      </div>
+    </main>
+  );
+}
+
 function Recordings({
   state,
   config,
@@ -2663,11 +2863,6 @@ function Recordings({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
-  const [link, setLink] = useState<{
-    url: string;
-    expiresAt: number;
-    passwordEmailSent: boolean;
-  }>();
   const code = state.meeting.code;
   const active = state.recordings.some((r) =>
     ["starting", "recording", "active", "stopping"].includes(r.status),
@@ -2684,11 +2879,7 @@ function Recordings({
     setNotice("");
     setBusy(true);
     try {
-      const result = await api<{
-        url?: string;
-        expiresAt?: number;
-        passwordEmailSent?: boolean;
-      }>(
+      const result = await api<{ ok?: boolean }>(
         meetingPath(code, suffix),
         method === "GET" ? undefined : body,
         method,
@@ -2830,6 +3021,94 @@ function Recordings({
       )}
       {error && <Notice>{error}</Notice>}
       {notice && <Notice kind="success">{notice}</Notice>}
+      <RecordingList
+        code={code}
+        recordings={state.recordings}
+        refresh={refresh}
+        disabled={busy}
+        stopRecording={(id) =>
+          void request(`/recordings/${encodeURIComponent(id)}/stop`)
+        }
+      />
+    </div>
+  );
+}
+
+type RecordingLink = {
+  url: string;
+  expiresAt: number;
+  passwordEmailSent: boolean;
+};
+
+function RecordingList({
+  code,
+  recordings,
+  refresh,
+  disabled = false,
+  stopRecording,
+}: {
+  code: string;
+  recordings: Array<
+    MeetingState["recordings"][number] | RecordingArchive["recordings"][number]
+  >;
+  refresh: () => void;
+  disabled?: boolean;
+  stopRecording?: (id: string) => void;
+}) {
+  const [link, setLink] = useState<RecordingLink>();
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function getLink(id: string, method: "GET" | "POST") {
+    setLink(undefined);
+    setError("");
+    setNotice("");
+    setBusy(true);
+    try {
+      const result = await api<RecordingLink>(
+        meetingPath(code, `/recordings/${encodeURIComponent(id)}/link`),
+        method === "GET" ? undefined : {},
+        method,
+      );
+      if (
+        !result?.url ||
+        !result.expiresAt ||
+        typeof result.passwordEmailSent !== "boolean"
+      )
+        throw new Error("Recording link is unavailable");
+      setLink(result);
+      refresh();
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revoke(id: string) {
+    setLink(undefined);
+    setError("");
+    setNotice("");
+    setBusy(true);
+    try {
+      await api(
+        meetingPath(code, `/recordings/${encodeURIComponent(id)}/revoke`),
+        {},
+      );
+      setNotice("Download links revoked.");
+      refresh();
+    } catch (e) {
+      setError(messageOf(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      {error && <Notice>{error}</Notice>}
+      {notice && <Notice kind="success">{notice}</Notice>}
       {link && (
         <div className="recording-link">
           <strong>Download link</strong>
@@ -2860,13 +3139,13 @@ function Recordings({
         </div>
       )}
       <div className="section-label">MEETING RECORDINGS</div>
-      {state.recordings.length === 0 && (
+      {recordings.length === 0 && (
         <div className="empty-panel">
           <Icon name="record" size={28} />
           <p>No recordings</p>
         </div>
       )}
-      {state.recordings.map((recording) => (
+      {recordings.map((recording) => (
         <div className="recording-item" key={recording.id}>
           <div>
             <strong>
@@ -2878,15 +3157,12 @@ function Recordings({
             <span className="status-pill">{recording.status}</span>
           </div>
           {recording.error && <Notice>{recording.error}</Notice>}
-          {["starting", "recording", "active"].includes(recording.status) ? (
+          {["starting", "recording", "active"].includes(recording.status) &&
+          stopRecording ? (
             <Button
               className="small"
-              disabled={busy}
-              onClick={() =>
-                void request(
-                  `/recordings/${encodeURIComponent(recording.id)}/stop`,
-                )
-              }
+              disabled={busy || disabled}
+              onClick={() => stopRecording(recording.id)}
             >
               Stop recording
             </Button>
@@ -2894,63 +3170,22 @@ function Recordings({
             <div className="button-row">
               <Button
                 className="small"
-                disabled={busy}
-                onClick={async () => {
-                  setLink(undefined);
-                  const result = await request(
-                    `/recordings/${encodeURIComponent(recording.id)}/link`,
-                    {},
-                    "GET",
-                  );
-                  if (
-                    result?.url &&
-                    result.expiresAt &&
-                    typeof result.passwordEmailSent === "boolean"
-                  )
-                    setLink({
-                      url: result.url,
-                      expiresAt: result.expiresAt,
-                      passwordEmailSent: result.passwordEmailSent,
-                    });
-                }}
+                disabled={busy || disabled}
+                onClick={() => void getLink(recording.id, "GET")}
               >
                 Show download link
               </Button>
               <Button
                 className="small"
-                disabled={busy}
-                onClick={async () => {
-                  setLink(undefined);
-                  const result = await request(
-                    `/recordings/${encodeURIComponent(recording.id)}/link`,
-                  );
-                  if (
-                    result?.url &&
-                    result.expiresAt &&
-                    typeof result.passwordEmailSent === "boolean"
-                  )
-                    setLink({
-                      url: result.url,
-                      expiresAt: result.expiresAt,
-                      passwordEmailSent: result.passwordEmailSent,
-                    });
-                }}
+                disabled={busy || disabled}
+                onClick={() => void getLink(recording.id, "POST")}
               >
                 Create new 24-hour link
               </Button>
               <button
                 className="text-button danger-text"
-                disabled={busy}
-                onClick={async () => {
-                  setLink(undefined);
-                  if (
-                    await request(
-                      `/recordings/${encodeURIComponent(recording.id)}/revoke`,
-                    )
-                  ) {
-                    setNotice("Download links revoked.");
-                  }
-                }}
+                disabled={busy || disabled}
+                onClick={() => void revoke(recording.id)}
               >
                 Revoke links
               </button>
@@ -2958,12 +3193,23 @@ function Recordings({
           ) : null}
         </div>
       ))}
-    </div>
+    </>
   );
 }
 
 function Download({ code, config }: { code: string; config: Config }) {
   const [token] = useState(initialDownloadToken);
+  const recoveryHref = `/recordings/${encodeURIComponent(code)}`;
+  const recoveryAction = (
+    <a
+      className="button"
+      href={recoveryHref}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      Recordings
+    </a>
+  );
   useEffect(() => {
     initialDownloadToken = "";
   }, []);
@@ -2998,9 +3244,10 @@ function Download({ code, config }: { code: string; config: Config }) {
         <Icon name="link" size={30} />
         <h1>Reopen the download link</h1>
         <p className="muted">
-          This tab no longer contains the download key. Reopen the original
-          24-hour link from the meeting.
+          This tab no longer contains the download key. Open Recordings to get
+          a current link.
         </p>
+        {recoveryAction}
         <Button onClick={() => navigate("/")}>{homeLabel()}</Button>
       </Center>
     );
@@ -3011,10 +3258,7 @@ function Download({ code, config }: { code: string; config: Config }) {
         <Icon name="download" size={30} />
       </div>
       <h1>Download recording</h1>
-      <p className="muted">
-        Enter the password emailed to the host. Use the browser with the active
-        host session.
-      </p>
+      <p className="muted">Enter the password emailed to the host.</p>
       <form
         action={`/api/meetings/${encodeURIComponent(code)}/download`}
         method="post"
@@ -3054,6 +3298,7 @@ function Download({ code, config }: { code: string; config: Config }) {
         onLoad={downloadResult}
         hidden
       />
+      {recoveryAction}
       <small className="muted">
         Links last up to 24 hours, within the recording’s seven-day retention.
         The server decrypts the video for download. The downloaded MP4 has no

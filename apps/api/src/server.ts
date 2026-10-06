@@ -32,7 +32,7 @@ import {
   signedDevice,
   verifyDevice,
 } from "./security.js";
-import { RecordingService } from "./recordings.js";
+import { RecordingService, retentionMs } from "./recordings.js";
 import { PhoneService, revokePhoneParticipants } from "./phone.js";
 import { PhoneDialogService } from "./phone-dialogs.js";
 import {
@@ -302,6 +302,66 @@ export async function createApp(config: Config, store: Store, media: Media) {
     if (host && p.status !== "admitted")
       throw new HttpError(403, "Host session is inactive");
     return p;
+  }
+  const recordingCookie = (code: string) => `mp_recordings_${code}`;
+  const recoveryCookie = (code: string) => `mp_recording_recovery_${code}`;
+  function retainedRecordings(m: Meeting) {
+    return m.recordings.filter((r) => r.createdAt > Date.now() - retentionMs);
+  }
+  function requireRecoverableRecording(m: Meeting) {
+    if (
+      m.hosted?.revoked ||
+      !retainedRecordings(m).some((r) => r.status === "ready")
+    )
+      throw new HttpError(403, "Recording access is unavailable");
+  }
+  function recordingActor(req: FastifyRequest, m: Meeting) {
+    if (m.hosted?.revoked)
+      throw new HttpError(401, "Recording access required");
+    const host = sessionParticipant(req, m);
+    if (
+      host?.role === "host" &&
+      host.transport !== "phone" &&
+      (host.status === "admitted" || (m.ended && host.status === "left"))
+    )
+      return { key: host.tokenHash, host, session: undefined };
+    const access = m.recordingAccess;
+    const identity = access?.identity;
+    const bound =
+      identity &&
+      ("email" in identity
+        ? config.edition === "self-hosted" &&
+          !m.hosted &&
+          m.hostEmailVerified &&
+          m.hostEmail === identity.email
+        : m.hosted?.accountId === identity.accountId &&
+          m.hosted.version === identity.version &&
+          m.hosted.billingOwnerId === identity.billingOwnerId);
+    if (
+      !bound ||
+      !access?.session ||
+      access.session.expiresAt <= Date.now() ||
+      !safeEqual(
+        access.session.hash,
+        digest(req.cookies[recordingCookie(m.code)] ?? ""),
+      )
+    )
+      throw new HttpError(host ? 403 : 401, "Recording access required");
+    return {
+      key: access.session.hash,
+      session: access.session,
+      host: undefined,
+    };
+  }
+  function setRecordingCookie(
+    reply: FastifyReply,
+    code: string,
+    token: string,
+  ) {
+    reply.setCookie(recordingCookie(code), token, {
+      ...cookieOpts,
+      maxAge: 86400,
+    });
   }
   function active(m: Meeting) {
     requireMeetingAccess(m);
@@ -773,6 +833,46 @@ export async function createApp(config: Config, store: Store, media: Media) {
       }),
     };
   });
+  app.post(
+    "/api/internal/hosted/meetings/:code/recording-access",
+    async (req) => {
+      const { accountId, version } = z
+        .object({ accountId: hostedUuid, version: hostedVersion })
+        .strict()
+        .parse(req.body);
+      const code = codeOf(req),
+        ticket = randomToken();
+      const recordingsAvailable = await store.withHostedRecordingAccess(
+        code,
+        (m) => {
+          if (m.hosted!.accountId !== accountId || m.hosted!.version !== version)
+            throw new HttpError(403, "Meeting creator is unavailable");
+          if (!retainedRecordings(m).some((r) => r.status === "ready")) return false;
+          m.recordingAccess = {
+            identity: {
+              accountId,
+              version,
+              billingOwnerId: m.hosted!.billingOwnerId!,
+            },
+            session:
+              m.recordingAccess &&
+              "accountId" in m.recordingAccess.identity &&
+              m.recordingAccess.identity.accountId === accountId &&
+              m.recordingAccess.identity.version === version &&
+              m.recordingAccess.identity.billingOwnerId ===
+                m.hosted!.billingOwnerId
+                ? m.recordingAccess.session
+                : undefined,
+            ticket: { hash: digest(ticket), expiresAt: Date.now() + 5 * 60000 },
+          };
+          return true;
+        },
+      );
+      return recordingsAvailable
+        ? { code, ticket }
+        : { code, recordingsAvailable: false };
+    },
+  );
   app.post("/api/internal/hosted/meetings/:code/host-reentry", async (req) => {
     const body = z
       .object({
@@ -1691,6 +1791,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
       await store.change(m.code, (m) => {
         actor(req, m, true);
         for (const recording of m.recordings) clearRecordingLink(recording);
+        delete m.recordingAccess;
+        delete m.recordingRecovery;
         m.hostEmail = email;
         m.hostEmailVerified = false;
         m.emailOtpHash = otpHash;
@@ -1749,6 +1851,207 @@ export async function createApp(config: Config, store: Store, media: Media) {
       return { ok: true };
     },
   );
+  app.get("/api/meetings/:code/recordings", async (req) => {
+    const m = await find(req);
+    recordingActor(req, m);
+    return {
+      title: m.title,
+      recordings: retainedRecordings(m).map(
+        ({ id, status, createdAt, expiresAt, error }) => ({
+          id,
+          status,
+          createdAt,
+          expiresAt,
+          error,
+        }),
+      ),
+    };
+  });
+  app.post(
+    "/api/meetings/:code/recording-access/exchange",
+    async (req, reply) => {
+      if (config.edition !== "hosted")
+        throw new HttpError(403, "Recording access is unavailable");
+      const { ticket } = z
+        .object({ ticket: z.string().min(20).max(128) })
+        .strict()
+        .parse(req.body);
+      const code = codeOf(req),
+        token = randomToken();
+      await store.withHostedRecordingAccess(code, (m) => {
+        requireRecoverableRecording(m);
+        const access = m.recordingAccess;
+        if (
+          !access?.ticket ||
+          access.ticket.expiresAt <= Date.now() ||
+          !safeEqual(access.ticket.hash, digest(ticket)) ||
+          !("accountId" in access.identity) ||
+          access.identity.accountId !== m.hosted!.accountId ||
+          access.identity.version !== m.hosted!.version ||
+          access.identity.billingOwnerId !== m.hosted!.billingOwnerId
+        )
+          throw new HttpError(403, "Recording access is invalid or expired");
+        delete access.ticket;
+        access.session = {
+          hash: digest(token),
+          expiresAt: Date.now() + 86400000,
+        };
+      });
+      setRecordingCookie(reply, code, token);
+      return { ok: true };
+    },
+  );
+  app.post(
+    "/api/meetings/:code/recording-access/request",
+    {
+      config: { rateLimit: { max: 3, timeWindow: "10 minutes" } },
+    },
+    async (req, reply) => {
+      z.object({}).strict().parse(req.body);
+      const code = codeOf(req),
+        now = Date.now();
+      for (const value of new Set([normalizeIP(req.ip), browserRateKey(req)])) {
+        if (
+          !(await store.phoneAttempt(
+            `recording-recovery:${keyedDigest(config.secret, value)}`,
+            3,
+            now,
+          ))
+        )
+          throw new HttpError(429, "Too many attempts. Try again shortly.");
+      }
+      const previous = req.cookies[recoveryCookie(code)] ?? "";
+      const challenge = /^[A-Za-z0-9_-]{20,128}$/.test(previous)
+        ? previous
+        : randomToken();
+      reply.setCookie(recoveryCookie(code), challenge, {
+        ...cookieOpts,
+        maxAge: 600,
+      });
+      const accepted = () => reply.code(202).send({ ok: true });
+      const snapshot = await store.get(code);
+      if (
+        config.edition !== "self-hosted" ||
+        !mail ||
+        !snapshot ||
+        snapshot.hosted
+      )
+        return accepted();
+      const otp = String(randomInt(100000, 1000000)),
+        expiresAt = now + 600000;
+      const recipient = await store.change(code, (m) => {
+        if (
+          m.hosted ||
+          !m.hostEmailVerified ||
+          !m.hostEmail ||
+          !retainedRecordings(m).some((r) => r.status === "ready") ||
+          (m.recordingRecoveryRequestedAt ?? 0) + 600000 > now
+        )
+          return null;
+        m.recordingRecoveryRequestedAt = now;
+        m.recordingRecovery = {
+          email: m.hostEmail,
+          challengeHash: digest(challenge),
+          expiresAt,
+          attempts: 0,
+          otpHash: keyedDigest(
+            config.secret,
+            JSON.stringify([
+              "recording-recovery-v1",
+              m.id,
+              m.code,
+              m.hostEmail,
+              challenge,
+              expiresAt,
+              otp,
+            ]),
+          ),
+        };
+        return m.hostEmail;
+      });
+      if (recipient) {
+        try {
+          await mail.sendMail({
+            from: config.smtpFrom,
+            to: recipient,
+            subject: "Recording access code",
+            text: `Verification code: ${otp}\nExpires in 10 minutes.`,
+          });
+        } catch {
+          await store.change(code, (m) => {
+            if (
+              m.recordingRecovery?.challengeHash === digest(challenge) &&
+              m.recordingRecovery.expiresAt === expiresAt
+            ) {
+              delete m.recordingRecovery;
+              delete m.recordingRecoveryRequestedAt;
+            }
+          });
+        }
+      }
+      return accepted();
+    },
+  );
+  app.post(
+    "/api/meetings/:code/recording-access/verify",
+    {
+      config: { rateLimit: { max: 10, timeWindow: "10 minutes" } },
+    },
+    async (req, reply) => {
+      const { otp } = z
+        .object({ otp: z.string().regex(/^\d{6}$/) })
+        .strict()
+        .parse(req.body);
+      const code = codeOf(req),
+        challenge = req.cookies[recoveryCookie(code)] ?? "",
+        token = randomToken();
+      if (config.edition !== "self-hosted" || !(await store.get(code)))
+        throw new HttpError(403, "Code is invalid or expired");
+      const ok = await store.change(code, (m) => {
+        const recovery = m.recordingRecovery;
+        if (
+          m.hosted ||
+          !m.hostEmailVerified ||
+          !recovery ||
+          recovery.email !== m.hostEmail ||
+          recovery.expiresAt <= Date.now() ||
+          !safeEqual(recovery.challengeHash, digest(challenge))
+        )
+          return false;
+        recovery.attempts++;
+        if (
+          recovery.attempts > 5 ||
+          !safeEqual(
+            recovery.otpHash,
+            keyedDigest(
+              config.secret,
+              JSON.stringify([
+                "recording-recovery-v1",
+                m.id,
+                m.code,
+                m.hostEmail,
+                challenge,
+                recovery.expiresAt,
+                otp,
+              ]),
+            ),
+          )
+        )
+          return false;
+        requireRecoverableRecording(m);
+        m.recordingAccess = {
+          identity: { email: recovery.email },
+          session: { hash: digest(token), expiresAt: Date.now() + 86400000 },
+        };
+        delete m.recordingRecovery;
+        return true;
+      });
+      if (!ok) throw new HttpError(403, "Code is invalid or expired");
+      reply.clearCookie(recoveryCookie(code), { ...cookieOpts, maxAge: 0 });
+      setRecordingCookie(reply, code, token);
+      return { ok: true };
+    },
+  );
   app.post("/api/meetings/:code/recordings", async (req) => {
     const m = await find(req);
     active(m);
@@ -1766,16 +2069,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
   async function extendRecordingHostLink(
     req: FastifyRequest,
     m: Meeting,
-    participantId: string,
+    accessKey: string,
     id: string,
     link: { url: string; expiresAt: number },
   ) {
     const hash = digestDownloadToken(new URL(link.url).hash.slice(1));
     await store.change(m.code, (state) => {
-      const host = actor(req, state, true);
+      const access = recordingActor(req, state);
       const recording = state.recordings.find((row) => row.id === id);
       if (
-        host.id !== participantId ||
+        access.key !== accessKey ||
         state.hosted?.revoked ||
         !recording ||
         recording.status !== "ready" ||
@@ -1785,42 +2088,45 @@ export async function createApp(config: Config, store: Store, media: Media) {
         link.expiresAt <= Date.now()
       )
         throw new HttpError(403, "Recording link is unavailable");
-      host.expiresAt = Math.max(host.expiresAt, link.expiresAt);
+      if (access.host)
+        access.host.expiresAt = Math.max(access.host.expiresAt, link.expiresAt);
     });
   }
   app.post("/api/meetings/:code/recordings/:id/link", async (req, reply) => {
     const m = await find(req);
-    const p = actor(req, m, true);
+    const p = recordingActor(req, m);
     const id = (req.params as any).id;
     const link = await recordings.link(m, id, (state) => {
-      if (actor(req, state, true).id !== p.id)
+      if (recordingActor(req, state).key !== p.key)
         throw new HttpError(403, "Host session is unavailable");
     });
-    await extendRecordingHostLink(req, m, p.id, id, link);
-    reply.setCookie(authCookie(m.code), req.cookies[authCookie(m.code)]!, {
-      ...cookieOpts,
-      maxAge: 86400,
-    });
+    await extendRecordingHostLink(req, m, p.key, id, link);
+    if (p.host)
+      reply.setCookie(authCookie(m.code), req.cookies[authCookie(m.code)]!, {
+        ...cookieOpts,
+        maxAge: 86400,
+      });
     return link;
   });
   app.get("/api/meetings/:code/recordings/:id/link", async (req, reply) => {
     const m = await find(req);
-    const p = actor(req, m, true);
+    const p = recordingActor(req, m);
     const id = (req.params as any).id;
     const link = await recordings.currentLink(m, id);
-    await extendRecordingHostLink(req, m, p.id, id, link);
+    await extendRecordingHostLink(req, m, p.key, id, link);
     reply.header("Cache-Control", "no-store");
-    reply.setCookie(authCookie(m.code), req.cookies[authCookie(m.code)]!, {
-      ...cookieOpts,
-      maxAge: 86400,
-    });
+    if (p.host)
+      reply.setCookie(authCookie(m.code), req.cookies[authCookie(m.code)]!, {
+        ...cookieOpts,
+        maxAge: 86400,
+      });
     return link;
   });
   app.post("/api/meetings/:code/recordings/:id/revoke", async (req) => {
     const m = await find(req);
-    const p = actor(req, m, true);
+    const p = recordingActor(req, m);
     await recordings.revoke(m, (req.params as any).id, (state) => {
-      if (actor(req, state, true).id !== p.id)
+      if (recordingActor(req, state).key !== p.key)
         throw new HttpError(403, "Host session is unavailable");
     });
     return { ok: true };
@@ -1848,7 +2154,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           .strict()
           .parse(req.body);
         const meeting = await find(req);
-        actor(req, meeting, true);
+        recordingActor(req, meeting);
         const found = await recordings.findToken(token, meeting.code);
         if (!found) throw new HttpError(403, "Download unavailable");
         const stream = await recordings.download(
@@ -1857,7 +2163,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           token,
           password,
           (state) => {
-            actor(req, state, true);
+            recordingActor(req, state);
           },
           controller.signal,
         );
