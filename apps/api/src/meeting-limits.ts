@@ -261,6 +261,16 @@ export function occupiesMeetingSeat(p: Participant) {
   );
 }
 
+export function occupiesRoomSeat(m: Meeting, p: Participant) {
+  return (
+    occupiesMeetingSeat(p) ||
+    (p.role === "host" &&
+      !!m.hosted?.billingOwnerId &&
+      !m.ended &&
+      !m.lifecycle?.cleanupConfirmed)
+  );
+}
+
 export function participantLimit(m: Meeting) {
   if (m.mode === "webinar" && m.hosted?.entitlement?.limits.webinarParticipants)
     return m.hosted.entitlement.limits.webinarParticipants;
@@ -282,7 +292,10 @@ export function requireWebinarViewerSeat(m: Meeting) {
 }
 
 export function requireMeetingSeat(m: Meeting) {
-  if (m.participants.filter(occupiesMeetingSeat).length >= participantLimit(m))
+  if (
+    m.participants.filter((p) => occupiesRoomSeat(m, p)).length >=
+    participantLimit(m)
+  )
     throw new HttpError(409, "Meeting is full");
   if (m.mode === "webinar") requireWebinarViewerSeat(m);
 }

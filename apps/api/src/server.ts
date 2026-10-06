@@ -41,6 +41,7 @@ import {
   recordingIncluded,
   participantLimit,
   occupiesMeetingSeat,
+  occupiesRoomSeat,
   requireWebinarViewerSeat,
   webinarViewerLimit,
   requireMeetingAccess,
@@ -273,6 +274,13 @@ export async function createApp(config: Config, store: Store, media: Media) {
     maxAge: 43200,
   };
   const authCookie = (code: string) => `mp_${code}`;
+  function requireReturningHostSeat(m: Meeting, host: Participant) {
+    if (
+      m.participants.filter((p) => p.id !== host.id && occupiesMeetingSeat(p))
+        .length >= participantLimit(m)
+    )
+      throw new HttpError(409, "Meeting is full");
+  }
   function sessionParticipant(req: FastifyRequest, m: Meeting) {
     const tokenHash = digest(req.cookies[authCookie(m.code)] ?? "");
     return m.participants.find(
@@ -712,18 +720,94 @@ export async function createApp(config: Config, store: Store, media: Media) {
           (m) =>
             m.hosted &&
             m.hosted.version <= version &&
-            m.lifecycle &&
-            !m.lifecycle.cleanupConfirmed,
+            (m.lifecycle
+              ? !m.lifecycle.cleanupConfirmed
+              : !m.ended && !m.hosted.revoked),
         )
         .map((m) => ({
           code: m.code,
-          status: m.ended
-            ? "ending"
-            : m.participants.find((p) => p.role === "host")?.status === "left"
-              ? "orphaned"
-              : "active",
+          hostReentryRevision: m.hostReentryRevision ?? 0,
+          status: !m.lifecycle
+            ? "not-started"
+            : m.ended
+              ? "ending"
+              : m.participants.find((p) => p.role === "host")?.status === "left"
+                ? "orphaned"
+                : "active",
         })),
     };
+  });
+  app.post("/api/internal/hosted/meetings/:code/host-reentry", async (req) => {
+    const body = z
+      .object({
+        accountId: hostedUuid,
+        version: hostedVersion,
+        billingOwnerId: hostedUuid,
+        requestId: hostedUuid,
+        expectedRevision: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(Number.MAX_SAFE_INTEGER - 1),
+      })
+      .strict()
+      .parse(req.body);
+    const code = codeOf(req);
+    const hostToken = keyedDigest(
+      config.secret,
+      JSON.stringify([
+        "hosted-host-reentry-v1",
+        code,
+        body.accountId,
+        body.version,
+        body.billingOwnerId,
+        body.requestId,
+        body.expectedRevision,
+      ]),
+    );
+    await store.withHostedReentry(code, (m) => {
+      if (
+        m.hosted?.accountId !== body.accountId ||
+        m.hosted.version !== body.version ||
+        m.hosted.billingOwnerId !== body.billingOwnerId
+      )
+        throw new HttpError(403, "Meeting creator is unavailable");
+      const revision = m.hostReentryRevision ?? 0;
+      const current = m.hostReentry;
+      if (
+        current?.requestId === body.requestId &&
+        body.expectedRevision === revision - 1
+      ) {
+        if (
+          current.phase === "consumed" ||
+          !m.hostTokenHash ||
+          !safeEqual(m.hostTokenHash, digest(hostToken)) ||
+          m.hostTokenExpiresAt <= Date.now()
+        )
+          throw new HttpError(
+            409,
+            "Host re-entry request is no longer available",
+          );
+        return;
+      }
+      if (body.expectedRevision !== revision)
+        throw new HttpError(409, "Host re-entry revision changed");
+      if (m.lifecycle && !current && m.hostTokenHash)
+        throw new HttpError(409, "Initial host invitation is still available");
+      const host = m.participants.find((p) => p.role === "host")!;
+      if (host.enforcementPending)
+        throw new HttpError(503, "Host media disconnect is pending");
+      // A new revision replaces an unredeemed invitation. A fenced invitation
+      // can be replaced only after the physical old-host removal is confirmed.
+      m.hostReentryRevision = revision + 1;
+      m.hostReentry = {
+        requestId: body.requestId,
+        phase: current?.phase === "fenced" ? "fenced" : "issued",
+      };
+      m.hostTokenHash = digest(hostToken);
+      m.hostTokenExpiresAt = Date.now() + 30 * 60_000;
+    });
+    return { code, hostToken };
   });
   app.post("/api/internal/hosted/meetings/:code/end", async (req, reply) => {
     const { accountId, version } = z
@@ -874,28 +958,88 @@ export async function createApp(config: Config, store: Store, media: Media) {
   );
   app.post("/api/meetings/:code/host", async (req, reply) => {
     const { token } = z.object({ token: z.string().max(256) }).parse(req.body);
-    await store.checkUsage(codeOf(req));
+    const code = codeOf(req);
+    const snapshot = await store.get(code);
+    if (snapshot?.hosted?.billingOwnerId && snapshot.lifecycle) {
+      const fenced = await store.withHostedReentry(code, (m) => {
+        const reentry = m.hostReentry;
+        if (
+          !reentry ||
+          reentry.phase === "consumed" ||
+          !m.hostTokenHash ||
+          !safeEqual(m.hostTokenHash, digest(token)) ||
+          m.hostTokenExpiresAt <= Date.now()
+        )
+          throw new HttpError(403, "Host link is invalid or already used");
+        const host = m.participants.find((p) => p.role === "host")!;
+        if (reentry.phase === "issued") {
+          if (host.enforcementPending)
+            throw new HttpError(503, "Host media disconnect is pending");
+          // Persist the old cookie and media fence before physical removal.
+          host.tokenHash = digest(randomToken());
+          fenceParticipantMedia(m, host);
+          reentry.phase = "fenced";
+        }
+        return { meeting: structuredClone(m), host: structuredClone(host) };
+      });
+      if (fenced.host.enforcementPending)
+        await enforce(fenced.meeting, [fenced.host]);
+      const session = randomToken();
+      const id = await store.withHostedReentry(code, (m) => {
+        const host = m.participants.find((p) => p.role === "host")!;
+        if (
+          m.hostReentry?.phase !== "fenced" ||
+          !m.hostTokenHash ||
+          !safeEqual(m.hostTokenHash, digest(token)) ||
+          m.hostTokenExpiresAt <= Date.now() ||
+          host.enforcementPending
+        )
+          throw new HttpError(
+            409,
+            "Host re-entry changed or cleanup is pending",
+          );
+        requireReturningHostSeat(m, host);
+        host.status = "admitted";
+        applyGroupDuration(m);
+        host.tokenHash = digest(session);
+        host.expiresAt = Date.now() + 12 * 60 * 60_000;
+        Object.assign(host, identity(req, reply, m.code));
+        m.hostReentry.phase = "consumed";
+        delete m.hostTokenHash;
+        return host.id;
+      });
+      reply.setCookie(authCookie(code), session, cookieOpts);
+      return { participantId: id };
+    }
+    await store.checkUsage(code);
     const session = randomToken();
     const id = await store.startMeeting(
-      codeOf(req),
+      code,
       (m) => {
         active(m);
+        if (m.lifecycle || (m.hostReentry && m.hostReentry.phase !== "issued"))
+          throw new HttpError(409, "Host invitation changed");
         if (
           !m.hostTokenHash ||
           !safeEqual(m.hostTokenHash, digest(token)) ||
           m.hostTokenExpiresAt < Date.now()
         )
           throw new HttpError(403, "Host link is invalid or already used");
-        delete m.hostTokenHash;
         const p = m.participants.find((x) => x.role === "host")!;
+        if (p.enforcementPending)
+          throw new HttpError(503, "Host media disconnect is pending");
+        requireReturningHostSeat(m, p);
+        if (m.hostReentry) m.hostReentry.phase = "consumed";
+        delete m.hostTokenHash;
         p.status = "admitted";
         p.tokenHash = digest(session);
+        p.expiresAt = Date.now() + 43200000;
         Object.assign(p, identity(req, reply, m.code));
         return p.id;
       },
       config.freeMaxActiveRooms,
     );
-    reply.setCookie(authCookie(codeOf(req)), session, cookieOpts);
+    reply.setCookie(authCookie(code), session, cookieOpts);
     return { participantId: id };
   });
   app.post(
@@ -945,7 +1089,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
         m.participants.push(p);
         return { id: p.id, created: true };
       });
-      if (joined.created) reply.setCookie(authCookie(code), session, cookieOpts);
+      if (joined.created)
+        reply.setCookie(authCookie(code), session, cookieOpts);
       return { participantId: joined.id };
     },
   );
@@ -1019,7 +1164,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
             m.mode === "webinar"
               ? {
                   presenters: m.participants.filter(
-                    (x) => occupiesSeat(x) && x.role !== "viewer",
+                    (x) => occupiesRoomSeat(m, x) && x.role !== "viewer",
                   ).length,
                   viewers: m.participants.filter(
                     (x) => occupiesSeat(x) && x.role === "viewer",
@@ -1145,7 +1290,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           body.action === "promote" ? "viewer" : "participant";
         if (p.role !== expectedRole)
           throw new HttpError(409, "Participant already has this role");
-        const occupied = m.participants.filter(occupiesMeetingSeat);
+        const occupied = m.participants.filter((x) => occupiesRoomSeat(m, x));
         if (
           body.action === "promote" &&
           occupied.filter((x) => x.role !== "viewer").length >=

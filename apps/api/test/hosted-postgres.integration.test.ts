@@ -167,6 +167,143 @@ async function fixture(t: TestContext) {
 }
 
 test(
+  "PostgreSQL host re-entry serializes revision replacement and preserves one start reservation",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t);
+    const owner = f.account();
+    const made = await f.create(0, owner, randomUUID());
+    assert.equal(made.statusCode, 200, made.body);
+    const { code, hostToken } = made.json();
+    const path = `/api/internal/hosted/meetings/${code}/host-reentry`;
+    const issue = (
+      index: number,
+      requestId: string,
+      expectedRevision: number,
+    ) =>
+      f.apps[index]!.inject({
+        method: "POST",
+        url: path,
+        headers: internalHeaders,
+        payload: {
+          accountId: owner,
+          version: 1,
+          billingOwnerId: owner,
+          requestId,
+          expectedRevision,
+        },
+      });
+    const requests = [randomUUID(), randomUUID()];
+    const first = await Promise.all(
+      requests.map((requestId, index) => issue(index, requestId, 0)),
+    );
+    assert.deepEqual(first.map((r) => r.statusCode).sort(), [200, 409]);
+    const winner = first.findIndex((r) => r.statusCode === 200);
+    const replaced = await issue(1 - winner, randomUUID(), 1);
+    assert.equal(replaced.statusCode, 200, replaced.body);
+    assert.equal((await issue(winner, requests[winner]!, 0)).statusCode, 409);
+    const host = (index: number, token: string) =>
+      f.apps[index]!.inject({
+        method: "POST",
+        url: `/api/meetings/${code}/host`,
+        headers: browserHeaders,
+        payload: { token },
+      });
+    assert.equal((await host(0, hostToken)).statusCode, 403);
+    assert.equal(
+      (await host(winner, first[winner]!.json().hostToken)).statusCode,
+      403,
+    );
+    const started = await host(1 - winner, replaced.json().hostToken);
+    assert.equal(started.statusCode, 200, started.body);
+    const before = (await f.stores[0].get(code))!;
+    assert.equal(before.hostReentryRevision, 2);
+    assert.equal(before.hostReentry?.phase, "consumed");
+    const other = await f.create(1, owner, randomUUID());
+    assert.equal(other.statusCode, 200, other.body);
+    assert.equal(
+      (
+        await f.apps[1].inject({
+          method: "POST",
+          url: `/api/meetings/${other.json().code}/host`,
+          headers: browserHeaders,
+          payload: { token: other.json().hostToken },
+        })
+      ).statusCode,
+      409,
+    );
+    const reentry = await issue(0, randomUUID(), 2);
+    assert.equal(reentry.statusCode, 200, reentry.body);
+    assert.equal((await host(1, reentry.json().hostToken)).statusCode, 200);
+    const after = (await f.stores[1].get(code))!;
+    assert.equal(after.lifecycle?.startedAt, before.lifecycle?.startedAt);
+    assert.equal(after.participants.length, before.participants.length);
+    assert.equal(after.hostReentryRevision, 3);
+    const staleAuthority = await issue(0, randomUUID(), 3);
+    assert.equal(staleAuthority.statusCode, 200, staleAuthority.body);
+    const revoked = await f.authority(1, owner, 2, false);
+    assert.ok([200, 202].includes(revoked.statusCode), revoked.body);
+    assert.notEqual(
+      (await host(0, staleAuthority.json().hostToken)).statusCode,
+      200,
+    );
+    assert.notEqual((await issue(1, randomUUID(), 4)).statusCode, 200);
+
+    const otherOwner = f.account();
+    const otherMade = await f.create(0, otherOwner, randomUUID());
+    assert.equal(otherMade.statusCode, 200, otherMade.body);
+    const otherCode = otherMade.json().code;
+    assert.equal(
+      (
+        await f.apps[0].inject({
+          method: "POST",
+          url: `/api/meetings/${otherCode}/host`,
+          headers: browserHeaders,
+          payload: { token: otherMade.json().hostToken },
+        })
+      ).statusCode,
+      200,
+    );
+    const otherPath = `/api/internal/hosted/meetings/${otherCode}/host-reentry`;
+    const pending = await f.apps[1].inject({
+      method: "POST",
+      url: otherPath,
+      headers: internalHeaders,
+      payload: {
+        accountId: otherOwner,
+        version: 1,
+        billingOwnerId: otherOwner,
+        requestId: randomUUID(),
+        expectedRevision: 0,
+      },
+    });
+    assert.equal(pending.statusCode, 200, pending.body);
+    const grant = (
+      await f.stores[1].pool.query(
+        "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+        [otherOwner],
+      )
+    ).rows[0].data;
+    await f.stores[1].setHostedEntitlement({
+      ...grant,
+      revision: 2,
+      enabled: false,
+    });
+    assert.notEqual(
+      (
+        await f.apps[0].inject({
+          method: "POST",
+          url: `/api/meetings/${otherCode}/host`,
+          headers: browserHeaders,
+          payload: { token: pending.json().hostToken },
+        })
+      ).statusCode,
+      200,
+    );
+  },
+);
+
+test(
   "PostgreSQL pooled participant claims serialize across APIs and retain unknown media after process restart",
   { skip: !databaseUrl, timeout: 30000 },
   async (t) => {

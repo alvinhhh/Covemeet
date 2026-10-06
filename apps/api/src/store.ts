@@ -61,6 +61,7 @@ import {
   endMeeting,
   entitlementFor,
   entitlementSchema,
+  meetingAllowed,
   nextEntitlement,
   requireEntitlement,
   startMeetingReservation,
@@ -136,6 +137,11 @@ export type Recording = {
 };
 export type Meeting = {
   meetingMeter?: MeetingMeter;
+  hostReentryRevision?: number;
+  hostReentry?: {
+    requestId: string;
+    phase: "issued" | "fenced" | "consumed";
+  };
   hosted?: {
     accountId: string;
     billingOwnerId?: string;
@@ -348,6 +354,7 @@ export interface Store {
   ): Promise<void>;
   reconcileParticipantMeters(code: string): Promise<void>;
   createHosted(m: Meeting): Promise<Meeting>;
+  withHostedReentry<T>(code: string, change: (m: Meeting) => T): Promise<T>;
   setHostedEntitlement(input: HostedEntitlement): Promise<HostedEntitlement>;
   startMeeting<T>(
     code: string,
@@ -441,6 +448,41 @@ export type HostedAuthority = {
   version: number;
   enabled: boolean;
 };
+
+function requireCurrentHostedReentry(
+  m: Meeting,
+  authority: HostedAuthority | undefined,
+  grant: HostedEntitlement | undefined,
+) {
+  const binding = m.hosted;
+  if (
+    !binding?.billingOwnerId ||
+    !authority?.enabled ||
+    authority.accountId !== binding.accountId ||
+    authority.version !== binding.version ||
+    authority.billingOwnerId !== binding.billingOwnerId ||
+    m.lifecycle?.cleanupConfirmed ||
+    binding.revoked ||
+    binding.cleanupConfirmed ||
+    m.cleanupPending ||
+    !meetingAllowed(m) ||
+    !m.participants.some(
+      (p) =>
+        p.role === "host" &&
+        (m.lifecycle
+          ? p.status === "admitted" || p.status === "left"
+          : p.status === "waiting" || p.status === "left"),
+    ) ||
+    (!m.lifecycle &&
+      m.hostReentry !== undefined &&
+      m.hostReentry.phase !== "issued") ||
+    (m.lifecycle && !m.hostReentry && !!m.hostTokenHash)
+  )
+    throw new HttpError(409, "Host re-entry is unavailable");
+  const currentGrant = requireEntitlement(grant, binding.accountId);
+  if (binding.entitlement?.revision !== currentGrant.revision)
+    throw new HttpError(409, "Hosting grant changed");
+}
 
 function reusableHostedMeeting(existing: Meeting, incoming: Meeting) {
   if (
@@ -1030,6 +1072,58 @@ export class PgStore implements Store {
           [m.code, `hosted:${binding.accountId}`, `version:${binding.version}`],
         );
         return m;
+      },
+      binding.billingOwnerId,
+    );
+  }
+  async withHostedReentry<T>(
+    code: string,
+    change: (m: Meeting) => T,
+  ): Promise<T> {
+    const snapshot = await this.get(code);
+    const binding = snapshot?.hosted;
+    if (!binding?.billingOwnerId)
+      throw new HttpError(404, "Meeting unavailable");
+    return this.hostedTransaction(
+      binding.accountId,
+      async (c) => {
+        const m = (
+          await c.query("SELECT data FROM meetings WHERE code=$1 FOR UPDATE", [
+            code,
+          ])
+        ).rows[0]?.data as Meeting | undefined;
+        if (
+          !m ||
+          m.hosted?.accountId !== binding.accountId ||
+          m.hosted?.billingOwnerId !== binding.billingOwnerId
+        )
+          throw new HttpError(409, "Meeting ownership changed");
+        const authorityRow = (
+          await c.query(
+            "SELECT version,enabled,billing_owner_id FROM hosted_authorities WHERE account_id=$1",
+            [binding.accountId],
+          )
+        ).rows[0];
+        const authority = authorityRow && {
+          accountId: binding.accountId,
+          version: Number(authorityRow.version),
+          enabled: authorityRow.enabled as boolean,
+          billingOwnerId: authorityRow.billing_owner_id as string | undefined,
+        };
+        const grant = (
+          await c.query(
+            "SELECT data FROM hosted_entitlements WHERE billing_owner_id=$1",
+            [binding.billingOwnerId],
+          )
+        ).rows[0]?.data as HostedEntitlement | undefined;
+        requireCurrentHostedReentry(m, authority, grant);
+        const result = change(m);
+        m.revision++;
+        await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+          code,
+          JSON.stringify(m),
+        ]);
+        return result;
       },
       binding.billingOwnerId,
     );
@@ -2257,6 +2351,25 @@ export class MemoryStore implements Store {
         `version:${binding.version}`,
       );
       return structuredClone(m);
+    });
+  }
+  async withHostedReentry<T>(
+    code: string,
+    change: (m: Meeting) => T,
+  ): Promise<T> {
+    return this.serialize(async () => {
+      const m = structuredClone(this.data.get(code));
+      if (!m?.hosted?.billingOwnerId)
+        throw new HttpError(404, "Meeting unavailable");
+      requireCurrentHostedReentry(
+        m,
+        this.hostedAuthorities.get(m.hosted.accountId),
+        this.hostedEntitlements.get(m.hosted.billingOwnerId),
+      );
+      const result = change(m);
+      m.revision++;
+      this.data.set(code, m);
+      return result;
     });
   }
   async setHostedAuthority(

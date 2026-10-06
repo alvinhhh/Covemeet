@@ -6,6 +6,7 @@ import { createApp } from "../src/server.js";
 import { LiveMedia } from "../src/media.js";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import { RecordingService } from "../src/recordings.js";
+import { usageWindow } from "../src/participant-meter.js";
 
 const origin = "http://localhost:5173";
 const creationKey = "hosted-authority-creation-key-at-least-32-chars";
@@ -22,12 +23,19 @@ const machineHeaders = {
 };
 class TestMedia extends LiveMedia {
   ended: string[] = [];
+  removed: string[] = [];
   failEnd = false;
+  failRemove = false;
+  onRemove?: () => Promise<void>;
   override async end(m: Meeting) {
     this.ended.push(m.code);
     if (this.failEnd) throw new Error("SFU unavailable");
   }
-  override async remove(_m: Meeting, _p: Participant) {}
+  override async remove(_m: Meeting, p: Participant) {
+    this.removed.push(p.previousMediaIdentity ?? p.mediaIdentity ?? p.id);
+    if (this.failRemove) throw new Error("SFU unavailable");
+    await this.onRemove?.();
+  }
 }
 async function fixture(
   t: TestContext,
@@ -1097,6 +1105,411 @@ test("host exchange atomically reserves one slot per host, and closing media ret
   );
 });
 
+test("host re-entry requires exact creator authority and a current revision", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const requestId = randomUUID();
+  const request = {
+    accountId: f.accountId,
+    version: 1,
+    billingOwnerId: f.billingOwnerId,
+    requestId,
+    expectedRevision: 0,
+  };
+  const issue = (
+    body = request,
+    headers: Record<string, string> = machineHeaders,
+  ) => f.internal(`meetings/${made.code}/host-reentry`, body, headers);
+  const oldCookie = await f.exchange(made.code, made.hostToken);
+  assert.equal(
+    (
+      await f.internal("meetings/status", {
+        accountId: f.accountId,
+        version: 1,
+      })
+    ).json().meetings[0].hostReentryRevision,
+    0,
+  );
+  assert.equal((await issue(request, {})).statusCode, 403);
+  assert.equal(
+    (await issue({ ...request, accountId: f.foreignAccountId })).statusCode,
+    403,
+  );
+  assert.equal(
+    (await issue({ ...request, billingOwnerId: randomUUID() })).statusCode,
+    403,
+  );
+  assert.equal((await issue({ ...request, version: 2 })).statusCode, 403);
+  const first = await issue();
+  assert.equal(first.statusCode, 200, first.body);
+  assert.deepEqual((await issue()).json(), first.json());
+  assert.equal(
+    (await issue({ ...request, requestId: randomUUID() })).statusCode,
+    409,
+  );
+  const replacementRequest = {
+    ...request,
+    requestId: randomUUID(),
+    expectedRevision: 1,
+  };
+  const replacement = await issue(replacementRequest);
+  assert.equal(replacement.statusCode, 200, replacement.body);
+  assert.equal((await issue()).statusCode, 409);
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/host`, {
+        token: first.json().hostToken,
+      })
+    ).statusCode,
+    403,
+  );
+  assert.equal(
+    (
+      await f.internal("meetings/status", {
+        accountId: f.accountId,
+        version: 1,
+      })
+    ).json().meetings[0].hostReentryRevision,
+    2,
+  );
+  const newCookie = await f.exchange(made.code, replacement.json().hostToken);
+  assert.notEqual(oldCookie, newCookie);
+  assert.equal(
+    (await f.browser(`/api/meetings/${made.code}/state`, undefined, oldCookie))
+      .statusCode,
+    401,
+  );
+  assert.equal((await issue()).statusCode, 409);
+  assert.equal(
+    (await issue({ ...request, requestId: randomUUID(), expectedRevision: 2 }))
+      .statusCode,
+    200,
+  );
+  assert.equal((await issue()).statusCode, 409);
+});
+
+test("a lost first host link can be replaced before start without bypassing the initial reservation", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const before = (await f.store.get(made.code))!;
+  assert.equal(before.lifecycle, undefined);
+  assert.deepEqual(
+    (
+      await f.internal("meetings/status", {
+        accountId: f.accountId,
+        version: 1,
+      })
+    ).json(),
+    {
+      meetings: [
+        { code: made.code, hostReentryRevision: 0, status: "not-started" },
+      ],
+    },
+  );
+  const request = {
+    accountId: f.accountId,
+    version: 1,
+    billingOwnerId: f.billingOwnerId,
+    requestId: randomUUID(),
+    expectedRevision: 0,
+  };
+  const path = `meetings/${made.code}/host-reentry`;
+  const issued = await f.internal(path, request);
+  assert.equal(issued.statusCode, 200, issued.body);
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/host`, {
+        token: made.hostToken,
+      })
+    ).statusCode,
+    403,
+  );
+  assert.equal((await f.store.get(made.code))!.lifecycle, undefined);
+  const replay = await f.internal(path, request);
+  assert.deepEqual(replay.json(), issued.json());
+  await f.exchange(made.code, issued.json().hostToken);
+  const started = (await f.store.get(made.code))!;
+  assert.equal(started.hostReentry?.phase, "consumed");
+  assert.ok(started.lifecycle?.startedAt);
+  assert.equal(started.participants.length, before.participants.length);
+  assert.equal((await f.internal(path, request)).statusCode, 409);
+  assert.equal(
+    (
+      await f.internal("meetings/status", {
+        accountId: f.accountId,
+        version: 1,
+      })
+    ).json().meetings[0].status,
+    "active",
+  );
+});
+
+test("an expired unstarted host row can open with a fresh session after cleanup", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  await f.store.change(made.code, (m) => {
+    m.hostTokenExpiresAt = Date.now() - 1;
+    m.participants.find((p) => p.role === "host")!.expiresAt = Date.now() - 1;
+  });
+  await f.tick();
+  const expired = (await f.store.get(made.code))!;
+  assert.equal(expired.lifecycle, undefined);
+  assert.equal(
+    expired.participants.find((p) => p.role === "host")?.status,
+    "left",
+  );
+  assert.equal(
+    expired.participants.find((p) => p.role === "host")?.enforcementPending,
+    false,
+  );
+  assert.equal(
+    (
+      await f.internal("meetings/status", {
+        accountId: f.accountId,
+        version: 1,
+      })
+    ).json().meetings[0].status,
+    "not-started",
+  );
+  await f.store.change(made.code, (m) => {
+    const host = m.participants.find((p) => p.role === "host")!;
+    for (let index = 0; index < 99; index++)
+      m.participants.push({
+        ...host,
+        id: randomUUID(),
+        name: `Guest ${index}`,
+        role: "participant",
+        status: "admitted",
+        tokenHash: randomUUID(),
+        expiresAt: Date.now() + 60_000,
+        mediaIdentity: randomUUID(),
+      });
+  });
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/join`, {
+        name: "Extra guest",
+        password: settings.password,
+      })
+    ).statusCode,
+    409,
+  );
+  const issued = await f.internal(`meetings/${made.code}/host-reentry`, {
+    accountId: f.accountId,
+    version: 1,
+    billingOwnerId: f.billingOwnerId,
+    requestId: randomUUID(),
+    expectedRevision: 0,
+  });
+  assert.equal(issued.statusCode, 200, issued.body);
+  await f.exchange(made.code, issued.json().hostToken);
+  const host = (await f.store.get(made.code))!.participants.find(
+    (p) => p.role === "host",
+  )!;
+  assert.equal(host.status, "admitted");
+  assert.ok(host.expiresAt >= Date.now() + 11 * 60 * 60_000);
+  assert.equal(
+    (await f.store.get(made.code))!.participants.filter(
+      (p) => p.status === "admitted",
+    ).length,
+    100,
+  );
+});
+
+test("host re-entry persists the old media fence and retries cleanup without a new reservation", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const oldCookie = await f.exchange(made.code, made.hostToken);
+  const before = (await f.store.get(made.code))!;
+  const oldHost = before.participants.find((p) => p.role === "host")!;
+  // A started room has already consumed its only hosted reservation.
+  await f.store.setHostedEntitlement({
+    ...f.grant,
+    revision: 2,
+    quota: { ...f.grant.quota, participantSecondsPerMonth: 1 },
+  });
+  f.store.usageLedgers.get(f.billingOwnerId)!.windows = [
+    { ...usageWindow(f.grant.quota.anchorAt, Date.now()), usedMs: 1000 },
+  ];
+  await assert.rejects(f.store.checkUsage(made.code));
+  const request = {
+    accountId: f.accountId,
+    version: 1,
+    billingOwnerId: f.billingOwnerId,
+    requestId: randomUUID(),
+    expectedRevision: 0,
+  };
+  const issued = await f.internal(
+    `meetings/${made.code}/host-reentry`,
+    request,
+  );
+  assert.equal(issued.statusCode, 200, issued.body);
+  const token = issued.json().hostToken;
+  f.media.failRemove = true;
+  const pending = await f.browser(`/api/meetings/${made.code}/host`, { token });
+  assert.equal(pending.statusCode, 503, pending.body);
+  assert.equal(
+    pending.cookies.some((c) => c.name === `mp_${made.code}`),
+    false,
+  );
+  const fenced = (await f.store.get(made.code))!;
+  const host = fenced.participants.find((p) => p.role === "host")!;
+  assert.equal(fenced.hostReentry?.phase, "fenced");
+  assert.equal(host.enforcementPending, true);
+  assert.notEqual(host.mediaIdentity, oldHost.mediaIdentity);
+  assert.equal(
+    (await f.browser(`/api/meetings/${made.code}/state`, undefined, oldCookie))
+      .statusCode,
+    401,
+  );
+  assert.equal(
+    (
+      await f.internal(`meetings/${made.code}/host-reentry`, {
+        ...request,
+        requestId: randomUUID(),
+        expectedRevision: 1,
+      })
+    ).statusCode,
+    503,
+  );
+  f.media.failRemove = false;
+  const newCookie = await f.exchange(made.code, token);
+  assert.notEqual(newCookie, oldCookie);
+  const after = (await f.store.get(made.code))!;
+  assert.equal(after.hostReentry?.phase, "consumed");
+  assert.equal(after.participants.length, before.participants.length);
+  assert.equal(after.lifecycle?.startedAt, before.lifecycle?.startedAt);
+  assert.equal(
+    after.participants.find((p) => p.role === "host")?.id,
+    oldHost.id,
+  );
+  assert.ok(f.media.removed.length >= 2);
+  assert.ok(f.media.removed.every((identity) => identity === oldHost.id));
+});
+
+test("host re-entry rechecks the live grant after media cleanup before issuing a cookie", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const oldCookie = await f.exchange(made.code, made.hostToken);
+  const issued = await f.internal(`meetings/${made.code}/host-reentry`, {
+    accountId: f.accountId,
+    version: 1,
+    billingOwnerId: f.billingOwnerId,
+    requestId: randomUUID(),
+    expectedRevision: 0,
+  });
+  assert.equal(issued.statusCode, 200, issued.body);
+  f.media.onRemove = async () => {
+    f.media.onRemove = undefined;
+    await f.store.setHostedEntitlement({
+      ...f.grant,
+      revision: 2,
+      enabled: false,
+    });
+  };
+  const exchanged = await f.browser(`/api/meetings/${made.code}/host`, {
+    token: issued.json().hostToken,
+  });
+  assert.equal(exchanged.statusCode, 409, exchanged.body);
+  assert.equal(
+    exchanged.cookies.some((c) => c.name === `mp_${made.code}`),
+    false,
+  );
+  assert.equal((await f.store.get(made.code))!.ended, true);
+  assert.equal(
+    (await f.browser(`/api/meetings/${made.code}/state`, undefined, oldCookie))
+      .statusCode,
+    401,
+  );
+});
+
+test("a refreshed intent can take over a fenced invitation after background media cleanup", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  await f.exchange(made.code, made.hostToken);
+  const request = {
+    accountId: f.accountId,
+    version: 1,
+    billingOwnerId: f.billingOwnerId,
+    requestId: randomUUID(),
+    expectedRevision: 0,
+  };
+  const path = `meetings/${made.code}/host-reentry`;
+  const first = (await f.internal(path, request)).json().hostToken;
+  f.media.failRemove = true;
+  assert.equal(
+    (await f.browser(`/api/meetings/${made.code}/host`, { token: first }))
+      .statusCode,
+    503,
+  );
+  f.media.failRemove = false;
+  await f.tick();
+  assert.equal(
+    (await f.store.get(made.code))!.participants.find((p) => p.role === "host")
+      ?.enforcementPending,
+    false,
+  );
+  const replacement = await f.internal(path, {
+    ...request,
+    requestId: randomUUID(),
+    expectedRevision: 1,
+  });
+  assert.equal(replacement.statusCode, 200, replacement.body);
+  assert.equal((await f.store.get(made.code))!.hostReentry?.phase, "fenced");
+  assert.equal(
+    (await f.browser(`/api/meetings/${made.code}/host`, { token: first }))
+      .statusCode,
+    403,
+  );
+  const removals = f.media.removed.length;
+  await f.exchange(made.code, replacement.json().hostToken);
+  assert.equal(f.media.removed.length, removals);
+});
+
+test("a started hosted room reserves the absent host seat for re-entry", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  await f.exchange(made.code, made.hostToken);
+  await f.store.change(made.code, (m) => {
+    const host = m.participants.find((p) => p.role === "host")!;
+    host.status = "left";
+    host.expiresAt = Date.now() - 1;
+    for (let index = 0; index < 99; index++)
+      m.participants.push({
+        ...host,
+        id: randomUUID(),
+        name: `Guest ${index}`,
+        role: "participant",
+        status: "admitted",
+        tokenHash: randomUUID(),
+        expiresAt: Date.now() + 60_000,
+      });
+  });
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${made.code}/join`, {
+        name: "Extra guest",
+        password: settings.password,
+      })
+    ).statusCode,
+    409,
+  );
+  const issued = await f.internal(`meetings/${made.code}/host-reentry`, {
+    accountId: f.accountId,
+    version: 1,
+    billingOwnerId: f.billingOwnerId,
+    requestId: randomUUID(),
+    expectedRevision: 0,
+  });
+  assert.equal(issued.statusCode, 200, issued.body);
+  await f.exchange(made.code, issued.json().hostToken);
+  const after = (await f.store.get(made.code))!;
+  assert.equal(
+    after.participants.filter((p) => p.status === "admitted").length,
+    100,
+  );
+});
+
 test("host leave ends the room and releases its start reservation after cleanup", async (t) => {
   const f = await fixture(t);
   const first = (await f.create()).json();
@@ -1133,13 +1546,15 @@ test("current owner can end an older left-host room but not a future-version roo
       ...changes,
     });
   assert.deepEqual((await status()).json(), {
-    meetings: [{ code: first.code, status: "active" }],
+    meetings: [{ code: first.code, hostReentryRevision: 0, status: "active" }],
   });
   await f.store.change(first.code, (m) => {
     m.participants.find((p) => p.role === "host")!.status = "left";
   });
   assert.deepEqual((await status()).json(), {
-    meetings: [{ code: first.code, status: "orphaned" }],
+    meetings: [
+      { code: first.code, hostReentryRevision: 0, status: "orphaned" },
+    ],
   });
   await f.store.change(first.code, (m) => {
     m.hosted!.version = 3;
@@ -1170,7 +1585,7 @@ test("current owner can end an older left-host room but not a future-version roo
   assert.equal(pending.statusCode, 202, pending.body);
   assert.deepEqual(pending.json(), { ok: true, cleanupPending: true });
   assert.deepEqual((await status()).json(), {
-    meetings: [{ code: first.code, status: "ending" }],
+    meetings: [{ code: first.code, hostReentryRevision: 0, status: "ending" }],
   });
   assert.equal(
     (
@@ -1224,7 +1639,11 @@ test("hosted owner can finish cleanup after the host ended a room", async (t) =>
         version: 1,
       })
     ).json(),
-    { meetings: [{ code: first.code, status: "ending" }] },
+    {
+      meetings: [
+        { code: first.code, hostReentryRevision: 0, status: "ending" },
+      ],
+    },
   );
   f.media.failEnd = false;
   const completed = await f.internal(`meetings/${first.code}/end`, {
