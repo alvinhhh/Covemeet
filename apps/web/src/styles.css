@@ -100,7 +100,6 @@ small {
   border: 1px solid #e0e0e0;
   background: #fff;
   color: #404040;
-  border-radius: 8px;
   min-height: 42px;
   padding: 10px 15px;
   display: inline-flex;
@@ -799,17 +798,11 @@ textarea:focus {
   height: 100dvh;
   display: flex;
   flex-direction: column;
-  background: #161616;
-  color: #efefef;
 }
 .meeting-header {
-  height: 78px;
   display: flex;
   align-items: center;
-  padding: 0 23px;
-  gap: 26px;
   border-bottom: 1px solid #343434;
-  background: #1f1f1f;
   flex-shrink: 0;
 }
 .meeting-header .brand {
@@ -821,24 +814,18 @@ textarea:focus {
 }
 .meeting-title {
   border-left: 1px solid #424242;
-  padding-left: 25px;
   min-width: 0;
 }
 .meeting-title h1 {
-  font-size: 15px;
   letter-spacing: -0.3px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 35vw;
 }
 .meeting-title > span {
-  font-size: 10px;
-  color: #999999;
   display: flex;
   align-items: center;
   gap: 7px;
-  margin-top: 5px;
 }
 .meeting-title i {
   width: 3px;
@@ -851,14 +838,6 @@ textarea:focus {
   display: flex;
   gap: 8px;
   align-items: center;
-}
-.meeting-header-actions .button {
-  background: #2e2e2e;
-  border-color: #434343;
-  color: #d5d5d5;
-  min-height: 35px;
-  padding: 8px 12px;
-  font-size: 11px;
 }
 .meeting-header-actions .button:hover {
   background: #444444;
@@ -873,14 +852,10 @@ textarea:focus {
   gap: 7px;
   align-items: center;
   margin-right: 9px;
-  color: #bebebe;
-  font-size: 10px;
 }
 .recording-status > span {
   width: 6px;
   height: 6px;
-  border-radius: 50%;
-  background: #878787;
 }
 .room-notices {
   padding: 8px 16px;
@@ -912,44 +887,30 @@ textarea:focus {
 .stage-content {
   flex: 1;
   min-height: 0;
-  padding: 36px 22px 15px;
   position: relative;
   display: flex;
   flex-direction: column;
 }
 .offline-stage {
   height: 100%;
-  min-height: 200px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  background: #252525;
-  border: 1px solid #373737;
-  border-radius: 13px;
   padding: 35px;
   text-align: center;
 }
 .stage-avatar {
-  width: 110px;
-  height: 110px;
   border-radius: 50%;
-  background: #464646;
-  color: #c9c9c9;
   display: flex;
   align-items: center;
   justify-content: center;
   font-family: inherit;
-  font-size: 38px;
-  font-weight: 500;
 }
 .offline-stage h2 {
-  font-size: 17px;
   margin-top: 20px;
 }
 .offline-stage > span:last-of-type {
-  font-size: 11px;
-  color: #9a9a9a;
   margin-top: 8px;
 }
 .offline-stage p {
@@ -961,23 +922,18 @@ textarea:focus {
   margin-top: 20px;
 }
 .stage-footer {
-  padding: 14px 24px 26px;
   display: flex;
   flex-direction: column;
   align-items: center;
   position: relative;
-  gap: 15px;
 }
 .meeting-caption {
-  font-size: 10px;
-  color: #797979;
   display: flex;
   gap: 7px;
   align-items: center;
 }
 .stage-controls {
   display: flex;
-  gap: 9px;
   justify-content: center;
   position: relative;
 }
@@ -1000,28 +956,16 @@ textarea:focus {
 }
 .stage-controls .button.leave-button {
   margin-left: 9px;
-  background: #373737;
-  border-color: #484848;
-  color: #c0c0c0;
 }
 .stage-controls .button.leave-button:hover {
   background: #444444;
 }
 .video-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 14px;
-  height: 100%;
   min-height: 0;
-  overflow: auto;
-  align-items: stretch;
 }
 .video-tile {
   position: relative;
-  min-height: 200px;
-  border-radius: 12px;
-  background: #282828;
-  border: 1px solid #404040;
   overflow: hidden;
 }
 .video-tile video {
@@ -1031,68 +975,40 @@ textarea:focus {
   display: block;
 }
 .tile-placeholder {
-  height: 100%;
-  min-height: 200px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 .tile-name {
-  position: absolute;
   bottom: 13px;
   left: 13px;
-  padding: 5px 8px;
-  background: #202020d9;
-  color: #d2d2d2;
-  font-size: 11px;
-  border-radius: 5px;
 }
 .video-grid.has-screen {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
-.screen-tile {
-  grid-column: 1/-1;
-  min-height: 320px;
-}
-.screen-tile video {
-  object-fit: contain;
-}
 .connection-label {
-  position: absolute;
   top: 8px;
   left: 25px;
   right: 22px;
-  min-height: 24px;
-  color: #909090;
-  font-size: 9px;
   text-transform: capitalize;
   display: flex;
   align-items: center;
   gap: 6px;
 }
 .connection-label > span {
-  width: 5px;
-  height: 5px;
   border-radius: 50%;
-  background: #929292;
-}
-.connection-label .connected {
-  background: #8d8d8d;
 }
 .video-pagination {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 8px;
   color: #d2d2d2;
-  font-size: 10px;
 }
 .video-pagination button {
   padding: 4px 8px;
   border: 1px solid #5b5b5b;
   border-radius: 5px;
   background: #333333;
-  color: inherit;
   font: inherit;
   cursor: pointer;
 }
@@ -1115,41 +1031,30 @@ textarea:focus {
   color: #b6b6b6;
 }
 .meeting-panel {
-  width: 336px;
-  background: #fbfbfb;
-  color: #444444;
-  border-left: 1px solid #3d3d3d;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
 }
 .panel-header {
-  height: 64px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid #eaeaea;
-  padding: 0 20px;
   flex-shrink: 0;
 }
 .panel-header h2 {
-  font-size: 14px;
   display: flex;
   align-items: center;
   gap: 8px;
   letter-spacing: -0.2px;
 }
 .count {
-  font-size: 10px;
   background: #ececec;
-  color: #888888;
-  padding: 3px 6px;
   border-radius: 5px;
   font-weight: 500;
 }
 .panel-scroll {
-  padding: 22px 17px;
   overflow-y: auto;
   flex: 1;
 }
@@ -1169,17 +1074,10 @@ textarea:focus {
 .participant-row {
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 11px 4px;
   min-width: 0;
 }
 .small-avatar {
-  width: 35px;
-  height: 35px;
-  font-size: 12px;
   flex-shrink: 0;
-  background: #eaeaea;
-  color: #8c8c8c;
 }
 .host-avatar {
   background: #e2e2e2;
@@ -1190,23 +1088,16 @@ textarea:focus {
   min-width: 0;
 }
 .participant-name strong {
-  font-size: 11px;
-  font-weight: 550;
   display: block;
   overflow-wrap: anywhere;
 }
 .participant-name small {
-  font-size: 9px;
-  color: #9d9d9d;
   display: block;
-  margin-top: 3px;
 }
 .permission-icon {
-  color: #a0a0a0;
   display: flex;
 }
 .permission-icon.blocked {
-  color: #8e8e8e;
   position: relative;
 }
 .permission-icon.blocked:after {
@@ -1214,20 +1105,12 @@ textarea:focus {
   position: absolute;
   width: 17px;
   height: 1px;
-  background: #8e8e8e;
   transform: rotate(-45deg);
   top: 7px;
   left: -1px;
 }
-.participant-row .icon-button {
-  width: 22px;
-  height: 28px;
-  color: #a5a5a5;
-}
 .participant-row .button.small {
-  font-size: 10px;
   padding: 7px;
-  min-height: 28px;
 }
 .waiting-list {
   padding-bottom: 18px;
@@ -1246,8 +1129,6 @@ textarea:focus {
   text-align: left;
   background: none;
   border: none;
-  color: #696969;
-  font-size: 10px;
   padding: 10px 8px;
   border-radius: 4px;
 }
@@ -1292,31 +1173,15 @@ input[type="checkbox"] {
   accent-color: var(--accent);
 }
 .meeting-bottom {
-  height: 70px;
-  background: #212121;
   border-top: 1px solid #3d3d3d;
-  display: flex;
   align-items: center;
-  padding: 0 24px;
-  gap: 15px;
   flex-shrink: 0;
-}
-.session-role {
-  font-size: 11px;
-  color: #afafaf;
-  min-width: 180px;
-}
-.session-role > span {
-  color: #767676;
 }
 .panel-tabs {
   display: flex;
-  gap: 9px;
-  margin: auto;
 }
 .panel-tabs button {
   border: 0;
-  background: none;
   color: #858585;
   border-radius: 7px;
   padding: 10px 13px;
@@ -1330,16 +1195,11 @@ input[type="checkbox"] {
   color: #c8c8c8;
 }
 .panel-tabs b {
-  font-size: 9px;
   font-weight: 500;
-  min-width: 16px;
-  height: 16px;
   display: flex;
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  background: #ababab;
-  color: #2f2f2f;
 }
 .chat-panel {
   flex: 1;
@@ -1361,12 +1221,7 @@ input[type="checkbox"] {
   align-items: center;
   text-align: center;
   gap: 12px;
-  color: #adadad;
   padding: 36px 16px;
-}
-.empty-panel h3 {
-  color: #7f7f7f;
-  font-size: 13px;
 }
 .empty-panel p {
   font-size: 11px;
@@ -1382,24 +1237,18 @@ input[type="checkbox"] {
   gap: 10px;
 }
 .chat-message strong {
-  font-size: 11px;
   font-weight: 600;
   overflow-wrap: anywhere;
 }
 .chat-message time {
-  font-size: 9px;
-  color: #a9a9a9;
   white-space: nowrap;
 }
 .chat-message p {
-  font-size: 12px;
   background: #f0f0f0;
   border-radius: 0 9px 9px 9px;
-  padding: 10px 12px;
   margin-top: 7px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  color: #6e6e6e;
 }
 .chat-compose {
   border-top: 1px solid #e6e6e6;
@@ -1412,7 +1261,6 @@ input[type="checkbox"] {
 }
 .chat-compose textarea {
   resize: none;
-  font-size: 12px;
   max-height: 140px;
   background: #f6f6f6;
 }
@@ -1539,8 +1387,6 @@ input[type="checkbox"] {
   gap: 12px;
   padding: 10px;
   background: #3b3b3b;
-  color: #bfbfbf;
-  font-size: 12px;
 }
 .media-error .button {
   font-size: 11px;
@@ -1549,13 +1395,7 @@ input[type="checkbox"] {
 }
 .device-error {
   position: absolute;
-  bottom: 60px;
-  padding: 10px;
-  background: #3f3f3f;
-  color: #cdcdcd;
   border-radius: 6px;
-  font-size: 11px;
-  max-width: 400px;
   text-align: center;
 }
 .lk-start-audio-button {
@@ -2138,11 +1978,9 @@ input[type="checkbox"] {
   display: none;
 }
 .return-main {
-  color: #bcbcbc;
   background: none;
   border: 0;
   border-bottom: 1px solid #7f7f7f;
-  font-size: 10px;
   margin-left: 7px;
   padding: 0;
 }

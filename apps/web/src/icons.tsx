@@ -19,8 +19,6 @@ export type IconName =
   | "grid"
   | "exit"
   | "download"
-  | "mail"
-  | "shield"
   | "more"
   | "camera-off"
   | "pen";
@@ -111,13 +109,6 @@ const paths: Record<IconName, ReactNode> = {
       <path d="M12 3v12m-5-5 5 5 5-5M4 15v6h16v-6" />
     </>
   ),
-  mail: (
-    <>
-      <rect x="3" y="5" width="18" height="14" rx="2" />
-      <path d="m3 6 9 7 9-7" />
-    </>
-  ),
-  shield: <path d="m12 2 8 4v6c0 5-8 10-8 10S4 17 4 12V6l8-4Zm-4 9 3 3 5-6" />,
   more: (
     <>
       <circle cx="5" cy="12" r="1" />
