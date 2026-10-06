@@ -101,9 +101,12 @@ export function observe(room, acceptsIdentity) {
   };
 }
 
-export async function publish(room, frequency) {
+export async function publish(room, frequency, amplitude = 800) {
   if (!Number.isFinite(frequency) || frequency < 40 || frequency > 4000) {
     throw new Error("Invalid synthetic PCM frequency");
+  }
+  if (!Number.isInteger(amplitude) || amplitude < 1 || amplitude > 16000) {
+    throw new Error("Invalid synthetic PCM amplitude");
   }
   const source = new AudioSource(48000, 1, 100);
   const track = LocalAudioTrack.createAudioTrack(
@@ -132,7 +135,8 @@ export async function publish(room, frequency) {
       for (let i = 0; i < frame.data.length; i++) {
         frame.data[i] = enabled
           ? Math.round(
-              800 * Math.sin((2 * Math.PI * frequency * sampleIndex++) / 48000),
+              amplitude *
+                Math.sin((2 * Math.PI * frequency * sampleIndex++) / 48000),
             )
           : 0;
       }
