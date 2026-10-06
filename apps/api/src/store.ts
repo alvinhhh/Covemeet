@@ -380,6 +380,10 @@ export interface Store {
   create(m: Meeting): Promise<void>;
   get(code: string): Promise<Meeting | null>;
   hostedMeetings(accountId: string): Promise<Meeting[]>;
+  hostedOperations(
+    accountId: string,
+    operationIds: string[],
+  ): Promise<Meeting[]>;
   byRoom(room: string): Promise<Meeting | null>;
   all(): Promise<Meeting[]>;
   change<T>(code: string, fn: (m: Meeting) => Promise<T> | T): Promise<T>;
@@ -1304,6 +1308,14 @@ export class PgStore implements Store {
       await this.pool.query(
         "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1",
         [accountId],
+      )
+    ).rows.map((row) => row.data as Meeting);
+  }
+  async hostedOperations(accountId: string, operationIds: string[]) {
+    return (
+      await this.pool.query(
+        "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1 AND data->'hosted'->>'operationId'=ANY($2::text[]) AND data->'hosted'->>'billingOwnerId' IS NOT NULL LIMIT 20",
+        [accountId, operationIds],
       )
     ).rows.map((row) => row.data as Meeting);
   }
@@ -2522,6 +2534,20 @@ export class MemoryStore implements Store {
   async hostedMeetings(accountId: string) {
     return structuredClone(
       [...this.data.values()].filter((m) => m.hosted?.accountId === accountId),
+    );
+  }
+  async hostedOperations(accountId: string, operationIds: string[]) {
+    const requested = new Set(operationIds);
+    return structuredClone(
+      [...this.data.values()]
+        .filter(
+          (m) =>
+            m.hosted?.accountId === accountId &&
+            !!m.hosted.operationId &&
+            !!m.hosted.billingOwnerId &&
+            requested.has(m.hosted.operationId),
+        )
+        .slice(0, 20),
     );
   }
   async byRoom(room: string) {

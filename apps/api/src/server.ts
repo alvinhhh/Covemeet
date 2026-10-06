@@ -737,6 +737,36 @@ export async function createApp(config: Config, store: Store, media: Media) {
         })),
     };
   });
+  app.post("/api/internal/hosted/meeting-operations/lookup", async (req) => {
+    const { accountId, operationIds } = z
+      .object({
+        accountId: hostedUuid,
+        operationIds: z
+          .array(hostedUuid)
+          .min(1)
+          .max(20)
+          .refine((ids) => new Set(ids).size === ids.length),
+      })
+      .strict()
+      .parse(req.body);
+    const rows = await store.hostedOperations(accountId, operationIds);
+    return {
+      operations: rows.map((m) => {
+        const binding = m.hosted!;
+        return {
+          accountId: binding.accountId,
+          operationId: binding.operationId!,
+          version: binding.version,
+          billingOwnerId: binding.billingOwnerId!,
+          code: m.code,
+          title: m.title,
+          mode: m.mode,
+          createdAt: new Date(m.createdAt).toISOString(),
+          revoked: !!binding.revoked,
+        };
+      }),
+    };
+  });
   app.post("/api/internal/hosted/meetings/:code/host-reentry", async (req) => {
     const body = z
       .object({

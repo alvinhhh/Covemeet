@@ -167,6 +167,43 @@ async function fixture(t: TestContext) {
 }
 
 test(
+  "PostgreSQL operation lookup finds only requested creator rows after invitation expiry",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t);
+    const owner = f.account(),
+      foreignOwner = f.account(),
+      operationId = randomUUID(),
+      foreignOperationId = randomUUID();
+    const created = await f.create(0, owner, operationId);
+    const foreign = await f.create(1, foreignOwner, foreignOperationId);
+    assert.equal(created.statusCode, 200, created.body);
+    assert.equal(foreign.statusCode, 200, foreign.body);
+    const code = created.json().code;
+    await f.stores[0].change(code, (m) => {
+      m.hostTokenExpiresAt = Date.now() - 1;
+      m.ended = true;
+    });
+    const found = await f.apps[1].inject({
+      method: "POST",
+      url: "/api/internal/hosted/meeting-operations/lookup",
+      headers: internalHeaders,
+      payload: {
+        accountId: owner,
+        operationIds: [operationId, foreignOperationId],
+      },
+    });
+    assert.equal(found.statusCode, 200, found.body);
+    assert.equal(found.json().operations.length, 1);
+    assert.equal(found.json().operations[0].code, code);
+    assert.equal(found.json().operations[0].operationId, operationId);
+    assert.equal(found.json().operations[0].revoked, false);
+    assert.ok(!found.body.includes(created.json().hostToken));
+    assert.doesNotMatch(found.body, /passwordHash|requestHash|hostToken/);
+  },
+);
+
+test(
   "PostgreSQL host re-entry serializes revision replacement and preserves one start reservation",
   { skip: !databaseUrl, timeout: 30000 },
   async (t) => {

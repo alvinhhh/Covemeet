@@ -438,6 +438,91 @@ test("hosted internal mutations require the exact server credential and reject b
   assert.equal((await f.store.all()).length, 0);
 });
 
+test("machine operation lookup is bounded to requested creator IDs and survives invitation expiry and end", async (t) => {
+  const f = await fixture(t);
+  const owned = (await f.create()).json();
+  const foreignOperationId = randomUUID();
+  const foreign = await f.create({
+    accountId: f.foreignAccountId,
+    operationId: foreignOperationId,
+  });
+  assert.equal(foreign.statusCode, 200, foreign.body);
+  await f.store.change(owned.code, (m) => {
+    m.hostTokenExpiresAt = Date.now() - 1;
+  });
+  assert.equal((await f.create()).statusCode, 409);
+  const path = "meeting-operations/lookup";
+  const body = {
+    accountId: f.accountId,
+    operationIds: [f.input.operationId, foreignOperationId, randomUUID()],
+  };
+  assert.equal((await f.internal(path, body, {})).statusCode, 403);
+  assert.equal(
+    (await f.internal(path, body, { ...machineHeaders, origin })).statusCode,
+    403,
+  );
+  assert.equal(
+    (
+      await f.internal(path, {
+        accountId: f.accountId,
+        operationIds: Array.from({ length: 21 }, () => randomUUID()),
+      })
+    ).statusCode,
+    400,
+  );
+  assert.equal(
+    (
+      await f.internal(path, {
+        accountId: f.accountId,
+        operationIds: [f.input.operationId, f.input.operationId.toUpperCase()],
+      })
+    ).statusCode,
+    400,
+  );
+  const response = await f.internal(path, body);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.deepEqual(response.json(), {
+    operations: [
+      {
+        accountId: f.accountId,
+        operationId: f.input.operationId,
+        version: 1,
+        billingOwnerId: f.billingOwnerId,
+        code: owned.code,
+        title: settings.title,
+        mode: settings.mode,
+        createdAt: new Date(
+          (await f.store.get(owned.code))!.createdAt,
+        ).toISOString(),
+        revoked: false,
+      },
+    ],
+  });
+  assert.doesNotMatch(
+    response.body,
+    /hostToken|passwordHash|requestHash|entitlement/,
+  );
+  assert.ok(!response.body.includes(owned.hostToken));
+  assert.ok(!response.body.includes(settings.password));
+  await f.store.change(owned.code, (m) => {
+    m.ended = true;
+  });
+  assert.equal(
+    (await f.internal(path, body)).json().operations[0].code,
+    owned.code,
+  );
+  const secondOperationId = randomUUID();
+  const second = (await f.create({ operationId: secondOperationId })).json();
+  await f.store.change(second.code, (m) => {
+    m.hosted!.revoked = true;
+  });
+  const revoked = await f.internal(path, {
+    accountId: f.accountId,
+    operationIds: [secondOperationId],
+  });
+  assert.equal(revoked.json().operations[0].revoked, true);
+});
+
 test("concurrent creation retries bind one operation and return only its original unused capability", async (t) => {
   const f = await fixture(t);
   const responses = await Promise.all([f.create(), f.create()]);
