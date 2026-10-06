@@ -3,6 +3,7 @@ import { fenceParticipantMedia } from "./media-identity.js";
 import {
   endMeeting,
   meetingAllowed,
+  participantMediaAllowed,
   meetingDeadline,
   refreshHostPresence,
   type HostedEntitlement,
@@ -199,9 +200,7 @@ export function sweepParticipantMeters(
         const meter = p.meter;
         if (!meter || meter.phase === "closing") continue;
         if (
-          !meetingAllowed(m, now) ||
-          p.status !== "admitted" ||
-          p.enforcementPending ||
+          !participantMediaAllowed(m, p, now) ||
           shared.fundedUntil <= now ||
           meter.presenceUntil <= now
         ) {
@@ -219,9 +218,7 @@ export function sweepParticipantMeters(
       const meter = p.meter;
       if (!meter || meter.phase === "closing") continue;
       if (
-        !meetingAllowed(m, now) ||
-        p.status !== "admitted" ||
-        p.enforcementPending ||
+        !participantMediaAllowed(m, p, now) ||
         meter.fundedUntil <= now ||
         meter.presenceUntil <= now
       ) {
@@ -398,9 +395,7 @@ export function updateMeter(
   const p = meeting.participants.find((x) => x.id === input.participantId);
   if (
     !p ||
-    !meetingAllowed(meeting, now) ||
-    p.status !== "admitted" ||
-    p.enforcementPending ||
+    !participantMediaAllowed(meeting, p, now) ||
     p.mediaVersion !== input.mediaVersion
   )
     throw new HttpError(403, "Media access denied");

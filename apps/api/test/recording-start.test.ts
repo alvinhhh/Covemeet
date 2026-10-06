@@ -1026,3 +1026,31 @@ test("hosted deadline and stale plan snapshots prevent recorder startup using an
     );
   }
 });
+
+test("webinar recording rejects backstage and captures only the live audience room", async (t) => {
+  const f = await fixture(t);
+  await f.store.change(f.meeting.code, (m) => {
+    m.mode = "webinar";
+    m.webinar = {
+      phase: "backstage",
+      backstageRoom: `w_${randomUUID()}`,
+      revision: 0,
+    };
+  });
+  let m = (await f.store.get(f.meeting.code))!;
+  await assert.rejects(
+    f.service.start(m),
+    (error: unknown) => error instanceof HttpError && error.status === 409,
+  );
+  assert.equal(f.jobs.length, 0);
+  assert.equal((await f.store.get(m.code))!.recordings.length, 0);
+  await f.store.change(m.code, (current) => {
+    current.webinar!.phase = "live";
+    current.webinar!.revision++;
+  });
+  m = (await f.store.get(m.code))!;
+  await f.service.start(m);
+  assert.equal(f.jobs.length, 1);
+  assert.equal(f.jobs[0]!.roomName, m.room);
+  assert.notEqual(f.jobs[0]!.roomName, m.webinar!.backstageRoom);
+});

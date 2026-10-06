@@ -6,6 +6,7 @@ type StageMember = {
   role: "host" | "participant" | "viewer";
   status: string;
   breakoutId: string | null;
+  webinarBackstage?: boolean;
   transport?: "browser" | "phone";
 };
 export type StageCandidate = {
@@ -24,6 +25,7 @@ export function selectStage<T extends StageCandidate>(
     localId: string;
     mode: "meeting" | "webinar";
     breakoutId: string | null;
+    webinarBackstage?: boolean;
   },
   requestedPage: number,
 ) {
@@ -31,6 +33,10 @@ export function selectStage<T extends StageCandidate>(
     (member) =>
       member.status === "admitted" &&
       member.breakoutId === context.breakoutId &&
+      (context.mode !== "webinar" ||
+        context.webinarBackstage === undefined ||
+        (member.webinarBackstage === true) ===
+          (context.webinarBackstage === true)) &&
       (context.mode !== "webinar" || member.role !== "viewer"),
   );
   const roles = new Map(

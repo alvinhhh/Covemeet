@@ -2486,6 +2486,15 @@ input[type="checkbox"] {
   background: #252525;
   border-color: #3b3b3b;
 }
+.conference .meeting-header-actions .button.webinar-control {
+  width: auto;
+  white-space: nowrap;
+}
+.conference .meeting-header-actions .button.webinar-control.primary {
+  background: #eeeeee;
+  border-color: #eeeeee;
+  color: #171717;
+}
 .conference .recording-status {
   font-size: 12px;
   color: #eeeeee;
@@ -3066,6 +3075,15 @@ input[type="checkbox"] {
 .conference .participant-row .button.small {
   min-height: 34px;
   font-size: 12px;
+}
+.conference .webinar-stage-action {
+  display: flex;
+  justify-content: flex-end;
+  padding: 0 4px 12px;
+}
+.conference .webinar-stage-action .button {
+  font-size: 12px;
+  min-height: 34px;
 }
 .conference .participant-actions button {
   font-size: 13px;

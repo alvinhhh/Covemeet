@@ -1742,3 +1742,118 @@ test(
     );
   },
 );
+
+test(
+  "PostgreSQL webinar start resumes its fence across APIs without changing ownership or session limits",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account();
+    const created = await f.create(0, owner, randomUUID(), 1, {
+      ...meeting,
+      mode: "webinar",
+    });
+    assert.equal(created.statusCode, 200, created.body);
+    const made = created.json(),
+      path = `/api/meetings/${made.code}`;
+    const browser = (
+      index: number,
+      method: "GET" | "POST" | "PUT",
+      suffix: string,
+      payload?: object,
+      cookie = "",
+    ) =>
+      f.apps[index]!.inject({
+        method,
+        url: path + suffix,
+        headers: { ...browserHeaders, cookie },
+        ...(payload ? { payload } : {}),
+      });
+    const cookies = (response: {
+      cookies: { name: string; value: string }[];
+    }) => response.cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    const started = await browser(0, "POST", "/host", {
+      token: made.hostToken,
+    });
+    assert.equal(started.statusCode, 200, started.body);
+    const hostCookie = cookies(started);
+    const joined = await browser(1, "POST", "/join", {
+      name: "Audience",
+      password: meeting.password,
+    });
+    assert.equal(joined.statusCode, 200, joined.body);
+    const viewerCookie = cookies(joined);
+    assert.equal(
+      (
+        await browser(
+          0,
+          "POST",
+          `/participants/${joined.json().participantId}/action`,
+          { action: "admit" },
+          hostCookie,
+        )
+      ).statusCode,
+      200,
+    );
+    const before = (await f.stores[1].get(made.code))!;
+    const command = {
+      expectedRevision: before.webinar!.revision,
+      expectedControlRevision: before.hostControl!.revision,
+    };
+    f.media[0].failing = true;
+    assert.equal(
+      (await browser(0, "POST", "/webinar/start", command, hostCookie))
+        .statusCode,
+      503,
+    );
+    const pending = (await f.stores[1].get(made.code))!;
+    assert.equal(pending.webinar!.phase, "backstage");
+    assert.equal(pending.webinar!.starting, true);
+    assert.equal(
+      pending.participants.find((p) => p.role === "host")!.previousRoom,
+      before.webinar!.backstageRoom,
+    );
+    assert.equal(
+      (await browser(1, "POST", "/media", {}, viewerCookie)).statusCode,
+      403,
+    );
+    assert.equal(
+      (await browser(1, "POST", "/media", {}, hostCookie)).statusCode,
+      403,
+    );
+    assert.equal(
+      (await browser(1, "POST", "/webinar/start", command, hostCookie))
+        .statusCode,
+      200,
+    );
+    const live = (await f.stores[0].get(made.code))!;
+    assert.equal(live.webinar!.phase, "live");
+    assert.equal(live.webinar!.starting, undefined);
+    assert.deepEqual(live.lifecycle, before.lifecycle);
+    assert.deepEqual(live.hosted, before.hosted);
+    assert.deepEqual(live.hostControl, before.hostControl);
+    assert.ok(live.participants.every((p) => !p.enforcementPending));
+    assert.equal(
+      (await browser(1, "POST", "/media", {}, viewerCookie)).statusCode,
+      200,
+    );
+    assert.equal(
+      (await browser(0, "POST", "/webinar/start", command, hostCookie))
+        .statusCode,
+      409,
+    );
+    const second = (await f.create(1, owner, randomUUID())).json();
+    assert.equal(
+      (
+        await f.apps[1].inject({
+          method: "POST",
+          url: `/api/meetings/${second.code}/host`,
+          headers: browserHeaders,
+          payload: { token: second.hostToken },
+        })
+      ).statusCode,
+      409,
+      "Go live retains the original concurrent host reservation",
+    );
+  },
+);

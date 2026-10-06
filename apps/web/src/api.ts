@@ -39,6 +39,9 @@ export type Participant = {
   mediaVersion: number;
   mediaIdentity?: string;
   breakoutId: string | null;
+  webinarLocation?: "backstage" | "stage";
+  webinarBackstage?: boolean;
+  mediaAllowed?: boolean;
   enforcementPending?: boolean;
   transport: "browser" | "phone";
   phone?: {
@@ -73,6 +76,9 @@ export type MeetingState = {
       viewers: number;
       presenterLimit: number;
       viewerLimit: number;
+      phase: "backstage" | "live" | "ended";
+      revision: number;
+      canManage: boolean;
     };
     locked: boolean;
     ended: boolean;

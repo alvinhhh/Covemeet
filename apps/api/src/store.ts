@@ -120,6 +120,7 @@ export type Participant = {
   ipHash: string;
   deviceHash: string;
   breakoutId: string | null;
+  webinarLocation?: "backstage" | "stage";
   enforcementPending?: boolean;
   previousRoom?: string;
 };
@@ -238,6 +239,12 @@ export type Meeting = {
   room: string;
   title: string;
   mode: "meeting" | "webinar";
+  webinar?: {
+    phase: "backstage" | "live";
+    backstageRoom: string;
+    revision: number;
+    starting?: boolean;
+  };
   locked: boolean;
   ended: boolean;
   recordingAllowed: boolean;
@@ -252,6 +259,7 @@ export type Meeting = {
   breakouts: { id: string; name: string; room: string }[];
   messages: ChatMessage[];
   privateMessages?: ChatMessage[];
+  backstageMessages?: ChatMessage[];
   recordings: Recording[];
   hostEmail?: string;
   hostEmailVerified?: boolean;
@@ -259,11 +267,7 @@ export type Meeting = {
   emailOtpExpiresAt?: number;
   emailOtpAttempts?: number;
 };
-export function participantRoom(m: Meeting, p: Participant) {
-  return p.breakoutId
-    ? (m.breakouts.find((b) => b.id === p.breakoutId)?.room ?? m.room)
-    : m.room;
-}
+export { participantRoom } from "./media-identity.js";
 export const canShareScreen = (p: Participant) =>
   p.transport !== "phone" &&
   p.role !== "viewer" &&

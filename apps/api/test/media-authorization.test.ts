@@ -508,3 +508,65 @@ test("legacy pending cleanup rotates before release and keeps delayed legacy rem
     f.media.authorize(await f.signed({ version: next.mediaVersion })),
   );
 });
+
+test("webinar media tokens bind actual backstage or live rooms and fail during transition fences", async (t) => {
+  const f = await fixture(t);
+  await f.store.change(f.meeting.code, (m) => {
+    m.mode = "webinar";
+    m.webinar = {
+      phase: "backstage",
+      revision: 0,
+      backstageRoom: `w_${randomUUID()}`,
+    };
+    m.participants[0]!.webinarLocation = "stage";
+  });
+  let m = (await f.store.get(f.meeting.code))!;
+  let p = m.participants[0]!;
+  const backstage = await f.media.token(m, p);
+  assert.equal(
+    (await f.media.verifier.verify(backstage)).video!.room,
+    m.webinar!.backstageRoom,
+  );
+  await f.media.authorize(backstage);
+  await assert.rejects(f.media.authorize(await f.signed({ room: m.room })));
+  await assert.rejects(f.media.token(m, { ...p, role: "viewer" }));
+  await f.store.change(m.code, (m) => {
+    fenceParticipantMedia(m, m.participants[0]!);
+    m.webinar!.starting = true;
+  });
+  m = (await f.store.get(m.code))!;
+  const fenced = structuredClone(m.participants[0]!);
+  assert.equal(fenced.previousRoom, m.webinar!.backstageRoom);
+  await assert.rejects(f.media.authorize(backstage));
+  await f.store.change(m.code, (m) => {
+    completeMediaFence(m.participants[0]!, fenced);
+  });
+  m = (await f.store.get(m.code))!;
+  await assert.rejects(f.media.token(m, m.participants[0]!));
+  await f.store.change(m.code, (m) => {
+    m.webinar!.phase = "live";
+    delete m.webinar!.starting;
+  });
+  m = (await f.store.get(m.code))!;
+  p = m.participants[0]!;
+  const onStage = await f.media.token(m, p);
+  assert.equal((await f.media.verifier.verify(onStage)).video!.room, m.room);
+  await f.media.authorize(onStage);
+  await assert.rejects(f.media.authorize(backstage));
+  await f.store.change(m.code, (m) => {
+    fenceParticipantMedia(m, m.participants[0]!);
+    m.participants[0]!.webinarLocation = "backstage";
+  });
+  m = (await f.store.get(m.code))!;
+  assert.equal(m.participants[0]!.previousRoom, m.room);
+  await assert.rejects(f.media.authorize(onStage));
+  const removed: string[] = [];
+  f.media.client.deleteRoom = async (room) => {
+    removed.push(room);
+  };
+  await f.media.end(m);
+  assert.deepEqual(
+    new Set(removed),
+    new Set([m.room, m.webinar!.backstageRoom]),
+  );
+});

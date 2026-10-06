@@ -920,3 +920,88 @@ test("legacy pending phone cleanup returns the migrated grant and physical subsc
     policy.mediaIdentity,
   );
 });
+
+test("webinar phone audience stays in holding and subscribes only to the live stage", async (t) => {
+  const f = await fixture(t);
+  const h = await f.host("webinar");
+  const audience = await f.call(h);
+  const presenter = await f.call(h, "+15551234568");
+  for (const p of [audience, presenter])
+    assert.equal((await h.action(p.participantId, "admit")).statusCode, 200);
+  const waiting = (await audience.update()).json();
+  assert.equal(waiting.state, "waiting");
+  assert.equal(waiting.grant, undefined);
+  assert.equal(
+    (await f.store.get(h.code))!.participants.find(
+      (p) => p.id === audience.participantId,
+    )!.status,
+    "admitted",
+  );
+  assert.equal(
+    (await h.action(presenter.participantId, "promote")).statusCode,
+    200,
+  );
+  let m = (await f.store.get(h.code))!;
+  const rehearsal = (await presenter.update()).json();
+  assert.equal(rehearsal.state, "admitted");
+  assert.equal(
+    (await f.media.verifier.verify(rehearsal.grant.token)).video!.room,
+    m.webinar!.backstageRoom,
+  );
+  const started = await f.browser(
+    "POST",
+    `/api/meetings/${h.code}/webinar/start`,
+    {
+      expectedRevision: m.webinar!.revision,
+      expectedControlRevision: m.hostControl!.revision,
+    },
+    h.cookie,
+  );
+  assert.equal(started.statusCode, 200, started.body);
+  m = (await f.store.get(h.code))!;
+  const live = (await audience.update()).json();
+  assert.equal(live.state, "admitted");
+  assert.equal(
+    (await f.media.verifier.verify(live.grant.token)).video!.room,
+    m.room,
+  );
+  assert.equal(
+    live.grant.subscribeParticipantIds.includes(
+      mediaIdentity(
+        m.participants.find((p) => p.id === presenter.participantId)!,
+      ),
+    ),
+    false,
+  );
+  assert.equal(
+    (
+      await f.browser(
+        "PUT",
+        `/api/meetings/${h.code}/webinar/participants/${presenter.participantId}`,
+        {
+          location: "stage",
+          expectedRevision: m.webinar!.revision,
+          expectedControlRevision: m.hostControl!.revision,
+        },
+        h.cookie,
+      )
+    ).statusCode,
+    200,
+  );
+  m = (await f.store.get(h.code))!;
+  const onStage = (await presenter.update()).json();
+  assert.equal(
+    (await f.media.verifier.verify(onStage.grant.token)).video!.room,
+    m.room,
+  );
+  assert.ok(
+    (await audience.update())
+      .json()
+      .grant.subscribeParticipantIds.includes(
+        mediaIdentity(
+          m.participants.find((p) => p.id === presenter.participantId)!,
+        ),
+      ),
+  );
+  await assert.rejects(f.media.authorize(rehearsal.grant.token));
+});

@@ -2,9 +2,11 @@ import {
   completeMediaFence,
   fenceParticipantMedia,
   mediaIdentity,
+  participantRoom,
 } from "./media-identity.js";
 import {
   meetingAllowed,
+  participantMediaAllowed,
   meetingDeadline,
   requireMeetingSeat,
 } from "./meeting-limits.js";
@@ -298,7 +300,7 @@ export class PhoneService {
       // Lease expiry alone never releases a billable/concurrent-call reservation.
       await this.store.releasePhone(body.callId, code, id);
     }
-    const admitted = !ended && p.status === "admitted";
+    const admitted = !ended && participantMediaAllowed(m, p);
     if (admitted) await this.store.checkUsage(code, id);
     const grant = admitted
       ? {
@@ -309,10 +311,9 @@ export class PhoneService {
             .filter(
               (x) =>
                 x.id !== p.id &&
-                x.status === "admitted" &&
-                !x.enforcementPending &&
+                participantMediaAllowed(m, x) &&
                 x.role !== "viewer" &&
-                x.breakoutId === null &&
+                participantRoom(m, x) === participantRoom(m, p) &&
                 x.expiresAt > Date.now() &&
                 (!x.phone || x.phone.leaseExpiresAt > Date.now()),
             )

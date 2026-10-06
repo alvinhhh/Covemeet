@@ -65,6 +65,18 @@ test("chat displays its retained draft on every fresh mount", () => {
   assert.match(render({ text: "" }), /<textarea[^>]*><\/textarea>/);
 });
 
+test("backstage chat names its private room before sending", () => {
+  const backstage: MeetingState = {
+    ...state,
+    meeting: { ...state.meeting, mode: "webinar" },
+    me: { ...guest, webinarBackstage: true },
+  };
+  const markup = render({ state: backstage });
+  assert.match(markup, /Message backstage/);
+  assert.match(markup, /Backstage<\/button>/);
+  assert.doesNotMatch(markup, />Everyone<\/button>/);
+});
+
 test("chat sender controls are host-only and disabled modes retain the draft", () => {
   assert.doesNotMatch(render(), /Who can send/);
   const restricted: MeetingState = {

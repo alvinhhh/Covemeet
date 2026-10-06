@@ -60,6 +60,50 @@ test("1000 webinar viewers do not create video placeholders or consume presenter
   );
 });
 
+test("webinar tiles stay in the viewer's actual stage or backstage room", () => {
+  const presenters = [
+    {
+      id: "host",
+      role: "host" as const,
+      status: "admitted",
+      breakoutId: null,
+      webinarBackstage: false,
+    },
+    {
+      id: "presenter",
+      role: "participant" as const,
+      status: "admitted",
+      breakoutId: null,
+      webinarBackstage: true,
+    },
+  ];
+  const tracks = ["host", "presenter"].map((id) => ({
+    key: `${id}:camera`,
+    mediaIdentity: id,
+    source: "camera" as const,
+  }));
+  const base = { localId: "host", mode: "webinar" as const, breakoutId: null };
+  assert.deepEqual(
+    selectStage(tracks, presenters, { ...base, webinarBackstage: false }, 0)
+      .visible.map((track) => track.mediaIdentity),
+    ["host"],
+  );
+  assert.deepEqual(
+    selectStage(tracks, presenters, { ...base, webinarBackstage: true }, 0)
+      .visible.map((track) => track.mediaIdentity),
+    ["presenter"],
+  );
+  assert.deepEqual(
+    selectStage(
+      tracks,
+      [{ ...presenters[0]!, webinarBackstage: undefined }, presenters[1]!],
+      { ...base, webinarBackstage: false },
+      0,
+    ).visible.map((track) => track.mediaIdentity),
+    ["host"],
+  );
+});
+
 test("screen sharing gets bounded priority while overflow screens and cameras remain reachable", () => {
   const tracks: StageCandidate[] = [
     ...cameras(40),

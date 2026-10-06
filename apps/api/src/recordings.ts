@@ -749,6 +749,8 @@ export class RecordingService {
             );
           if (!meetingAllowed(m) || !m.recordingAllowed)
             throw new HttpError(403, "Enable recording first");
+          if (m.mode === "webinar" && m.webinar?.phase === "backstage")
+            throw new HttpError(409, "Start the broadcast before recording");
           if (!m.hostEmailVerified)
             throw new HttpError(403, "Verify the host email first");
           if (

@@ -3,6 +3,8 @@ import {
   fenceParticipantMedia,
   gatewayPresenceExpired,
   mediaIdentity,
+  webinarBackstage,
+  participantDataScope,
 } from "./media-identity.js";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
@@ -45,6 +47,7 @@ import {
   endMeeting,
   entitlementSchema,
   meetingAllowed,
+  participantMediaAllowed,
   recordingIncluded,
   participantLimit,
   occupiesMeetingSeat,
@@ -318,6 +321,34 @@ export async function createApp(config: Config, store: Store, media: Media) {
       meetingAllowed(m)
     );
   }
+  function canManageWebinar(m: Meeting, p: Participant) {
+    return (
+      m.mode === "webinar" &&
+      !!m.webinar &&
+      p.status === "admitted" &&
+      p.transport !== "phone" &&
+      p.expiresAt > Date.now() &&
+      meetingAllowed(m) &&
+      (p.role === "host" ||
+        (!!p.moderator && meetingController(m)?.id === p.id))
+    );
+  }
+  function webinarActor(
+    req: FastifyRequest,
+    m: Meeting,
+    expectedControlRevision: number,
+  ) {
+    active(m);
+    const p = actor(req, m);
+    if (!canManageWebinar(m, p))
+      throw new HttpError(403, "Broadcast control required");
+    if ((m.hostControl?.revision ?? 0) !== expectedControlRevision)
+      throw new HttpError(
+        409,
+        "Meeting control changed; refresh and try again",
+      );
+    return p;
+  }
   function canEndMeeting(m: Meeting, p: Participant) {
     if (p.role === "host") return p.status === "admitted";
     if (meetingController(m)?.id !== p.id) return false;
@@ -409,7 +440,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const p = actor(req, m);
     if (p.status !== "admitted") throw new HttpError(403, "Admission required");
     return {
-      scope: p.breakoutId ?? "",
+      scope: participantDataScope(m, p),
       authorId: p.id,
       host: p.role === "host",
     };
@@ -696,6 +727,15 @@ export async function createApp(config: Config, store: Store, media: Media) {
       room: `m_${randomUUID()}`,
       title: body.title,
       mode: body.mode,
+      ...(body.mode === "webinar"
+        ? {
+            webinar: {
+              phase: "backstage" as const,
+              backstageRoom: `w_${randomUUID()}`,
+              revision: 0,
+            },
+          }
+        : {}),
       locked: false,
       ended: false,
       recordingAllowed: false,
@@ -728,6 +768,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       id: randomUUID(),
       name: body.hostName,
       role: "host",
+      ...(m.webinar ? { webinarLocation: "stage" as const } : {}),
       status: "waiting",
       audioAllowed: true,
       videoAllowed: true,
@@ -1362,6 +1403,12 @@ export async function createApp(config: Config, store: Store, media: Media) {
         mediaIdentity: mediaIdentity(x),
         breakoutId: x.breakoutId,
         enforcementPending: !!x.enforcementPending,
+        webinarLocation:
+          x.role === "viewer"
+            ? undefined
+            : (x.webinarLocation ?? (m.webinar ? "backstage" : "stage")),
+        webinarBackstage: webinarBackstage(m, x),
+        mediaAllowed: participantMediaAllowed(m, x),
       });
       const canSee = p.status === "admitted";
       const usage =
@@ -1376,6 +1423,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
           webinar:
             m.mode === "webinar"
               ? {
+                  phase: !meetingAllowed(m)
+                    ? "ended"
+                    : (m.webinar?.phase ?? "live"),
+                  revision: m.webinar?.revision ?? 0,
+                  canManage: canManageWebinar(m, p),
                   presenters: m.participants.filter(
                     (x) => occupiesRoomSeat(m, x) && x.role !== "viewer",
                   ).length,
@@ -1417,17 +1469,21 @@ export async function createApp(config: Config, store: Store, media: Media) {
             (x) =>
               x.id === p.id ||
               p.role === "host" ||
-              canModerate(m, p) ||
+              canManageWebinar(m, p) ||
+              (canModerate(m, p) && !webinarBackstage(m, x)) ||
               (canSee &&
                 x.status === "admitted" &&
-                x.breakoutId === p.breakoutId),
+                participantDataScope(m, x) === participantDataScope(m, p)),
           )
           .map(pub),
         messages: canSee
           ? [
               ...m.messages.filter(
-                (x) => x.broadcast || x.breakoutId === p.breakoutId,
+                (x) =>
+                  x.broadcast ||
+                  (!webinarBackstage(m, p) && x.breakoutId === p.breakoutId),
               ),
+              ...(webinarBackstage(m, p) ? (m.backstageMessages ?? []) : []),
               ...(m.privateMessages ?? []).filter(
                 (x) =>
                   x.senderId === p.id ||
@@ -1560,9 +1616,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
       )
         throw new HttpError(
           409,
-          "Invite the viewer to stage before allowing devices",
+          "Make this viewer a presenter before allowing devices",
         );
       if (body.action === "promote" || body.action === "demote") {
+        if (m.webinar?.starting)
+          throw new HttpError(409, "Broadcast start is pending");
         if (m.mode !== "webinar" || p.status !== "admitted")
           throw new HttpError(
             409,
@@ -1578,10 +1636,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           occupied.filter((x) => x.role !== "viewer").length >=
             webinarPresenterLimit
         )
-          throw new HttpError(
-            409,
-            "Webinar stage is full (10 including the host)",
-          );
+          throw new HttpError(409, "Maximum 10 presenters including the host");
         if (body.action === "demote") requireWebinarViewerSeat(m);
       }
       if (body.action === "admit") {
@@ -1614,17 +1669,23 @@ export async function createApp(config: Config, store: Store, media: Media) {
         }
         if (body.action === "allow-video") p.videoAllowed = true;
         if (body.action === "block-video") p.videoAllowed = false;
-        if (body.action === "allow-screen-share")
-          p.screenShareAllowed = true;
-        if (body.action === "block-screen-share")
-          p.screenShareAllowed = false;
+        if (body.action === "allow-screen-share") p.screenShareAllowed = true;
+        if (body.action === "block-screen-share") p.screenShareAllowed = false;
         if (body.action === "promote") {
           p.role = "participant";
+          if (m.webinar) {
+            p.webinarLocation = "backstage";
+            m.webinar.revision++;
+          }
           p.audioAllowed = true;
           p.videoAllowed = p.transport !== "phone";
         }
         if (body.action === "demote") {
           p.role = "viewer";
+          if (m.webinar) {
+            delete p.webinarLocation;
+            m.webinar.revision++;
+          }
           p.audioAllowed = false;
           p.videoAllowed = false;
           p.screenShareAllowed = false;
@@ -1836,12 +1897,113 @@ export async function createApp(config: Config, store: Store, media: Media) {
     await enforce(m, [who]);
     return { ok: true };
   });
+  const webinarRevision = z
+    .number()
+    .int()
+    .nonnegative()
+    .max(Number.MAX_SAFE_INTEGER);
+  app.post("/api/meetings/:code/webinar/start", async (req) => {
+    const body = z
+      .object({
+        expectedRevision: webinarRevision,
+        expectedControlRevision: webinarRevision,
+      })
+      .strict()
+      .parse(req.body);
+    let actorId!: string;
+    const pending = await store.change(codeOf(req), (m) => {
+      actorId = webinarActor(req, m, body.expectedControlRevision).id;
+      if (!m.webinar) throw new HttpError(409, "This webinar is already live");
+      if (m.webinar.revision !== body.expectedRevision)
+        throw new HttpError(409, "Broadcast changed; refresh and try again");
+      if (m.webinar.phase === "live") return structuredClone(m);
+      if (!m.webinar.starting) {
+        // Capture every old private-room identity before any live-room grant can exist.
+        for (const p of m.participants)
+          if (p.status === "admitted" && webinarBackstage(m, p)) {
+            if (p.enforcementPending)
+              throw new HttpError(409, "A presenter transfer is pending");
+            fenceParticipantMedia(m, p);
+          }
+        m.webinar.starting = true;
+      }
+      return structuredClone(m);
+    });
+    if (pending.webinar!.phase === "live") return { ok: true };
+    await enforce(
+      pending,
+      pending.participants.filter((p) => p.enforcementPending),
+    );
+    await store.change(pending.code, (m) => {
+      webinarActor(req, m, body.expectedControlRevision);
+      if (
+        !m.webinar ||
+        m.webinar.revision !== body.expectedRevision ||
+        !m.webinar.starting
+      )
+        throw new HttpError(409, "Broadcast changed; refresh and try again");
+      if (m.participants.some((p) => p.enforcementPending))
+        throw new HttpError(
+          503,
+          "A presenter transfer is pending; retry Go live",
+        );
+      m.webinar.phase = "live";
+      delete m.webinar.starting;
+      m.webinar.revision++;
+    });
+    await store.audit(pending.code, actorId, "webinar.start");
+    return { ok: true };
+  });
+  app.put("/api/meetings/:code/webinar/participants/:id", async (req) => {
+    const body = z
+      .object({
+        location: z.enum(["stage", "backstage"]),
+        expectedRevision: webinarRevision,
+        expectedControlRevision: webinarRevision,
+      })
+      .strict()
+      .parse(req.body);
+    let changed!: Participant, actorId!: string;
+    const m = await store.change(codeOf(req), (m) => {
+      const self = webinarActor(req, m, body.expectedControlRevision);
+      actorId = self.id;
+      if (
+        !m.webinar ||
+        m.webinar.starting ||
+        m.webinar.revision !== body.expectedRevision
+      )
+        throw new HttpError(409, "Broadcast changed; refresh and try again");
+      const p = m.participants.find((p) => p.id === (req.params as any).id);
+      if (
+        !p ||
+        p.status !== "admitted" ||
+        p.expiresAt <= Date.now() ||
+        p.role === "viewer"
+      )
+        throw new HttpError(409, "Select an admitted presenter");
+      if (self.role !== "host" && p.role === "host")
+        throw new HttpError(403, "The original host cannot be moved");
+      if (p.enforcementPending)
+        throw new HttpError(409, "A presenter transfer is pending");
+      if (p.webinarLocation !== body.location || p.breakoutId) {
+        fenceParticipantMedia(m, p);
+        p.breakoutId = null;
+        p.webinarLocation = body.location;
+        m.webinar.revision++;
+      }
+      changed = structuredClone(p);
+      return structuredClone(m);
+    });
+    if (changed.enforcementPending) await enforce(m, [changed]);
+    await store.audit(m.code, actorId, `webinar.${body.location}`, changed.id);
+    return { ok: true };
+  });
   app.post("/api/meetings/:code/media", async (req) => {
     const m = await find(req);
     active(m);
     const p = actor(req, m);
-    if (p.status !== "admitted" || p.enforcementPending)
-      throw new HttpError(403, "Admission required");
+    if (!participantMediaAllowed(m, p))
+      throw new HttpError(403, "Media is unavailable in this room");
     await store.checkUsage(m.code, p.id);
     return {
       token: await media.token(m, p),
@@ -1895,7 +2057,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
           }
           const messages = recipientId
             ? (m.privateMessages ??= [])
-            : m.messages;
+            : !broadcast && webinarBackstage(m, p)
+              ? (m.backstageMessages ??= [])
+              : m.messages;
           messages.push({
             id: randomUUID(),
             sequence: m.revision + 1,
@@ -1907,11 +2071,23 @@ export async function createApp(config: Config, store: Store, media: Media) {
             broadcast,
             ...(recipientId ? { recipientId } : {}),
           });
-          const retained = [...m.messages, ...(m.privateMessages ?? [])]
-            .sort(chatOrder)
-            .slice(-500);
-          m.messages = retained.filter((entry) => !entry.recipientId);
-          m.privateMessages = retained.filter((entry) => entry.recipientId);
+          const retained = new Set(
+            [
+              ...m.messages,
+              ...(m.privateMessages ?? []),
+              ...(m.backstageMessages ?? []),
+            ]
+              .sort(chatOrder)
+              .slice(-500)
+              .map((entry) => entry.id),
+          );
+          m.messages = m.messages.filter((entry) => retained.has(entry.id));
+          m.privateMessages = (m.privateMessages ?? []).filter((entry) =>
+            retained.has(entry.id),
+          );
+          m.backstageMessages = (m.backstageMessages ?? []).filter((entry) =>
+            retained.has(entry.id),
+          );
         });
         return { ok: true };
       },
@@ -1923,9 +2099,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const hostId = await store.change(codeOf(req), (m) => {
       active(m);
       const host = actor(req, m, true);
-      const message = [...m.messages, ...(m.privateMessages ?? [])].find(
-        (entry) => entry.id === messageId,
-      );
+      const message = [
+        ...m.messages,
+        ...(m.privateMessages ?? []),
+        ...(m.backstageMessages ?? []),
+      ].find((entry) => entry.id === messageId);
       if (!message) throw new HttpError(404, "Message unavailable");
       // Keep its slot so removing content cannot reintroduce older unread history.
       message.text = "";
@@ -2022,6 +2200,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
           !m.breakouts.some((b) => b.id === body.breakoutId)
         )
           throw new HttpError(404, "Breakout room unavailable");
+        if (m.webinar?.starting)
+          throw new HttpError(409, "Broadcast start is pending");
         const targets =
           route === "close-breakouts"
             ? m.participants.filter(
@@ -2054,6 +2234,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
             );
           fenceParticipantMedia(m, p);
           p.breakoutId = body?.breakoutId ?? null;
+          if (m.webinar && p.role !== "viewer") {
+            p.webinarLocation = "backstage";
+            m.webinar.revision++;
+          }
           moved.push(structuredClone(p));
         }
         if (route === "close-breakouts") m.breakouts = [];

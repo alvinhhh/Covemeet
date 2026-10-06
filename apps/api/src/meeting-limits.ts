@@ -1,4 +1,4 @@
-import { fenceParticipantMedia } from "./media-identity.js";
+import { fenceParticipantMedia, webinarBackstage } from "./media-identity.js";
 import type { Meeting, Participant } from "./store.js";
 import { HttpError } from "./security.js";
 import { z } from "zod";
@@ -243,6 +243,26 @@ export function meetingAllowed(m: Meeting, now = Date.now()) {
         m.hosted.entitlement.allowed &&
         m.hosted.entitlement.quota
       ))
+  );
+}
+
+export function participantMediaAllowed(
+  m: Meeting,
+  p: Participant,
+  now = Date.now(),
+) {
+  return (
+    meetingAllowed(m, now) &&
+    p.status === "admitted" &&
+    !p.enforcementPending &&
+    p.expiresAt > now &&
+    (!p.phone || p.phone.leaseExpiresAt > now) &&
+    !(
+      m.mode === "webinar" &&
+      m.webinar &&
+      ((p.role === "viewer" && m.webinar.phase !== "live") ||
+        (m.webinar.starting && webinarBackstage(m, p)))
+    )
   );
 }
 

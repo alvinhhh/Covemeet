@@ -56,6 +56,10 @@ import { ChatUnread } from "./chat-state";
 import { Whiteboard } from "./whiteboard";
 import { type Viewport } from "./whiteboard-state";
 import { SpeakingBadge } from "./speaking-badge";
+import {
+  participantMediaAllowed,
+  participantRoomScope,
+} from "./webinar-state";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
 let initialHostToken = location.pathname.startsWith("/host/")
@@ -1122,7 +1126,8 @@ function Conference({
     {},
   );
   const [unreadChat, setUnreadChat] = useState(0);
-  const chatRoom = `${state.meeting.code}:${state.me.id}:${state.me.breakoutId ?? "main"}`;
+  const roomScope = participantRoomScope(state.meeting.mode, state.me);
+  const chatRoom = `${state.meeting.code}:${state.me.id}:${roomScope}`;
   const chatRecipient = chatRecipients[chatRoom] ?? "everyone";
   const chatDraftKey = `${chatRoom}:${chatRecipient}`;
   useEffect(() => {
@@ -1159,17 +1164,24 @@ function Conference({
     token: string;
     url: string;
     version: number;
+    scope: string;
   }>();
+  const mediaAllowed = participantMediaAllowed(state.me);
   const credentials =
     issuedCredentials?.version === state.me.mediaVersion &&
-    !state.me.enforcementPending
+    issuedCredentials.scope === roomScope &&
+    mediaAllowed
       ? issuedCredentials
       : undefined;
+  const visibleAudioSignals = credentials
+    ? audioSignals
+    : new Map<string, AudioSignal>();
   const [mediaError, setMediaError] = useState("");
   const [attempt, setAttempt] = useState(0);
   const host = state.me.role === "host";
   const moderator = host || !!state.me.moderator;
   const canEnd = state.meeting.canEnd ?? host;
+  const webinar = state.meeting.webinar;
   const successors = state.participants.filter(
     (p) =>
       p.id !== state.me.id &&
@@ -1213,10 +1225,10 @@ function Conference({
   const admitted = state.participants.filter((p) => p.status === "admitted");
   const waiting = state.participants.filter((p) => p.status === "waiting");
   useEffect(() => {
-    if (!config.mediaAvailable || state.me.enforcementPending) return;
-    const controller = new AbortController();
     setMediaError("");
     setCredentials(undefined);
+    if (!config.mediaAvailable || !mediaAllowed) return;
+    const controller = new AbortController();
     api<{ token: string; url: string }>(
       meetingPath(code, "/media"),
       {},
@@ -1236,6 +1248,7 @@ function Conference({
           ...value,
           url: url.href,
           version: state.me.mediaVersion,
+          scope: roomScope,
         });
       })
       .catch((e) => {
@@ -1247,8 +1260,8 @@ function Conference({
     config.mediaAvailable,
     attempt,
     state.me.mediaVersion,
-    state.me.breakoutId,
-    state.me.enforcementPending,
+    roomScope,
+    mediaAllowed,
   ]);
   async function mutate(path: string, body: unknown = {}, method?: string) {
     setError("");
@@ -1259,6 +1272,7 @@ function Conference({
       return true;
     } catch (e) {
       setError(messageOf(e));
+      if (e instanceof ApiError && e.status === 409) refresh();
       return false;
     } finally {
       setBusy(false);
@@ -1279,7 +1293,11 @@ function Conference({
       );
     }
   }
-  const boardScope = `${code}:${state.me.breakoutId ?? "main"}`;
+  const boardScope = `${code}:${roomScope}`;
+  const broadcastHolding =
+    state.meeting.mode === "webinar" &&
+    state.me.role === "viewer" &&
+    webinar?.phase === "backstage";
   const board = (
     <Whiteboard
       key={boardScope}
@@ -1302,22 +1320,26 @@ function Conference({
             setSignals={setAudioSignals}
             board={board}
           />
-        ) : boardOpen ? (
+        ) : boardOpen && mediaAllowed ? (
           board
         ) : (
           <div className="offline-stage">
             <span className="stage-avatar">{initials(state.me.name)}</span>
-            <h2>{state.me.name}</h2>
-            <span>
-              {!config.mediaAvailable
-                ? "Audio and video are not configured"
-                : mediaError
-                  ? "Audio and video unavailable"
-                  : state.me.enforcementPending
-                    ? "Applying host controls…"
-                    : "Connecting audio and video…"}
-            </span>
-            {mediaError && (
+            <h2>
+              {broadcastHolding ? "Broadcast has not started" : state.me.name}
+            </h2>
+            {!broadcastHolding && (
+              <span>
+                {!mediaAllowed
+                  ? "Updating meeting access…"
+                  : !config.mediaAvailable
+                    ? "Audio and video are not configured"
+                    : mediaError
+                      ? "Audio and video unavailable"
+                      : "Connecting audio and video…"}
+              </span>
+            )}
+            {mediaAllowed && mediaError && (
               <>
                 <p>{mediaError}</p>
                 <Button onClick={() => setAttempt((v) => v + 1)}>
@@ -1332,7 +1354,14 @@ function Conference({
         <div className="meeting-caption">
           <Icon name="lock" size={14} />
           {state.meeting.breakouts?.find((r) => r.id === state.me.breakoutId)
-            ?.name || "Main room"}{" "}
+            ?.name ||
+            (state.meeting.mode === "webinar"
+              ? state.me.webinarBackstage
+                ? "Backstage"
+                : state.me.role === "viewer"
+                  ? "Audience"
+                  : "On stage"
+              : "Main room")}{" "}
           · {state.meeting.locked ? "Meeting locked" : "Waiting room enabled"}
           {state.meeting.deadlineAt && (
             <span>
@@ -1365,7 +1394,7 @@ function Conference({
         <main className="meeting-stage">
           {credentials ? (
             <LiveKitRoom
-              key={`${attempt}-${state.me.mediaVersion}`}
+              key={`${attempt}-${state.me.mediaVersion}-${roomScope}`}
               token={credentials.token}
               serverUrl={credentials.url}
               connect
@@ -1418,7 +1447,11 @@ function Conference({
                 {panel === "participants"
                   ? "Participants"
                   : panel === "chat"
-                    ? "Meeting chat"
+                    ? state.meeting.mode === "webinar"
+                      ? state.me.webinarBackstage
+                        ? "Backstage chat"
+                        : "Webinar chat"
+                      : "Meeting chat"
                     : panel === "breakouts"
                       ? "Breakout rooms"
                       : panel === "phone"
@@ -1439,7 +1472,7 @@ function Conference({
             {panel === "participants" ? (
               <Participants
                 state={state}
-                signals={audioSignals}
+                signals={visibleAudioSignals}
                 busy={busy}
                 openPhone={
                   host && config.phoneAvailable
@@ -1453,6 +1486,18 @@ function Conference({
                   mutate(
                     `/participants/${encodeURIComponent(id)}/moderator`,
                     { enabled },
+                    "PUT",
+                  )
+                }
+                stage={(id, location) =>
+                  mutate(
+                    `/webinar/participants/${encodeURIComponent(id)}`,
+                    {
+                      location,
+                      expectedRevision: webinar?.revision,
+                      expectedControlRevision:
+                        state.meeting.controlRevision ?? 0,
+                    },
                     "PUT",
                   )
                 }
@@ -1521,7 +1566,7 @@ function Conference({
           <SpeakingBadge
             surface="dock"
             name={state.me.name}
-            signal={audioSignals.get(participantMediaIdentity(state.me))}
+            signal={visibleAudioSignals.get(participantMediaIdentity(state.me))}
           />
         </span>
         <div className="meeting-dock">
@@ -1576,6 +1621,7 @@ function Conference({
               aria-label={boardOpen ? "Close whiteboard" : "Open whiteboard"}
               title={boardOpen ? "Close whiteboard" : "Open whiteboard"}
               aria-pressed={boardOpen}
+              disabled={!mediaAllowed}
               onClick={() => setBoardOpen((open) => !open)}
             >
               <Icon name="pen" />
@@ -1658,11 +1704,49 @@ function Conference({
           <h1>{state.meeting.title}</h1>
           <span>
             {state.meeting.mode === "webinar" ? "Webinar" : "Meeting"}
+            {webinar && (
+              <>
+                {" · "}
+                {webinar.phase === "backstage"
+                  ? state.me.role === "viewer"
+                    ? "Not live"
+                    : "Backstage"
+                  : webinar.phase === "live"
+                    ? "Live"
+                    : "Ended"}
+              </>
+            )}
             <i /> {admitted.length}{" "}
             {admitted.length === 1 ? "participant" : "participants"}
           </span>
         </div>
         <div className="meeting-header-actions">
+          {webinar?.canManage && webinar.phase === "backstage" && (
+            <Button
+              className="primary webinar-control"
+              disabled={busy}
+              onClick={() =>
+                void mutate("/webinar/start", {
+                  expectedRevision: webinar.revision,
+                  expectedControlRevision: state.meeting.controlRevision ?? 0,
+                })
+              }
+            >
+              Go live
+            </Button>
+          )}
+          {webinar?.canManage && webinar.phase === "live" && canEnd && (
+            <Button
+              className="danger webinar-control"
+              disabled={busy}
+              onClick={() => {
+                if (window.confirm("End this broadcast for everyone?"))
+                  void mutate("/end");
+              }}
+            >
+              End broadcast
+            </Button>
+          )}
           {state.meeting.recordingActive && (
             <span className="recording-status">
               <span />
@@ -1752,11 +1836,19 @@ function Conference({
               className="danger"
               disabled={busy}
               onClick={() => {
-                if (window.confirm("End this meeting for everyone?"))
+                if (
+                  window.confirm(
+                    webinar
+                      ? "End this webinar for everyone?"
+                      : "End this meeting for everyone?",
+                  )
+                )
                   void mutate("/end");
               }}
             >
-              End for everyone
+              {webinar?.phase === "live"
+                ? "End broadcast"
+                : "End for everyone"}
             </Button>
           )}
         </div>
@@ -1804,7 +1896,12 @@ function MediaStage({
       track,
     })),
     participants,
-    { localId: me.id, mode, breakoutId: me.breakoutId },
+    {
+      localId: me.id,
+      mode,
+      breakoutId: me.breakoutId,
+      webinarBackstage: me.webinarBackstage,
+    },
     page,
   );
   const visible = selection.visible.map(({ track }) => track);
@@ -2280,6 +2377,7 @@ function Participants({
   busy,
   action,
   grant,
+  stage,
   openPhone,
 }: {
   state: MeetingState;
@@ -2287,6 +2385,7 @@ function Participants({
   busy: boolean;
   action: (id: string, data: object) => Promise<boolean>;
   grant: (id: string, enabled: boolean) => Promise<boolean>;
+  stage: (id: string, location: "backstage" | "stage") => Promise<boolean>;
   openPhone?: () => void;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -2303,6 +2402,11 @@ function Participants({
     p.role !== "host" &&
     (host || !p.moderator);
   const webinar = state.meeting.webinar;
+  const canStage = (p: Participant) =>
+    !!webinar?.canManage &&
+    webinar.phase !== "ended" &&
+    p.role !== "viewer" &&
+    (p.role !== "host" || p.id === state.me.id);
   const stageFull = !!webinar && webinar.presenters >= webinar.presenterLimit;
   const audienceFull = !!webinar && webinar.viewers >= webinar.viewerLimit;
   const waiting = state.participants.filter((p) => p.status === "waiting");
@@ -2366,7 +2470,7 @@ function Participants({
       )}
       {moderator && webinar && (
         <p className="panel-note">
-          Stage: {webinar.presenters}/{webinar.presenterLimit} · Audience:{" "}
+          Presenters: {webinar.presenters}/{webinar.presenterLimit} · Audience:{" "}
           {webinar.viewers}/{webinar.viewerLimit}
         </p>
       )}
@@ -2405,6 +2509,18 @@ function Participants({
                         ? "Presenter"
                         : "Participant"}
               </small>
+              {webinar && p.role !== "viewer" && (
+                <small>
+                  {p.enforcementPending
+                    ? "Changing location…"
+                    : p.webinarBackstage
+                      ? webinar.phase === "backstage" &&
+                        p.webinarLocation === "stage"
+                        ? "Backstage · Selected for stage"
+                        : "Backstage"
+                      : "On stage"}
+                </small>
+              )}
               {p.transport === "phone" && (
                 <small>
                   {!p.audioAllowed
@@ -2443,6 +2559,33 @@ function Participants({
               </button>
             )}
           </div>
+          {canStage(p) && (
+            <div className="webinar-stage-action">
+              <Button
+                className="small"
+                disabled={busy || !!p.enforcementPending}
+                aria-label={
+                  p.webinarLocation === "backstage"
+                    ? `${webinar?.phase === "backstage" ? "Select" : "Move"} ${p.id === state.me.id ? "yourself" : p.name} ${webinar?.phase === "backstage" ? "for" : "to"} stage`
+                    : `${webinar?.phase === "backstage" ? "Remove" : "Move"} ${p.id === state.me.id ? "yourself" : p.name} ${webinar?.phase === "backstage" ? "from stage" : "backstage"}`
+                }
+                onClick={() =>
+                  void stage(
+                    p.id,
+                    p.webinarLocation === "backstage" ? "stage" : "backstage",
+                  )
+                }
+              >
+                {p.webinarLocation === "backstage"
+                  ? webinar?.phase === "backstage"
+                    ? "Select for stage"
+                    : "Move to stage"
+                  : webinar?.phase === "backstage"
+                    ? "Remove from stage"
+                    : "Move backstage"}
+              </Button>
+            </div>
+          )}
           {canControl(p) && expanded === p.id && (
             <div className="participant-actions">
               <button
@@ -2450,8 +2593,8 @@ function Participants({
                 title={
                   p.role === "viewer"
                     ? p.transport === "phone"
-                      ? "Invite to stage to allow speaking"
-                      : "Invite to stage to allow devices"
+                      ? "Make presenter to allow speaking"
+                      : "Make presenter to allow devices"
                     : undefined
                 }
                 onClick={() =>
@@ -2473,7 +2616,7 @@ function Participants({
                   disabled={busy || p.role === "viewer"}
                   title={
                     p.role === "viewer"
-                      ? "Invite to stage to allow devices"
+                      ? "Make presenter to allow devices"
                       : undefined
                   }
                   onClick={() =>
@@ -2492,7 +2635,7 @@ function Participants({
                   disabled={busy || p.role === "viewer"}
                   title={
                     p.role === "viewer"
-                      ? "Invite to stage to allow screen sharing"
+                      ? "Make presenter to allow screen sharing"
                       : undefined
                   }
                   onClick={() =>
@@ -2569,7 +2712,7 @@ function Participants({
                     })
                   }
                 >
-                  {p.role === "viewer" ? "Invite to stage" : "Move to audience"}
+                  {p.role === "viewer" ? "Make presenter" : "Move to audience"}
                 </button>
               )}
               <button
@@ -3067,6 +3210,10 @@ function Recordings({
   const active = state.recordings.some((r) =>
     ["starting", "recording", "active", "stopping"].includes(r.status),
   );
+  const broadcastReady =
+    state.meeting.mode !== "webinar" ||
+    !state.meeting.webinar ||
+    state.meeting.webinar.phase === "live";
   const recordingUsage = state.meeting.usage?.recordingSeconds;
   const phonePresent = state.participants.some(
     (participant) =>
@@ -3203,12 +3350,16 @@ function Recordings({
               recording announcements are not configured.
             </Notice>
           )}
+          {!broadcastReady && (
+            <Notice kind="info">Go live before starting a recording.</Notice>
+          )}
           <Button
             className="primary full-width"
             disabled={
               busy ||
               !state.meeting.recordingAllowed ||
               !(verified || state.meeting.hostEmailVerified) ||
+              !broadcastReady ||
               phonePresent ||
               active
             }

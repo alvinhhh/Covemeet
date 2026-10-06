@@ -8,12 +8,28 @@ export const mediaIdentity = (p: Participant) => p.mediaIdentity ?? p.id;
 export const retiredMediaIdentity = (p: Participant) =>
   p.previousMediaIdentity ?? mediaIdentity(p);
 
+// Legacy webinars without lifecycle metadata remain on their existing live room.
+export function webinarBackstage(m: Meeting, p: Participant) {
+  return !!(
+    m.mode === "webinar" &&
+    m.webinar &&
+    !p.breakoutId &&
+    p.role !== "viewer" &&
+    (m.webinar.phase === "backstage" || p.webinarLocation !== "stage")
+  );
+}
+export function participantRoom(m: Meeting, p: Participant) {
+  if (p.breakoutId)
+    return m.breakouts.find((b) => b.id === p.breakoutId)?.room ?? m.room;
+  return webinarBackstage(m, p) ? m.webinar!.backstageRoom : m.room;
+}
+export const participantDataScope = (m: Meeting, p: Participant) =>
+  p.breakoutId ?? (webinarBackstage(m, p) ? "@backstage" : "");
+
 export function fenceParticipantMedia(m: Meeting, p: Participant) {
   // Pending cleanup owns this immutable target even if another restriction arrives.
   p.previousMediaIdentity ??= mediaIdentity(p);
-  p.previousRoom ??= p.breakoutId
-    ? (m.breakouts.find((b) => b.id === p.breakoutId)?.room ?? m.room)
-    : m.room;
+  p.previousRoom ??= participantRoom(m, p);
   p.mediaIdentity = randomUUID();
   p.mediaVersion++;
   p.enforcementPending = true;

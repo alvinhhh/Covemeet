@@ -39,6 +39,8 @@ export function Chat({
   const last = state.messages.at(-1);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const host = state.me.role === "host";
+  const backstage =
+    state.meeting.mode === "webinar" && state.me.webinarBackstage === true;
   const mode = state.meeting.chatMode ?? "everyone";
   const target = state.participants.find((entry) => entry.id === recipient);
   const unavailable =
@@ -58,7 +60,9 @@ export function Chat({
           : "";
   const messageLabel =
     recipient === "everyone"
-      ? "Message this room"
+      ? backstage
+        ? "Message backstage"
+        : "Message this room"
       : recipient === "host"
         ? "Message host"
         : `Message ${target?.name ?? "participant"}`;
@@ -225,7 +229,7 @@ export function Chat({
             disabled={busy}
             onClick={() => setRecipient("everyone")}
           >
-            Everyone
+            {backstage ? "Backstage" : "Everyone"}
           </button>
           {!host && (
             <button

@@ -11,6 +11,7 @@ import {
   endMeeting,
   refreshHostPresence,
   meetingAllowed,
+  participantMediaAllowed,
   meetingDeadline,
   requireMeetingAccess,
 } from "./meeting-limits.js";
@@ -54,6 +55,8 @@ export class LiveMedia implements Media {
   }
   async token(m: Meeting, p: Participant) {
     requireMeetingAccess(m);
+    if (!participantMediaAllowed(m, p))
+      throw new HttpError(403, "Media is unavailable in this room");
     if (!this.available)
       throw new HttpError(503, "Media server is not configured");
     const token = new AccessToken(
@@ -101,15 +104,11 @@ export class LiveMedia implements Media {
     const p = m?.participants.find((x) => mediaIdentity(x) === c.sub);
     if (
       !m ||
-      !meetingAllowed(m) ||
       !p ||
-      p.status !== "admitted" ||
-      p.enforcementPending ||
+      !participantMediaAllowed(m, p) ||
       gatewayPresenceExpired(p) ||
       (p.meter &&
         (p.meter.phase === "closing" || p.meter.fundedUntil <= Date.now())) ||
-      p.expiresAt < Date.now() ||
-      (p.phone && p.phone.leaseExpiresAt <= Date.now()) ||
       (p.transport === "phone" && !this.config.phoneEnabled) ||
       data.v !== p.mediaVersion ||
       room !== participantRoom(m, p)
@@ -142,7 +141,11 @@ export class LiveMedia implements Media {
         for (const ws of this.sockets.get(identity) ?? [])
           ws.close(4003, "Meeting ended");
     if (this.available)
-      for (const room of [m.room, ...m.breakouts.map((b) => b.room)])
+      for (const room of [
+        m.room,
+        ...(m.webinar ? [m.webinar.backstageRoom] : []),
+        ...m.breakouts.map((b) => b.room),
+      ])
         try {
           await this.client.deleteRoom(room);
         } catch (e) {
@@ -191,14 +194,10 @@ export class LiveMedia implements Media {
             const member = state.participants.find((x) => x.id === expected.id);
             if (
               !member ||
-              !meetingAllowed(state) ||
-              member.status !== "admitted" ||
-              member.enforcementPending ||
+              !participantMediaAllowed(state, member) ||
               gatewayPresenceExpired(member) ||
               member.mediaVersion !== expected.mediaVersion ||
               mediaIdentity(member) !== mediaIdentity(expected) ||
-              member.expiresAt <= Date.now() ||
-              (member.phone && member.phone.leaseExpiresAt <= Date.now()) ||
               !safeEqual(member.tokenHash, digest(cookie))
             )
               throw new HttpError(403, "Media session changed");
@@ -290,8 +289,9 @@ export class LiveMedia implements Media {
                 const member = current?.participants.find((x) => x.id === p.id);
                 if (
                   !current ||
-                  !meetingAllowed(current) ||
-                  member?.meter?.connectionId !== connectionId ||
+                  !member ||
+                  !participantMediaAllowed(current, member) ||
+                  member.meter?.connectionId !== connectionId ||
                   member.meter.phase === "closing"
                 )
                   return stop();
@@ -325,8 +325,7 @@ export class LiveMedia implements Media {
                 member.gatewayPresenceUntil ?? 0,
               );
               if (
-                !meetingAllowed(state) ||
-                member.status !== "admitted" ||
+                !participantMediaAllowed(state, member) ||
                 deadline <= Date.now() ||
                 Date.now() - Math.min(clientPongAt, upstreamPongAt) >=
                   GATEWAY_PRESENCE_MS
@@ -342,10 +341,7 @@ export class LiveMedia implements Media {
                     !live ||
                     !ownsGatewayConnection(live, p, connectionId) ||
                     gatewayPresenceExpired(live) ||
-                    !meetingAllowed(current) ||
-                    live.status !== "admitted" ||
-                    live.expiresAt <= Date.now() ||
-                    (live.phone && live.phone.leaseExpiresAt <= Date.now())
+                    !participantMediaAllowed(current, live)
                   )
                     throw new HttpError(403, "Media session changed");
                   live.gatewayPresenceUntil = Date.now() + GATEWAY_PRESENCE_MS;
@@ -417,12 +413,8 @@ export class LiveMedia implements Media {
                 const current = fresh?.participants.find((x) => x.id === p.id);
                 if (
                   !fresh ||
-                  !meetingAllowed(fresh) ||
-                  current?.status !== "admitted" ||
-                  current.expiresAt <= Date.now() ||
-                  (current.phone &&
-                    current.phone.leaseExpiresAt <= Date.now()) ||
-                  current.enforcementPending ||
+                  !current ||
+                  !participantMediaAllowed(fresh, current) ||
                   (metered &&
                     (current.meter?.connectionId !== connectionId ||
                       current.meter.phase !== "active" ||

@@ -638,9 +638,13 @@ test("only the host grants screen sharing independently of camera and stage", as
   assert.equal((await state()).json().me.videoAllowed, true);
   assert.equal((await state()).json().me.screenShareAllowed, false);
   rejected(
-    await guest.client.request("POST", `${path}/participants/${guest.id}/action`, {
-      action: "allow-screen-share",
-    }),
+    await guest.client.request(
+      "POST",
+      `${path}/participants/${guest.id}/action`,
+      {
+        action: "allow-screen-share",
+      },
+    ),
   );
 
   const cohost = await f.join(meeting.code, "198.51.100.31");
@@ -1231,6 +1235,18 @@ test("webinar viewers cannot publish until the host grants presenter permissions
       ),
     );
   }
+  assert.equal(
+    (await viewer.client.request("POST", `/api/meetings/${m.code}/media`, {}))
+      .statusCode,
+    403,
+  );
+  ok(
+    await f.host.request("POST", `/api/meetings/${m.code}/webinar/start`, {
+      expectedRevision: 0,
+      expectedControlRevision: (await f.store.get(m.code))!.hostControl!
+        .revision,
+    }),
+  );
   ok(await viewer.client.request("POST", `/api/meetings/${m.code}/media`, {}));
   assert.equal(f.media.issued.at(-1)?.participant.role, "viewer");
   assert.equal(f.media.issued.at(-1)?.participant.audioAllowed, false);
@@ -1619,7 +1635,9 @@ test("poll limits reject forged cookie and code rotation before further store re
     observed.push({
       route,
       ipv6,
-      initialLookupsDenied: statuses.slice(0, 90).every((status) => status === 404),
+      initialLookupsDenied: statuses
+        .slice(0, 90)
+        .every((status) => status === 404),
       limitedStatuses: statuses.slice(90),
       storeReads: atLimit - before,
       readsAfterLimit: reads.callCount() - atLimit,
@@ -2419,4 +2437,355 @@ test("a departed successor starts absence grace without promoting or refreshing 
     reconcileHostAbsence(m, 300);
   });
   assert.equal((await f.store.get(room.code))!.ended, true);
+});
+
+test("webinar backstage keeps audience media, roster, chat and whiteboard separate", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting({ mode: "webinar" });
+  const path = `/api/meetings/${room.code}`;
+  const presenter = await f.join(room.code);
+  const viewer = await f.join(room.code, "198.51.100.22");
+  for (const p of [presenter, viewer]) await f.action(room.code, p.id, "admit");
+  await f.action(room.code, presenter.id, "promote");
+  const before = (await f.store.get(room.code))!;
+  assert.equal(before.webinar!.phase, "backstage");
+  assert.equal(
+    before.participants.find((p) => p.id === presenter.id)!.webinarLocation,
+    "backstage",
+  );
+  ok(
+    await f.host.request("POST", `${path}/messages`, {
+      text: "Private rehearsal",
+    }),
+  );
+  ok(
+    await presenter.client.request("POST", `${path}/messages`, {
+      text: "Presenter rehearsal",
+    }),
+  );
+  ok(
+    await f.host.request("POST", `${path}/broadcast`, {
+      text: "Starting shortly",
+    }),
+  );
+  const privateStroke = randomUUID();
+  ok(
+    await f.host.request("POST", `${path}/whiteboard`, {
+      kind: "stroke",
+      epoch: 0,
+      id: privateStroke,
+      points: [
+        [0, 0],
+        [1, 1],
+      ],
+    }),
+  );
+  const audience = (await viewer.client.request("GET", `${path}/state`)).json();
+  assert.equal(audience.me.mediaAllowed, false);
+  assert.deepEqual(
+    audience.participants.map((p: { id: string }) => p.id),
+    [viewer.id],
+  );
+  assert.deepEqual(
+    audience.messages.map((m: { text: string }) => m.text),
+    ["Starting shortly"],
+  );
+  assert.ok(!JSON.stringify(audience).includes(before.webinar!.backstageRoom));
+  assert.equal(
+    (await viewer.client.request("POST", `${path}/media`, {})).statusCode,
+    403,
+  );
+  assert.deepEqual(
+    (await viewer.client.request("GET", `${path}/whiteboard`)).json().events,
+    [],
+  );
+  assert.equal(
+    (
+      await viewer.client.request("POST", `${path}/whiteboard`, {
+        kind: "clear",
+        epoch: 0,
+        scope: "@backstage",
+      })
+    ).statusCode,
+    400,
+  );
+  assert.equal(
+    (await presenter.client.request("GET", `${path}/whiteboard`)).json()
+      .events[0].id,
+    privateStroke,
+  );
+  const saved = (await f.store.get(room.code))!;
+  assert.ok(
+    !saved.messages.some((m) => m.text.includes("rehearsal")),
+    "Old public-only readers cannot expose backstage messages",
+  );
+  assert.equal(saved.backstageMessages!.length, 2);
+  ok(
+    await f.host.request("POST", `${path}/webinar/start`, {
+      expectedRevision: saved.webinar!.revision,
+      expectedControlRevision: before.hostControl!.revision,
+    }),
+  );
+  const live = (await f.store.get(room.code))!;
+  assert.deepEqual(live.lifecycle, before.lifecycle);
+  assert.deepEqual(live.hosted, before.hosted);
+  const state = (await viewer.client.request("GET", `${path}/state`)).json();
+  assert.equal(state.meeting.webinar.phase, "live");
+  assert.equal(state.me.mediaAllowed, true);
+  assert.ok(
+    state.participants.some((p: { id: string }) => p.id === room.hostId),
+  );
+  assert.ok(
+    !state.participants.some((p: { id: string }) => p.id === presenter.id),
+  );
+  assert.ok(
+    !state.messages.some((m: { text: string }) => m.text.includes("rehearsal")),
+  );
+  assert.deepEqual(
+    (await f.host.request("GET", `${path}/whiteboard`)).json().events,
+    [],
+  );
+  ok(
+    await f.host.request(
+      "PUT",
+      `${path}/webinar/participants/${presenter.id}`,
+      {
+        location: "stage",
+        expectedRevision: live.webinar!.revision,
+        expectedControlRevision: before.hostControl!.revision,
+      },
+    ),
+  );
+  assert.equal(
+    (await presenter.client.request("GET", `${path}/state`)).json().me
+      .webinarBackstage,
+    false,
+  );
+  ok(
+    await presenter.client.request("POST", `${path}/messages`, {
+      text: "Public presentation",
+    }),
+  );
+  assert.ok(
+    (await viewer.client.request("GET", `${path}/state`))
+      .json()
+      .messages.some((m: { text: string }) => m.text === "Public presentation"),
+  );
+  ok(await f.host.request("POST", `${path}/breakouts`, { name: "Discussion" }));
+  const breakout = (await f.store.get(room.code))!.breakouts[0]!;
+  ok(
+    await f.host.request("POST", `${path}/move`, {
+      participantId: presenter.id,
+      breakoutId: breakout.id,
+    }),
+  );
+  ok(await presenter.client.request("POST", `${path}/return-main`, {}));
+  const returned = (
+    await presenter.client.request("GET", `${path}/state`)
+  ).json();
+  assert.equal(
+    returned.me.webinarBackstage,
+    true,
+    "Returning from a breakout does not silently go on stage",
+  );
+  assert.equal(
+    (
+      await viewer.client.request("POST", `${path}/move`, {
+        participantId: viewer.id,
+        breakoutId: "@backstage",
+      })
+    ).statusCode,
+    403,
+  );
+});
+
+test("webinar start fences old backstage identities and never commits live after failed cleanup or changed control", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting({ mode: "webinar" });
+  const path = `/api/meetings/${room.code}`;
+  const viewer = await f.join(room.code);
+  await f.action(room.code, viewer.id, "admit");
+  const before = (await f.store.get(room.code))!;
+  const originalHost = before.participants.find((p) => p.id === room.hostId)!;
+  let fail = true;
+  const removals: Participant[] = [];
+  f.media.remove = async (_m, p) => {
+    removals.push(structuredClone(p));
+    if (fail) throw new Error("unavailable");
+  };
+  const input = {
+    expectedRevision: 0,
+    expectedControlRevision: before.hostControl!.revision,
+  };
+  assert.equal(
+    (await f.host.request("POST", `${path}/webinar/start`, input)).statusCode,
+    503,
+  );
+  const pending = (await f.store.get(room.code))!;
+  assert.equal(pending.webinar!.phase, "backstage");
+  assert.equal(pending.webinar!.starting, true);
+  assert.equal(removals[0]!.previousRoom, before.webinar!.backstageRoom);
+  assert.equal(removals[0]!.previousMediaIdentity, originalHost.id);
+  for (const client of [f.host, viewer.client])
+    assert.equal(
+      (await client.request("POST", `${path}/media`, {})).statusCode,
+      403,
+    );
+  fail = false;
+  ok(await f.host.request("POST", `${path}/webinar/start`, input));
+  assert.equal(
+    removals[1]!.previousMediaIdentity,
+    removals[0]!.previousMediaIdentity,
+  );
+  assert.equal(removals[1]!.mediaVersion, removals[0]!.mediaVersion);
+  assert.equal((await f.store.get(room.code))!.webinar!.phase, "live");
+  assert.equal(
+    (await f.host.request("POST", `${path}/webinar/start`, input)).statusCode,
+    409,
+    "Old revision cannot replay",
+  );
+  const live = (await f.store.get(room.code))!;
+  await f.store.change(room.code, (m) => {
+    m.hostControl!.revision++;
+  });
+  assert.equal(
+    (
+      await f.host.request(
+        "PUT",
+        `${path}/webinar/participants/${room.hostId}`,
+        {
+          location: "backstage",
+          expectedRevision: live.webinar!.revision,
+          expectedControlRevision: before.hostControl!.revision,
+        },
+      )
+    ).statusCode,
+    409,
+  );
+  assert.equal(
+    (await f.store.get(room.code))!.participants.find(
+      (p) => p.id === room.hostId,
+    )!.webinarLocation,
+    "stage",
+  );
+});
+
+test("webinar only the selected current controller can run the broadcast; revoked delegates and legacy rooms stay bounded", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting({ mode: "webinar" });
+  const path = `/api/meetings/${room.code}`;
+  const guest = await f.join(room.code);
+  await f.action(room.code, guest.id, "admit");
+  await f.action(room.code, guest.id, "promote");
+  ok(
+    await f.host.request("PUT", `${path}/participants/${guest.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  let saved = (await f.store.get(room.code))!;
+  assert.equal(
+    (
+      await guest.client.request("POST", `${path}/webinar/start`, {
+        expectedRevision: saved.webinar!.revision,
+        expectedControlRevision: saved.hostControl!.revision,
+      })
+    ).statusCode,
+    403,
+  );
+  ok(
+    await f.host.request("POST", `${path}/handoff`, {
+      participantId: guest.id,
+      grantRevision: saved.participants.find((p) => p.id === guest.id)!
+        .moderator!.revision,
+      expectedRevision: saved.hostControl!.revision,
+      requestId: randomUUID(),
+    }),
+  );
+  saved = (await f.store.get(room.code))!;
+  ok(
+    await guest.client.request(
+      "PUT",
+      `${path}/webinar/participants/${guest.id}`,
+      {
+        location: "stage",
+        expectedRevision: saved.webinar!.revision,
+        expectedControlRevision: saved.hostControl!.revision,
+      },
+    ),
+  );
+  saved = (await f.store.get(room.code))!;
+  const start = {
+    expectedRevision: saved.webinar!.revision,
+    expectedControlRevision: saved.hostControl!.revision,
+  };
+  ok(await guest.client.request("POST", `${path}/webinar/start`, start));
+  await f.store.change(room.code, (m) => {
+    delete m.participants.find((p) => p.id === guest.id)!.moderator;
+  });
+  assert.equal(
+    (await guest.client.request("POST", `${path}/webinar/start`, start))
+      .statusCode,
+    403,
+  );
+  const legacy = await f.meeting({ mode: "webinar" });
+  await f.store.change(legacy.code, (m) => {
+    delete m.webinar;
+  });
+  const viewer = await f.join(legacy.code, "198.51.100.23");
+  await f.action(legacy.code, viewer.id, "admit");
+  ok(
+    await viewer.client.request(
+      "POST",
+      `/api/meetings/${legacy.code}/media`,
+      {},
+    ),
+  );
+  assert.equal(
+    (
+      await viewer.client.request("GET", `/api/meetings/${legacy.code}/state`)
+    ).json().meeting.webinar.phase,
+    "live",
+  );
+});
+
+test("webinar start rechecks control after physical removal before committing live", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting({ mode: "webinar" });
+  const path = `/api/meetings/${room.code}`;
+  const before = (await f.store.get(room.code))!;
+  let rotate = true;
+  f.media.remove = async () => {
+    if (rotate) {
+      rotate = false;
+      await f.store.change(room.code, (m) => {
+        m.hostControl!.revision++;
+      });
+    }
+  };
+  const command = {
+    expectedRevision: before.webinar!.revision,
+    expectedControlRevision: before.hostControl!.revision,
+  };
+  assert.equal(
+    (await f.host.request("POST", `${path}/webinar/start`, command)).statusCode,
+    409,
+  );
+  const pending = (await f.store.get(room.code))!;
+  assert.equal(pending.webinar!.phase, "backstage");
+  assert.equal(pending.webinar!.starting, true);
+  assert.equal(
+    pending.participants.some((p) => p.enforcementPending),
+    false,
+  );
+  assert.equal(
+    (await f.host.request("POST", `${path}/media`, {})).statusCode,
+    403,
+  );
+  ok(
+    await f.host.request("POST", `${path}/webinar/start`, {
+      ...command,
+      expectedControlRevision: pending.hostControl!.revision,
+    }),
+  );
+  assert.equal((await f.store.get(room.code))!.webinar!.phase, "live");
 });
