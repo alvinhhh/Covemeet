@@ -170,6 +170,10 @@ export function loadConfig(env = process.env) {
     meetingParticipantLimit,
     webinarParticipantLimit,
     meetingDurationSeconds,
+    hostAbsenceGraceSeconds:
+      edition === "hosted"
+        ? 300
+        : boundedLimit("HOST_ABSENCE_GRACE_SECONDS", 300, 1800, 30),
     freeMaxActiveRooms,
     secret,
     origin,

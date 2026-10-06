@@ -37,6 +37,11 @@ import { PhoneService, revokePhoneParticipants } from "./phone.js";
 import { PhoneDialogService } from "./phone-dialogs.js";
 import {
   applyGroupDuration,
+  meetingController,
+  controllerPresent,
+  reclaimHostControl,
+  refreshHostPresence,
+  reconcileHostAbsence,
   endMeeting,
   entitlementSchema,
   meetingAllowed,
@@ -312,6 +317,13 @@ export async function createApp(config: Config, store: Store, media: Media) {
       p.expiresAt > Date.now() &&
       meetingAllowed(m)
     );
+  }
+  function canEndMeeting(m: Meeting, p: Participant) {
+    if (p.role === "host") return p.status === "admitted";
+    if (meetingController(m)?.id !== p.id) return false;
+    // Ending fences media before cleanup. The same current delegate may retry
+    // that cleanup, but a revoked/replaced grant or session cannot gain access.
+    return m.ended ? !m.hosted?.revoked : canModerate(m, p);
   }
   function moderationActor(req: FastifyRequest, m: Meeting) {
     const p = actor(req, m);
@@ -690,6 +702,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
       chatMode: "everyone",
       createdAt: Date.now(),
       revision: 1,
+      hostControl: {
+        revision: 0,
+        graceSeconds: config.hostAbsenceGraceSeconds,
+        lastSeenAt: Date.now(),
+      },
       passwordHash: await passwordHash(body.password),
       hostTokenHash: digest(hostToken),
       hostTokenExpiresAt: Date.now() + 30 * 60000,
@@ -823,7 +840,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
             ? "not-started"
             : m.ended
               ? "ending"
-              : m.participants.find((p) => p.role === "host")?.status === "left"
+              : !controllerPresent(m)
                 ? "orphaned"
                 : "active",
         })),
@@ -871,9 +888,13 @@ export async function createApp(config: Config, store: Store, media: Media) {
       const recordingsAvailable = await store.withHostedRecordingAccess(
         code,
         (m) => {
-          if (m.hosted!.accountId !== accountId || m.hosted!.version !== version)
+          if (
+            m.hosted!.accountId !== accountId ||
+            m.hosted!.version !== version
+          )
             throw new HttpError(403, "Meeting creator is unavailable");
-          if (!retainedRecordings(m).some((r) => r.status === "ready")) return false;
+          if (!retainedRecordings(m).some((r) => r.status === "ready"))
+            return false;
           m.recordingAccess = {
             identity: {
               accountId,
@@ -1167,6 +1188,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         host.expiresAt = Date.now() + 12 * 60 * 60_000;
         Object.assign(host, identity(req, reply, m.code));
         m.hostReentry.phase = "consumed";
+        reclaimHostControl(m, config.hostAbsenceGraceSeconds);
         delete m.hostTokenHash;
         return host.id;
       });
@@ -1194,6 +1216,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         if (m.hostReentry) m.hostReentry.phase = "consumed";
         delete m.hostTokenHash;
         p.status = "admitted";
+        reclaimHostControl(m, config.hostAbsenceGraceSeconds);
         p.tokenHash = digest(session);
         p.expiresAt = Date.now() + 43200000;
         Object.assign(p, identity(req, reply, m.code));
@@ -1290,6 +1313,31 @@ export async function createApp(config: Config, store: Store, media: Media) {
           cookieOpts,
         );
       }
+      if (
+        m.lifecycle &&
+        meetingAllowed(m) &&
+        meetingController(m)?.id === p.id &&
+        !p.enforcementPending &&
+        (!m.hostControl ||
+          m.hostControl.lastSeenAt <= Date.now() - 10_000 ||
+          m.hostControl.absentSince !== undefined)
+      ) {
+        m = await store.change(m.code, (current) => {
+          const member = actor(req, current);
+          if (
+            meetingAllowed(current) &&
+            current.lifecycle &&
+            meetingController(current)?.id === member.id &&
+            !member.enforcementPending
+          ) {
+            if (!current.hostControl)
+              reclaimHostControl(current, config.hostAbsenceGraceSeconds);
+            refreshHostPresence(current, member);
+          }
+          return structuredClone(current);
+        });
+        p = actor(req, m);
+      }
       const pub = (x: Participant) => ({
         transport: x.transport ?? "browser",
         ...(x.phone
@@ -1305,6 +1353,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         name: x.name,
         role: x.role,
         moderator: canModerate(m, x),
+        moderatorRevision: x.moderator?.revision,
         status: x.status,
         audioAllowed: x.audioAllowed,
         videoAllowed: x.videoAllowed,
@@ -1342,6 +1391,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
           locked: m.locked,
           ended: !meetingAllowed(m),
           cleanupPending: !!m.cleanupPending,
+          controllerId: meetingController(m)?.id,
+          controlRevision: m.hostControl?.revision ?? 0,
+          hostAbsentSince: m.hostControl?.absentSince,
+          canEnd: canEndMeeting(m, p),
           participantLimit: participantLimit(m),
           startedAt: m.lifecycle?.startedAt,
           deadlineAt: m.lifecycle?.deadlineAt,
@@ -1608,22 +1661,147 @@ export async function createApp(config: Config, store: Store, media: Media) {
     return { ok: true };
   });
   app.post("/api/meetings/:code/end", async (req, reply) => {
+    let actorId!: string;
     const m = await store.change(codeOf(req), (m) => {
-      actor(req, m, true);
+      const p = actor(req, m);
+      actorId = p.id;
+      if (!canEndMeeting(m, p))
+        throw new HttpError(403, "Host permission required");
       endMeeting(m);
       return structuredClone(m);
     });
     const complete = await cleanupMeeting(m);
-    await store.audit(m.code, "host", "meeting.end");
+    await store.audit(m.code, actorId, "meeting.end");
     return reply
       .code(complete ? 200 : 202)
       .send({ ok: true, cleanupPending: !complete });
+  });
+  app.post("/api/meetings/:code/handoff", async (req, reply) => {
+    const body = z
+      .object({
+        participantId: z.string().uuid(),
+        grantRevision: z.number().int().safe().nonnegative(),
+        expectedRevision: z.number().int().safe().nonnegative(),
+        requestId: z.string().uuid(),
+      })
+      .strict()
+      .parse(req.body);
+    const result = await store.change(codeOf(req), (m) => {
+      active(m);
+      const owner = actor(req, m);
+      if (owner.role !== "host")
+        throw new HttpError(403, "Host permission required");
+      const control = m.hostControl;
+      const prior = control?.handoff;
+      if (
+        prior?.requestId === body.requestId &&
+        control!.revision === body.expectedRevision + 1 &&
+        prior.participantId === body.participantId &&
+        prior.grantRevision === body.grantRevision &&
+        safeEqual(prior.ownerSessionHash, owner.tokenHash) &&
+        owner.status === "left" &&
+        prior.ownerMediaVersion === owner.mediaVersion
+      )
+        return {
+          meeting: structuredClone(m),
+          owner: structuredClone(owner),
+          created: false,
+        };
+      if (
+        !m.lifecycle ||
+        owner.status !== "admitted" ||
+        owner.enforcementPending ||
+        (control?.revision ?? 0) !== body.expectedRevision
+      )
+        throw new HttpError(409, "Host control changed");
+      const target = m.participants.find((p) => p.id === body.participantId);
+      if (
+        !target ||
+        target.role === "host" ||
+        !canModerate(m, target) ||
+        target.moderator?.revision !== body.grantRevision ||
+        target.moderator.grantedBy !== owner.id
+      )
+        throw new HttpError(409, "Select a current co-host");
+      owner.status = "left";
+      fenceParticipantMedia(m, owner);
+      reclaimHostControl(m, config.hostAbsenceGraceSeconds);
+      m.hostControl!.handoff = {
+        requestId: body.requestId,
+        participantId: target.id,
+        grantRevision: body.grantRevision,
+        ownerSessionHash: owner.tokenHash,
+        ownerMediaVersion: owner.mediaVersion,
+      };
+      return {
+        meeting: structuredClone(m),
+        owner: structuredClone(owner),
+        created: true,
+      };
+    });
+    if (result.created)
+      await store.audit(
+        result.meeting.code,
+        result.owner.id,
+        "host.handoff",
+        body.participantId,
+      );
+    if (result.owner.enforcementPending) {
+      try {
+        await enforce(result.meeting, [result.owner]);
+      } catch {
+        return reply.code(202).send({ ok: true, cleanupPending: true });
+      }
+    }
+    return { ok: true, cleanupPending: false };
+  });
+  app.post("/api/meetings/:code/host-return", async (req, reply) => {
+    if (config.edition !== "self-hosted") throw new HttpError(404, "Not found");
+    const { expectedRevision } = z
+      .object({ expectedRevision: z.number().int().safe().nonnegative() })
+      .strict()
+      .parse(req.body);
+    const snapshot = await find(req);
+    const owner = actor(req, snapshot);
+    if (owner.role !== "host" || snapshot.hosted)
+      throw new HttpError(403, "Host permission required");
+    active(snapshot);
+    if (owner.enforcementPending) await enforce(snapshot, [owner]);
+    await store.change(snapshot.code, (m) => {
+      active(m);
+      const p = actor(req, m);
+      if (p.role !== "host" || m.hosted || !m.lifecycle)
+        throw new HttpError(403, "Host permission required");
+      // Same-browser owner capability stays valid; response-loss retries do not create a second session.
+      if (p.status === "admitted" && !m.hostControl?.handoff) return;
+      if (
+        p.status !== "left" ||
+        p.enforcementPending ||
+        !m.hostControl?.handoff ||
+        m.hostControl.revision !== expectedRevision ||
+        !safeEqual(m.hostControl.handoff.ownerSessionHash, p.tokenHash)
+      )
+        throw new HttpError(409, "Host control changed");
+      requireReturningHostSeat(m, p);
+      p.status = "admitted";
+      applyGroupDuration(m);
+      reclaimHostControl(m, config.hostAbsenceGraceSeconds);
+      p.expiresAt = Date.now() + 43200000;
+    });
+    reply.setCookie(
+      authCookie(snapshot.code),
+      req.cookies[authCookie(snapshot.code)]!,
+      cookieOpts,
+    );
+    return { ok: true };
   });
   app.post("/api/meetings/:code/leave", async (req, reply) => {
     let who!: Participant;
     const m = await store.change(codeOf(req), (m) => {
       const p = actor(req, m);
       if (p.role === "host") {
+        if (p.status !== "admitted" && !m.ended)
+          throw new HttpError(409, "Host session is inactive");
         p.status = "left";
         endMeeting(m);
       } else {
@@ -2309,6 +2487,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
     controlPass = (async () => {
       for (let m of await store.all()) {
         try {
+          if (
+            reconcileHostAbsence(
+              structuredClone(m),
+              config.hostAbsenceGraceSeconds,
+            )
+          )
+            m = await store.change(m.code, (current) => {
+              reconcileHostAbsence(current, config.hostAbsenceGraceSeconds);
+              return structuredClone(current);
+            });
           if (m.hosted?.billingOwnerId) {
             await store.reconcileParticipantMeters(m.code).catch(() => {});
             m = (await store.get(m.code))!;

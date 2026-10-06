@@ -8,6 +8,13 @@ import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import type { Media } from "../src/media.js";
 import { RecordingService } from "../src/recordings.js";
 import argon2 from "argon2";
+import {
+  controllerPresent,
+  meetingAllowed,
+  meetingController,
+  occupiesRoomSeat,
+  reconcileHostAbsence,
+} from "../src/meeting-limits.js";
 
 const origin = "http://localhost:5173";
 const creationKey = "test-creation-key-that-is-longer-than-32-characters";
@@ -1907,4 +1914,423 @@ test("same-clock chat preserves append order and drops the oldest shared history
   );
   assert.ok(saved.messages.some((message) => message.text === "Second public"));
   assert.ok(saved.messages.some((message) => message.text === "Fourth public"));
+});
+
+test("handoff preserves ownership and private data while only the selected co-host can end", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting();
+  const a = await f.join(room.code, "198.51.100.61");
+  const b = await f.join(room.code, "198.51.100.62");
+  for (const p of [a, b]) {
+    await f.action(room.code, p.id, "admit");
+    ok(
+      await f.host.request(
+        "PUT",
+        `/api/meetings/${room.code}/participants/${p.id}/moderator`,
+        { enabled: true },
+      ),
+    );
+  }
+  const path = `/api/meetings/${room.code}`;
+  ok(
+    await f.host.request("POST", `${path}/messages`, {
+      text: "Owner private history",
+      recipient: b.id,
+    }),
+  );
+  await f.store.change(room.code, (m) => {
+    m.hostEmail = "owner@example.test";
+    m.hostEmailVerified = true;
+  });
+  const before = (await f.store.get(room.code))!;
+  const body = {
+    participantId: a.id,
+    grantRevision: before.participants.find((p) => p.id === a.id)!.moderator!
+      .revision,
+    expectedRevision: before.hostControl!.revision,
+    requestId: randomUUID(),
+  };
+  assert.equal(
+    (await a.client.request("POST", `${path}/handoff`, body)).statusCode,
+    403,
+  );
+  ok(await f.host.request("POST", `${path}/handoff`, body));
+  const after = (await f.store.get(room.code))!;
+  assert.equal(after.ended, false);
+  assert.deepEqual(after.lifecycle, before.lifecycle);
+  assert.deepEqual(after.hosted, before.hosted);
+  assert.deepEqual(after.recordings, before.recordings);
+  assert.deepEqual(after.privateMessages, before.privateMessages);
+  assert.equal(after.hostEmail, before.hostEmail);
+  assert.deepEqual(
+    after.participants.filter((p) => p.role === "host").map((p) => p.id),
+    [room.hostId],
+  );
+  assert.equal(meetingController(after)?.id, a.id);
+  assert.equal(
+    after.participants.find((p) => p.id === room.hostId)!.status,
+    "left",
+  );
+  assert.equal(
+    occupiesRoomSeat(
+      after,
+      after.participants.find((p) => p.id === room.hostId)!,
+    ),
+    true,
+  );
+  assert.deepEqual(f.media.removed, [room.hostId]);
+  assert.deepEqual(f.media.ended, []);
+  const state = (await a.client.request("GET", `${path}/state`)).json();
+  assert.equal(state.meeting.canEnd, true);
+  assert.equal(state.meeting.hostEmailVerified, undefined);
+  assert.equal(state.meeting.usage, undefined);
+  assert.deepEqual(state.recordings, []);
+  assert.equal(
+    state.messages.some(
+      (m: { text: string }) => m.text === "Owner private history",
+    ),
+    false,
+  );
+  assert.equal(JSON.stringify(state).includes("ownerSessionHash"), false);
+  assert.equal(
+    (await a.client.request("POST", `${path}/broadcast`, { text: "No" }))
+      .statusCode,
+    403,
+  );
+  assert.equal(
+    (await a.client.request("POST", `${path}/recordings`, {})).statusCode,
+    403,
+  );
+  assert.equal(
+    (await b.client.request("POST", `${path}/end`, {})).statusCode,
+    403,
+  );
+  assert.equal(
+    (await f.host.request("POST", `${path}/leave`, {})).statusCode,
+    409,
+  );
+  let cleanupFails = true;
+  t.mock.method(f.media, "end", async (m: Meeting) => {
+    f.media.ended.push(m.code);
+    if (cleanupFails) throw new Error("Synthetic cleanup failure");
+  });
+  assert.equal(
+    (await a.client.request("POST", `${path}/end`, {})).statusCode,
+    202,
+  );
+  assert.equal((await f.store.get(room.code))!.ended, true);
+  assert.equal(
+    (await b.client.request("POST", `${path}/end`, {})).statusCode,
+    403,
+  );
+  cleanupFails = false;
+  ok(await a.client.request("POST", `${path}/end`, {}));
+  // The completed response may also be lost; the same controller can retry.
+  ok(await a.client.request("POST", `${path}/end`, {}));
+  assert.deepEqual(f.media.ended, [room.code, room.code, room.code]);
+  await f.store.change(room.code, (m) => {
+    m.participants.find((p) => p.id === a.id)!.moderator!.revision++;
+  });
+  assert.equal(
+    (await a.client.request("POST", `${path}/end`, {})).statusCode,
+    403,
+  );
+});
+
+test("handoff retries one physical fence and self-host return invalidates delayed handoff without losing owner cookie", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting();
+  const a = await f.join(room.code, "198.51.100.63");
+  await f.action(room.code, a.id, "admit");
+  const path = `/api/meetings/${room.code}`;
+  ok(
+    await f.host.request("PUT", `${path}/participants/${a.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  const before = (await f.store.get(room.code))!;
+  const body = {
+    participantId: a.id,
+    grantRevision: before.participants.find((p) => p.id === a.id)!.moderator!
+      .revision,
+    expectedRevision: before.hostControl!.revision,
+    requestId: randomUUID(),
+  };
+  let failed = true;
+  const removed: number[] = [];
+  t.mock.method(f.media, "remove", async (_m: Meeting, p: Participant) => {
+    removed.push(p.mediaVersion);
+    if (failed) throw new Error("Synthetic disconnect failure");
+  });
+  const pending = await f.host.request("POST", `${path}/handoff`, body);
+  assert.equal(pending.statusCode, 202);
+  assert.equal(pending.json().cleanupPending, true);
+  const committed = (await f.store.get(room.code))!;
+  assert.equal(committed.ended, false);
+  const generation = committed.participants.find(
+    (p) => p.id === room.hostId,
+  )!.mediaVersion;
+  assert.equal(
+    (await f.host.request("POST", `${path}/media`, {})).statusCode,
+    403,
+  );
+  assert.equal(
+    (
+      await f.host.request("POST", `${path}/handoff`, {
+        ...body,
+        requestId: randomUUID(),
+      })
+    ).statusCode,
+    409,
+  );
+  failed = false;
+  ok(await f.host.request("POST", `${path}/handoff`, body));
+  ok(await f.host.request("POST", `${path}/handoff`, body));
+  assert.deepEqual(removed, [generation, generation]);
+  const cookie = f.host.cookie;
+  const revision = (await f.store.get(room.code))!.hostControl!.revision;
+  ok(
+    await f.host.request("POST", `${path}/host-return`, {
+      expectedRevision: revision,
+    }),
+  );
+  // Treat the first response as lost: keep the original cookie and repeat the request.
+  f.host.cookie = cookie;
+  ok(
+    await f.host.request("POST", `${path}/host-return`, {
+      expectedRevision: revision,
+    }),
+  );
+  const returned = (await f.store.get(room.code))!;
+  assert.equal(meetingController(returned)?.id, room.hostId);
+  assert.equal(returned.hostControl!.revision, revision + 1);
+  assert.deepEqual(returned.lifecycle, before.lifecycle);
+  assert.equal(
+    (await a.client.request("POST", `${path}/end`, {})).statusCode,
+    403,
+  );
+  assert.equal(
+    (await f.host.request("POST", `${path}/handoff`, body)).statusCode,
+    409,
+  );
+  ok(await f.host.request("POST", `${path}/media`, {}));
+  const next = {
+    ...body,
+    expectedRevision: returned.hostControl!.revision,
+    requestId: randomUUID(),
+  };
+  ok(await f.host.request("POST", `${path}/handoff`, next));
+  assert.equal(
+    (
+      await f.host.request("POST", `${path}/host-return`, {
+        expectedRevision: revision,
+      })
+    ).statusCode,
+    409,
+  );
+  assert.equal(meetingController((await f.store.get(room.code))!)?.id, a.id);
+});
+
+test("succession requires the current co-host grant and cannot select an inactive or foreign target", async (t) => {
+  const f = await fixture(t);
+  const room = await f.meeting();
+  const a = await f.join(room.code, "198.51.100.64");
+  const path = `/api/meetings/${room.code}`;
+  await f.action(room.code, a.id, "admit");
+  ok(
+    await f.host.request("PUT", `${path}/participants/${a.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  const before = (await f.store.get(room.code))!;
+  const body = {
+    participantId: a.id,
+    grantRevision: before.participants.find((p) => p.id === a.id)!.moderator!
+      .revision,
+    expectedRevision: before.hostControl!.revision,
+    requestId: randomUUID(),
+  };
+  for (const patch of [
+    { participantId: randomUUID() },
+    { participantId: room.hostId },
+    { grantRevision: body.grantRevision - 1 },
+  ])
+    assert.equal(
+      (await f.host.request("POST", `${path}/handoff`, { ...body, ...patch }))
+        .statusCode,
+      409,
+    );
+  ok(
+    await f.host.request("PUT", `${path}/participants/${a.id}/moderator`, {
+      enabled: false,
+    }),
+  );
+  ok(
+    await f.host.request("PUT", `${path}/participants/${a.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  assert.equal(
+    (await f.host.request("POST", `${path}/handoff`, body)).statusCode,
+    409,
+  );
+  await f.store.change(room.code, (m) => {
+    m.participants.find((p) => p.id === a.id)!.expiresAt = Date.now() - 1;
+  });
+  const current = (await f.store.get(room.code))!;
+  assert.equal(
+    (
+      await f.host.request("POST", `${path}/handoff`, {
+        ...body,
+        grantRevision: current.participants.find((p) => p.id === a.id)!
+          .moderator!.revision,
+      })
+    ).statusCode,
+    409,
+  );
+  assert.equal(
+    (await f.store.get(room.code))!.participants.find(
+      (p) => p.id === room.hostId,
+    )!.status,
+    "admitted",
+  );
+});
+
+test("host absence has durable grace without promoting guests or allowing late resurrection", async (t) => {
+  const now = Date.now();
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting();
+  const path = `/api/meetings/${room.code}`;
+  let m = (await f.store.get(room.code))!;
+  const original = structuredClone(m.lifecycle);
+  t.mock.timers.setTime(now + 31_000);
+  assert.equal(controllerPresent(m), false);
+  assert.equal(reconcileHostAbsence(m, 300), true);
+  const absentSince = m.hostControl!.absentSince;
+  assert.equal(absentSince, now + 30_000);
+  assert.equal(m.ended, false);
+  await f.store.change(room.code, (current) => {
+    current.hostControl = structuredClone(m.hostControl);
+  });
+  t.mock.timers.setTime(now + 60_000);
+  ok(await f.host.request("GET", `${path}/state`));
+  m = (await f.store.get(room.code))!;
+  assert.equal(m.hostControl!.absentSince, undefined);
+  assert.equal(controllerPresent(m), true);
+  // A fresh media presence also keeps control alive when the control tab is throttled.
+  t.mock.timers.setTime(now + 120_000);
+  m.participants[0]!.gatewayPresenceUntil = now + 130_000;
+  assert.equal(reconcileHostAbsence(m, 300), false);
+  assert.equal(controllerPresent(m), true);
+  t.mock.timers.setTime(now + 131_000);
+  reconcileHostAbsence(m, 300);
+  assert.equal(m.hostControl!.absentSince, now + 130_000);
+  const reopened = structuredClone(m);
+  t.mock.timers.setTime(now + 430_000);
+  assert.equal(meetingAllowed(reopened), false);
+  reconcileHostAbsence(reopened, 300);
+  assert.equal(reopened.ended, true);
+  assert.deepEqual(reopened.lifecycle, original);
+  await f.store.change(room.code, (current) => {
+    current.hostControl = m.hostControl;
+  });
+  assert.equal(
+    (await f.host.request("POST", `${path}/media`, {})).statusCode,
+    410,
+  );
+  const unstarted = structuredClone(m);
+  delete unstarted.lifecycle;
+  assert.equal(reconcileHostAbsence(unstarted, 300), false);
+  assert.equal(unstarted.ended, false);
+  const unadopted = structuredClone(m);
+  delete unadopted.hostControl;
+  reconcileHostAbsence(unadopted, 300);
+  const saved = structuredClone(unadopted.hostControl);
+  reconcileHostAbsence(unadopted, 300);
+  assert.deepEqual(unadopted.hostControl, saved);
+});
+
+test("self-host absence setting is bounded and cannot override hosted grace", () => {
+  const env = { SESSION_SECRET: "host-absence-test-secret-over-32-characters" };
+  assert.equal(loadConfig(env).hostAbsenceGraceSeconds, 300);
+  assert.equal(
+    loadConfig({ ...env, HOST_ABSENCE_GRACE_SECONDS: "30" })
+      .hostAbsenceGraceSeconds,
+    30,
+  );
+  for (const value of ["0", "29", "1801", "NaN", "1.5"])
+    assert.throws(() =>
+      loadConfig({ ...env, HOST_ABSENCE_GRACE_SECONDS: value }),
+    );
+  assert.equal(
+    loadConfig({
+      ...env,
+      EDITION: "hosted",
+      CREATION_KEY: creationKey,
+      HOST_ABSENCE_GRACE_SECONDS: "30",
+    }).hostAbsenceGraceSeconds,
+    300,
+  );
+});
+
+test("a departed successor starts absence grace without promoting or refreshing from another guest", async (t) => {
+  const now = Date.now();
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting(),
+    path = `/api/meetings/${room.code}`;
+  const a = await f.join(room.code, "198.51.100.71"),
+    b = await f.join(room.code, "198.51.100.72");
+  for (const p of [a, b]) {
+    await f.action(room.code, p.id, "admit");
+    ok(
+      await f.host.request("PUT", `${path}/participants/${p.id}/moderator`, {
+        enabled: true,
+      }),
+    );
+  }
+  const before = (await f.store.get(room.code))!;
+  ok(
+    await f.host.request("POST", `${path}/handoff`, {
+      participantId: a.id,
+      grantRevision: before.participants.find((p) => p.id === a.id)!.moderator!
+        .revision,
+      expectedRevision: before.hostControl!.revision,
+      requestId: randomUUID(),
+    }),
+  );
+  ok(await a.client.request("POST", `${path}/leave`, {}));
+  t.mock.timers.setTime(now + 31_000);
+  await f.store.change(room.code, (m) => {
+    reconcileHostAbsence(m, 300);
+  });
+  const absent = (await f.store.get(room.code))!;
+  assert.equal(meetingController(absent), undefined);
+  assert.equal(absent.hostControl!.absentSince, now + 30_000);
+  t.mock.timers.setTime(now + 100_000);
+  const other = await b.client.request("GET", `${path}/state`);
+  ok(other);
+  assert.equal(other.json().meeting.canEnd, false);
+  assert.equal(
+    (await f.store.get(room.code))!.hostControl!.absentSince,
+    absent.hostControl!.absentSince,
+  );
+  assert.equal(
+    (await b.client.request("POST", `${path}/end`, {})).statusCode,
+    403,
+  );
+  t.mock.timers.setTime(now + 330_000);
+  assert.equal(
+    (
+      await f.host.request("POST", `${path}/host-return`, {
+        expectedRevision: absent.hostControl!.revision,
+      })
+    ).statusCode,
+    410,
+  );
+  await f.store.change(room.code, (m) => {
+    reconcileHostAbsence(m, 300);
+  });
+  assert.equal((await f.store.get(room.code))!.ended, true);
 });

@@ -1594,3 +1594,151 @@ test(
     assert.ok((await f.stores[0].get(code))!.recordingAccess?.session);
   },
 );
+
+test(
+  "PostgreSQL handoff retries across APIs and creator reclaim invalidates the old controller",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t),
+      owner = f.account();
+    const made = (await f.create(0, owner, randomUUID())).json();
+    const path = `/api/meetings/${made.code}`;
+    const browser = (
+      index: number,
+      method: "GET" | "POST" | "PUT",
+      suffix: string,
+      payload?: object,
+      cookie = "",
+    ) =>
+      f.apps[index]!.inject({
+        method,
+        url: path + suffix,
+        headers: { ...browserHeaders, cookie },
+        ...(payload ? { payload } : {}),
+      });
+    const cookies = (response: {
+      cookies: { name: string; value: string }[];
+    }) => response.cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    const started = await browser(0, "POST", "/host", {
+      token: made.hostToken,
+    });
+    assert.equal(started.statusCode, 200, started.body);
+    const oldCookie = cookies(started);
+    const joined = await browser(1, "POST", "/join", {
+      name: "Successor",
+      password: meeting.password,
+    });
+    assert.equal(joined.statusCode, 200, joined.body);
+    const guestCookie = cookies(joined),
+      guestId = joined.json().participantId;
+    assert.equal(
+      (
+        await browser(
+          0,
+          "POST",
+          `/participants/${guestId}/action`,
+          { action: "admit" },
+          oldCookie,
+        )
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      (
+        await browser(
+          0,
+          "PUT",
+          `/participants/${guestId}/moderator`,
+          { enabled: true },
+          oldCookie,
+        )
+      ).statusCode,
+      200,
+    );
+    const before = (await f.stores[0].get(made.code))!;
+    const request = {
+      participantId: guestId,
+      grantRevision: before.participants.find((p) => p.id === guestId)!
+        .moderator!.revision,
+      expectedRevision: before.hostControl!.revision,
+      requestId: randomUUID(),
+    };
+    f.media[0].failing = true;
+    const pending = await browser(0, "POST", "/handoff", request, oldCookie);
+    assert.equal(pending.statusCode, 202, pending.body);
+    const persisted = (await f.stores[1].get(made.code))!;
+    assert.equal(
+      persisted.participants.find((p) => p.role === "host")!.enforcementPending,
+      true,
+    );
+    assert.equal(persisted.hostControl?.handoff?.participantId, guestId);
+    assert.equal(
+      (
+        await browser(
+          1,
+          "POST",
+          "/handoff",
+          { ...request, requestId: randomUUID() },
+          oldCookie,
+        )
+      ).statusCode,
+      409,
+    );
+    assert.equal(
+      (await browser(1, "POST", "/handoff", request, oldCookie)).statusCode,
+      200,
+    );
+    assert.deepEqual(
+      (await f.stores[0].get(made.code))!.hostControl,
+      persisted.hostControl,
+    );
+    f.media[0].failing = false;
+    const issued = await f.apps[1].inject({
+      method: "POST",
+      url: `/api/internal/hosted/meetings/${made.code}/host-reentry`,
+      headers: internalHeaders,
+      payload: {
+        accountId: owner,
+        billingOwnerId: owner,
+        version: 1,
+        requestId: randomUUID(),
+        expectedRevision: 0,
+      },
+    });
+    assert.equal(issued.statusCode, 200, issued.body);
+    assert.deepEqual(
+      (await f.stores[0].get(made.code))!.hostControl,
+      persisted.hostControl,
+    );
+    assert.equal(
+      (await browser(0, "POST", "/host", { token: issued.json().hostToken }))
+        .statusCode,
+      200,
+    );
+    const reclaimed = (await f.stores[1].get(made.code))!;
+    assert.equal(reclaimed.hostControl?.handoff, undefined);
+    assert.deepEqual(reclaimed.lifecycle, before.lifecycle);
+    assert.deepEqual(reclaimed.hosted, before.hosted);
+    assert.equal(reclaimed.participants.length, before.participants.length);
+    assert.equal(
+      (await browser(1, "POST", "/handoff", request, oldCookie)).statusCode,
+      401,
+    );
+    assert.equal(
+      (await browser(0, "POST", "/end", {}, guestCookie)).statusCode,
+      403,
+    );
+    const other = (await f.create(1, owner, randomUUID())).json();
+    assert.equal(
+      (
+        await f.apps[1].inject({
+          method: "POST",
+          url: `/api/meetings/${other.code}/host`,
+          headers: browserHeaders,
+          payload: { token: other.hostToken },
+        })
+      ).statusCode,
+      409,
+    );
+  },
+);

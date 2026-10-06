@@ -234,7 +234,11 @@ export function Chat({
               disabled={busy}
               onClick={() => setRecipient("host")}
             >
-              Host
+              {state.participants.some(
+                (p) => p.role === "host" && p.status === "admitted",
+              )
+                ? "Host"
+                : "Host (away)"}
             </button>
           )}
           {host && recipient !== "everyone" && (

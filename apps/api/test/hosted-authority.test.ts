@@ -2458,3 +2458,122 @@ test("breakout and reconnect grants preserve the original start reservation and 
   assert.equal(moved.participants.length, 1);
   assert.equal(moved.participants[0]!.id, initial.participants[0]!.id);
 });
+
+test(
+  "hosted creator reclaim keeps succession until final exchange and preserves one occurrence",
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t);
+    const made = (await f.create()).json();
+    const path = `/api/meetings/${made.code}`;
+    const oldCookie = await f.exchange(made.code, made.hostToken);
+    const joined = await f.browser(`${path}/join`, {
+      name: "Successor",
+      password: settings.password,
+    });
+    assert.equal(joined.statusCode, 200, joined.body);
+    const guestId = joined.json().participantId;
+    const guestCookie = joined.cookies
+      .map((c) => `${c.name}=${c.value}`)
+      .join("; ");
+    assert.equal(
+      (
+        await f.browser(
+          `${path}/participants/${guestId}/action`,
+          { action: "admit" },
+          oldCookie,
+        )
+      ).statusCode,
+      200,
+    );
+    const granted = await f.app.inject({
+      method: "PUT",
+      url: `${path}/participants/${guestId}/moderator`,
+      headers: {
+        origin,
+        "x-requested-with": "MeetingPlatform",
+        cookie: oldCookie,
+      },
+      payload: { enabled: true },
+    });
+    assert.equal(granted.statusCode, 200, granted.body);
+    const before = (await f.store.get(made.code))!;
+    const host = before.participants.find((p) => p.role === "host")!;
+    const handoff = {
+      participantId: guestId,
+      grantRevision: before.participants.find((p) => p.id === guestId)!
+        .moderator!.revision,
+      expectedRevision: before.hostControl!.revision,
+      requestId: randomUUID(),
+    };
+    assert.equal(
+      (await f.browser(`${path}/handoff`, handoff, oldCookie)).statusCode,
+      200,
+    );
+    const delegated = (await f.store.get(made.code))!.hostControl;
+    assert.equal(
+      (
+        await f.internal("meetings/status", {
+          accountId: f.accountId,
+          version: 1,
+        })
+      ).json().meetings[0].status,
+      "active",
+    );
+    const issued = await f.internal(`meetings/${made.code}/host-reentry`, {
+      accountId: f.accountId,
+      version: 1,
+      billingOwnerId: f.billingOwnerId,
+      requestId: randomUUID(),
+      expectedRevision: 0,
+    });
+    assert.equal(issued.statusCode, 200, issued.body);
+    assert.deepEqual((await f.store.get(made.code))!.hostControl, delegated);
+    f.media.failRemove = true;
+    assert.equal(
+      (await f.browser(`${path}/host`, { token: issued.json().hostToken }))
+        .statusCode,
+      503,
+    );
+    assert.deepEqual((await f.store.get(made.code))!.hostControl, delegated);
+    assert.equal(
+      (await f.browser(`${path}/state`, undefined, guestCookie)).json().meeting
+        .canEnd,
+      true,
+    );
+    f.media.failRemove = false;
+    const newCookie = await f.exchange(made.code, issued.json().hostToken);
+    const after = (await f.store.get(made.code))!;
+    assert.equal(after.hostControl?.handoff, undefined);
+    assert.deepEqual(after.lifecycle, before.lifecycle);
+    assert.deepEqual(after.hosted, before.hosted);
+    assert.deepEqual(
+      after.participants.filter((p) => p.role === "host").map((p) => p.id),
+      [host.id],
+    );
+    assert.equal(after.participants.length, before.participants.length);
+    assert.equal(
+      after.participants.find((p) => p.id === guestId)!.status,
+      "admitted",
+    );
+    assert.equal(
+      (await f.browser(`${path}/state`, undefined, oldCookie)).statusCode,
+      401,
+    );
+    assert.equal(
+      (await f.browser(`${path}/end`, {}, guestCookie)).statusCode,
+      403,
+    );
+    assert.equal(
+      (await f.browser(`${path}/handoff`, handoff, newCookie)).statusCode,
+      409,
+    );
+    assert.equal(f.media.removed.includes(guestId), false);
+    assert.equal((await f.authority(2, false)).statusCode, 200);
+    assert.equal((await f.store.get(made.code))!.ended, true);
+    assert.equal(
+      (await f.browser(`${path}/state`, undefined, newCookie)).statusCode,
+      401,
+    );
+  },
+);

@@ -854,3 +854,86 @@ test("one-way migration drains legacy access without relabeling history or reset
   );
   assert.equal((await f.usage()).participantSeconds.used, 1);
 });
+
+test("succession keeps the same shared or legacy funding and still honors exhaustion", async (t) => {
+  for (const metering of [undefined, "meeting"] as const)
+    await t.test(metering ?? "legacy", async (t) => {
+      const f = await fixture(t, metering ? 60 : 90, now, metering);
+      for (const p of [f.host, f.guest]) {
+        await f.act(p, p.id, "claim");
+        await f.act(p, p.id, "connected");
+      }
+      const original = (await f.store.get(f.m.code))!;
+      await f.store.change(f.m.code, (m) => {
+        const host = m.participants[0]!,
+          guest = m.participants[1]!;
+        guest.moderator = {
+          grantedBy: host.id,
+          grantedAt: now,
+          revision: m.revision,
+        };
+        host.status = "left";
+        host.mediaVersion++;
+        host.enforcementPending = true;
+        m.hostControl = {
+          revision: 1,
+          graceSeconds: 300,
+          lastSeenAt: now,
+          handoff: {
+            requestId: randomUUID(),
+            participantId: guest.id,
+            grantRevision: guest.moderator.revision,
+            ownerSessionHash: host.tokenHash,
+            ownerMediaVersion: host.mediaVersion,
+          },
+        };
+      });
+      await f.store.reconcileParticipantMeters(f.m.code);
+      const departed = (await f.store.get(f.m.code))!.participants[0]!;
+      assert.equal(departed.meter!.phase, "closing");
+      assert.equal((await f.usage()).blocked, true);
+      await f.store.settleParticipantMeter(
+        f.m.code,
+        departed.id,
+        departed.mediaVersion,
+        departed.meter,
+      );
+      await f.store.change(f.m.code, (m) => {
+        m.participants[0]!.enforcementPending = false;
+      });
+      // Only the existing guest connection renews the original room's prepaid time.
+      for (let i = 0; i < 11; i++) {
+        t.mock.timers.tick(5000);
+        await f.act(f.guest, f.guest.id, "heartbeat");
+      }
+      const current = (await f.store.get(f.m.code))!;
+      assert.equal(current.ended, false);
+      assert.deepEqual(current.lifecycle, original.lifecycle);
+      assert.deepEqual(current.hosted, original.hosted);
+      assert.equal(current.participants[0]!.meter, undefined);
+      assert(current.hostControl!.lastSeenAt >= now + 50_000);
+      assert.equal((await f.store.all()).length, 1);
+      if (metering) {
+        t.mock.timers.tick(5000);
+        await f.store.reconcileParticipantMeters(f.m.code);
+        assert.equal((await f.store.get(f.m.code))!.ended, true);
+        const guest = (await f.store.get(f.m.code))!.participants[1]!;
+        await f.store.settleParticipantMeter(
+          f.m.code,
+          guest.id,
+          guest.mediaVersion,
+          guest.meter,
+        );
+        assert.equal((await f.usage()).participantSeconds.used, 60);
+      } else {
+        // The owner's departure does not waive a later entitlement revocation.
+        await f.store.setHostedEntitlement({
+          ...f.grant,
+          revision: 2,
+          enabled: false,
+        });
+        assert.equal((await f.store.get(f.m.code))!.ended, true);
+        await assert.rejects(f.act(f.guest, f.guest.id, "heartbeat"), /denied/);
+      }
+    });
+});

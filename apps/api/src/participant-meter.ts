@@ -4,6 +4,7 @@ import {
   endMeeting,
   meetingAllowed,
   meetingDeadline,
+  refreshHostPresence,
   type HostedEntitlement,
 } from "./meeting-limits.js";
 import { HttpError } from "./security.js";
@@ -226,7 +227,12 @@ export function sweepParticipantMeters(
       ) {
         // No expiry is a refund. Fence first; settle only after physical cleanup.
         meter.phase = "closing";
-        if (meter.fundedUntil <= now && p.role === "host" && !m.ended)
+        if (
+          meter.fundedUntil <= now &&
+          p.role === "host" &&
+          !m.ended &&
+          !m.hostControl
+        )
           endMeeting(m);
         if (!p.enforcementPending) {
           fenceParticipantMedia(m, p);
@@ -443,6 +449,7 @@ export function updateMeter(
       meter!.connectedAt ??= now;
       meter!.phase = "active";
     }
+    refreshHostPresence(meeting, p, now);
     // One logical meeting interval covers all peers, phone legs and breakouts.
     // Successful signaling opens allowance, including setup and presence grace.
     if (shared.phase === "active") account(ledger, shared, now, "meeting");
@@ -487,6 +494,7 @@ export function updateMeter(
     meter!.accountedAt = now;
     meter!.phase = "active";
   }
+  refreshHostPresence(meeting, p, now);
   if (meter!.phase === "active") account(ledger, meter!, now);
   meter!.presenceUntil = now + PARTICIPANT_PRESENCE_MS;
   if (!blocked && meter!.fundedUntil - now <= 10_000)

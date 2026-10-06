@@ -931,6 +931,30 @@ function Meeting({
         {state.meeting.ended && state.meeting.cleanupPending && (
           <Notice kind="info">Meeting connections are still closing.</Notice>
         )}
+        {error && <Notice>{error}</Notice>}
+        {state.me.role === "host" &&
+          state.me.status === "left" &&
+          !state.meeting.ended &&
+          config.edition === "self-hosted" && (
+            <Button
+              onClick={async () => {
+                try {
+                  await api(meetingPath(code, "/host-return"), {
+                    expectedRevision: state.meeting.controlRevision ?? 0,
+                  });
+                  setError("");
+                  setRefresh((v) => v + 1);
+                } catch (e) {
+                  setError(messageOf(e));
+                }
+              }}
+            >
+              Return as host
+            </Button>
+          )}
+        {state.me.enforcementPending && !state.meeting.ended && (
+          <Notice kind="info">Meeting connections are still closing.</Notice>
+        )}
         {state.me.status === "kicked" && !state.meeting.ended && (
           <Button onClick={() => setNeedsJoin(true)}>Request admission</Button>
         )}
@@ -1120,6 +1144,17 @@ function Conference({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const leaveDialog = useRef<HTMLDialogElement>(null);
+  const [successorId, setSuccessorId] = useState("");
+  const handoffAttempt = useRef<
+    | {
+        participantId: string;
+        grantRevision: number;
+        expectedRevision: number;
+        requestId: string;
+      }
+    | undefined
+  >(undefined);
   const [issuedCredentials, setCredentials] = useState<{
     token: string;
     url: string;
@@ -1134,6 +1169,34 @@ function Conference({
   const [attempt, setAttempt] = useState(0);
   const host = state.me.role === "host";
   const moderator = host || !!state.me.moderator;
+  const canEnd = state.meeting.canEnd ?? host;
+  const successors = state.participants.filter(
+    (p) =>
+      p.id !== state.me.id &&
+      p.moderator &&
+      p.status === "admitted" &&
+      !p.enforcementPending &&
+      p.transport !== "phone",
+  );
+  async function handoff() {
+    const target = successors.find((p) => p.id === successorId);
+    if (!target || target.moderatorRevision === undefined) return;
+    let attempt = handoffAttempt.current;
+    const revision = state.meeting.controlRevision ?? 0;
+    if (
+      !attempt ||
+      attempt.participantId !== target.id ||
+      attempt.grantRevision !== target.moderatorRevision ||
+      attempt.expectedRevision !== revision
+    )
+      handoffAttempt.current = attempt = {
+        participantId: target.id,
+        grantRevision: target.moderatorRevision,
+        expectedRevision: revision,
+        requestId: crypto.randomUUID(),
+      };
+    if (await mutate("/handoff", attempt)) leaveDialog.current?.close();
+  }
   const usage = host ? state.meeting.usage : undefined;
   const quotaNotice =
     usage === null
@@ -1448,7 +1511,9 @@ function Conference({
           {host
             ? "Host"
             : state.me.moderator
-              ? "Co-host"
+              ? state.meeting.controllerId === state.me.id
+                ? "Co-host · Leading"
+                : "Co-host"
               : state.me.role === "viewer"
                 ? "Viewer"
                 : "Participant"}
@@ -1493,20 +1558,16 @@ function Conference({
             </div>
             <Button
               className="leave-button"
-              aria-label={host ? "End meeting" : "Leave meeting"}
-              title={host ? "End meeting" : "Leave meeting"}
+              aria-label="Leave meeting"
+              title="Leave meeting"
               disabled={busy}
               onClick={() => {
-                if (host) {
-                  if (window.confirm("End this meeting for everyone?"))
-                    void mutate("/end");
-                } else {
-                  void mutate("/leave");
-                }
+                if (host || canEnd) leaveDialog.current?.showModal();
+                else void mutate("/leave");
               }}
             >
               <Icon name="exit" />
-              <span>{host ? "End" : "Leave"}</span>
+              <span>Leave</span>
             </Button>
           </div>
           <div className="panel-tabs">
@@ -1641,6 +1702,65 @@ function Conference({
           {quotaNotice && <Notice kind="info">{quotaNotice}</Notice>}
         </div>
       )}
+      <dialog
+        className="leave-dialog"
+        ref={leaveDialog}
+        aria-labelledby="leave-title"
+      >
+        <h2 id="leave-title">Leave meeting</h2>
+        {host &&
+          (successors.length ? (
+            <fieldset>
+              <legend>Continue with a co-host</legend>
+              {successors.map((p) => (
+                <label className="checkbox" key={p.id}>
+                  <input
+                    type="radio"
+                    name="successor"
+                    value={p.id}
+                    checked={successorId === p.id}
+                    onChange={() => {
+                      setSuccessorId(p.id);
+                      handoffAttempt.current = undefined;
+                    }}
+                  />
+                  {p.name}
+                </label>
+              ))}
+            </fieldset>
+          ) : (
+            <p>Assign a co-host before leaving the meeting running.</p>
+          ))}
+        {state.meeting.recordingActive && (
+          <p>Recording continues if you leave.</p>
+        )}
+        {error && <Notice>{error}</Notice>}
+        <div className="button-row">
+          <Button disabled={busy} onClick={() => leaveDialog.current?.close()}>
+            Cancel
+          </Button>
+          <Button
+            disabled={
+              busy || (host && !successors.some((p) => p.id === successorId))
+            }
+            onClick={() => (host ? void handoff() : void mutate("/leave"))}
+          >
+            Leave meeting
+          </Button>
+          {canEnd && (
+            <Button
+              className="danger"
+              disabled={busy}
+              onClick={() => {
+                if (window.confirm("End this meeting for everyone?"))
+                  void mutate("/end");
+              }}
+            >
+              End for everyone
+            </Button>
+          )}
+        </div>
+      </dialog>
       <div className="meeting-session">{roomContent}</div>
     </div>
   );
@@ -2273,7 +2393,9 @@ function Participants({
                 {p.role === "host"
                   ? "Host"
                   : p.moderator
-                    ? "Co-host"
+                    ? state.meeting.controllerId === p.id
+                      ? "Co-host · Leading"
+                      : "Co-host"
                     : p.role === "viewer"
                       ? "Viewer"
                       : state.meeting.mode === "webinar"

@@ -223,9 +223,10 @@ export function requireEntitlement(
   return grant;
 }
 
-export function meetingDeadline(m: Meeting) {
+export function meetingDeadline(m: Meeting, now = Date.now()) {
   return Math.min(
     m.lifecycle?.deadlineAt ?? Infinity,
+    controllerAbsenceDeadline(m, now),
     m.hosted?.billingOwnerId
       ? (m.hosted.entitlement?.validUntil ?? 0)
       : Infinity,
@@ -235,7 +236,7 @@ export function meetingDeadline(m: Meeting) {
 export function meetingAllowed(m: Meeting, now = Date.now()) {
   return (
     !m.ended &&
-    meetingDeadline(m) > now &&
+    meetingDeadline(m, now) > now &&
     (!m.hosted?.billingOwnerId ||
       !!(
         m.hosted.entitlement?.enabled &&
@@ -248,6 +249,112 @@ export function meetingAllowed(m: Meeting, now = Date.now()) {
 export function requireMeetingAccess(m: Meeting) {
   if (!meetingAllowed(m))
     throw new HttpError(410, "Meeting ended or hosting plan unavailable");
+}
+
+// Control presence is independent of camera/microphone or a media reconnect.
+export const HOST_CONTROL_PRESENCE_MS = 30_000;
+export function meetingController(m: Meeting, now = Date.now()) {
+  const handoff = m.hostControl?.handoff;
+  const p = handoff
+    ? m.participants.find(
+        (p) =>
+          p.id === handoff.participantId &&
+          p.moderator?.revision === handoff.grantRevision,
+      )
+    : m.participants.find((p) => p.role === "host");
+  return p &&
+    p.transport !== "phone" &&
+    p.status === "admitted" &&
+    p.expiresAt > now
+    ? p
+    : undefined;
+}
+export function controllerPresent(m: Meeting, now = Date.now()) {
+  const p = meetingController(m, now);
+  if (!m.hostControl) return !!p && !p.enforcementPending;
+  return (
+    !!p &&
+    !p.enforcementPending &&
+    Math.max(
+      (m.hostControl?.lastSeenAt ?? 0) + HOST_CONTROL_PRESENCE_MS,
+      p.meter?.phase === "active" ? p.meter.presenceUntil : 0,
+      p.gatewayPresenceUntil ?? 0,
+    ) > now
+  );
+}
+export function refreshHostPresence(
+  m: Meeting,
+  p: Participant,
+  now = Date.now(),
+) {
+  const control = m.hostControl;
+  if (
+    !control ||
+    !m.lifecycle ||
+    !meetingAllowed(m, now) ||
+    meetingController(m, now)?.id !== p.id ||
+    p.enforcementPending ||
+    (control.lastSeenAt > now - 10_000 && control.absentSince === undefined)
+  )
+    return;
+  control.lastSeenAt = now;
+  delete control.absentSince;
+}
+function controllerAbsenceDeadline(m: Meeting, now: number) {
+  const control = m.hostControl;
+  if (!m.lifecycle || !control || controllerPresent(m, now)) return Infinity;
+  const p = meetingController(m, now);
+  const latestPresence = Math.max(
+    control.lastSeenAt + HOST_CONTROL_PRESENCE_MS,
+    p?.meter?.presenceUntil ?? 0,
+    p?.gatewayPresenceUntil ?? 0,
+  );
+  return (control.absentSince ?? latestPresence) + control.graceSeconds * 1000;
+}
+export function reclaimHostControl(
+  m: Meeting,
+  graceSeconds: number,
+  now = Date.now(),
+) {
+  m.hostControl = {
+    revision: (m.hostControl?.revision ?? 0) + 1,
+    graceSeconds: m.hostControl?.graceSeconds ?? graceSeconds,
+    lastSeenAt: now,
+  };
+}
+export function reconcileHostAbsence(
+  m: Meeting,
+  graceSeconds: number,
+  now = Date.now(),
+) {
+  if (!m.lifecycle || m.ended) return false;
+  if (!m.hostControl) {
+    // Existing occurrences get one adoption grace; restart never resets it.
+    reclaimHostControl(m, graceSeconds, now);
+    return true;
+  }
+  const control = m.hostControl;
+  if (controllerPresent(m, now)) {
+    if (control.absentSince === undefined) return false;
+    delete control.absentSince;
+    return true;
+  }
+  const p = meetingController(m, now);
+  const since = Math.min(
+    now,
+    Math.max(
+      control.lastSeenAt + HOST_CONTROL_PRESENCE_MS,
+      p?.meter?.presenceUntil ?? 0,
+      p?.gatewayPresenceUntil ?? 0,
+    ),
+  );
+  const changed = control.absentSince === undefined;
+  control.absentSince ??= since;
+  if (now >= control.absentSince + control.graceSeconds * 1000) {
+    endMeeting(m);
+    return true;
+  }
+  return changed;
 }
 
 export function occupiesMeetingSeat(p: Participant) {
@@ -265,7 +372,7 @@ export function occupiesRoomSeat(m: Meeting, p: Participant) {
   return (
     occupiesMeetingSeat(p) ||
     (p.role === "host" &&
-      !!m.hosted?.billingOwnerId &&
+      (!!m.hosted?.billingOwnerId || !!m.hostControl?.handoff) &&
       !m.ended &&
       !m.lifecycle?.cleanupConfirmed)
   );

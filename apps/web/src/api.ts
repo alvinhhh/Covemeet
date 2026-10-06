@@ -31,6 +31,7 @@ export type Participant = {
   name: string;
   role: "host" | "participant" | "viewer";
   moderator?: boolean;
+  moderatorRevision?: number;
   status: "waiting" | "admitted" | "kicked" | "banned" | "left";
   audioAllowed: boolean;
   videoAllowed: boolean;
@@ -75,6 +76,10 @@ export type MeetingState = {
     locked: boolean;
     ended: boolean;
     cleanupPending?: boolean;
+    controllerId?: string;
+    controlRevision?: number;
+    hostAbsentSince?: number;
+    canEnd?: boolean;
     participantLimit?: number;
     startedAt?: number;
     deadlineAt?: number;

@@ -3398,3 +3398,29 @@ input[type="checkbox"] {
 .company-join > footer {
   margin-top: 36px;
 }
+
+.leave-dialog {
+  width: min(440px, calc(100vw - 32px));
+  border: 1px solid #d4d4d4;
+  border-radius: 16px;
+  padding: 24px;
+  color: #171717;
+  background: #fff;
+}
+.leave-dialog::backdrop {
+  background: #0009;
+}
+.leave-dialog fieldset {
+  border: 0;
+  padding: 0;
+  margin: 20px 0;
+  max-height: 240px;
+  overflow: auto;
+}
+.leave-dialog legend {
+  margin-bottom: 12px;
+}
+.leave-dialog .button-row {
+  flex-wrap: wrap;
+  margin-top: 24px;
+}

@@ -9,6 +9,7 @@ import {
 } from "./media-identity.js";
 import {
   endMeeting,
+  refreshHostPresence,
   meetingAllowed,
   meetingDeadline,
   requireMeetingAccess,
@@ -347,6 +348,7 @@ export class LiveMedia implements Media {
                   )
                     throw new HttpError(403, "Media session changed");
                   live.gatewayPresenceUntil = Date.now() + GATEWAY_PRESENCE_MS;
+                  refreshHostPresence(current, live);
                 });
                 if (closed) return;
               }

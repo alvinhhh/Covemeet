@@ -175,6 +175,19 @@ export type RecordingIdentity =
   | { email: string }
   | { accountId: string; version: number; billingOwnerId: string };
 export type Meeting = {
+  hostControl?: {
+    revision: number;
+    graceSeconds: number;
+    lastSeenAt: number;
+    absentSince?: number;
+    handoff?: {
+      requestId: string;
+      participantId: string;
+      grantRevision: number;
+      ownerSessionHash: string;
+      ownerMediaVersion: number;
+    };
+  };
   recordingAccess?: {
     identity: RecordingIdentity;
     ticket?: { hash: string; expiresAt: number };
