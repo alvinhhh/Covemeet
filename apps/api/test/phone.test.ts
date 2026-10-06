@@ -602,6 +602,7 @@ test("credential rotation and disable revoke calls; leave cannot free capacity w
 });
 
 test("PIN attempt caps persist in shared store; active recording rejects new callers", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2026, 0, 1, 12) });
   const f = await fixture(t),
     h = await f.host();
   const bad = h.access.pin === "00000000" ? "00000001" : "00000000";
