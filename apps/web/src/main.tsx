@@ -491,9 +491,7 @@ function Home({ config }: { config: Config }) {
                       <input
                         name="password"
                         type="password"
-                        placeholder="At least 12 characters"
                         required
-                        minLength={12}
                         maxLength={128}
                         autoComplete="new-password"
                       />

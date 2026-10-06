@@ -45,7 +45,7 @@ import {
 } from "./meeting-limits.js";
 
 const name = z.string().trim().min(1).max(80),
-  password = z.string().min(8).max(256);
+  password = z.string().min(1).max(256);
 const meetingInput = z
   .object({
     title: name,

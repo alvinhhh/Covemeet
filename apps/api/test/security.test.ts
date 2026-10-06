@@ -171,6 +171,20 @@ test("hosted creation requires its server credential and rejects custom meeting 
   assert.ok(!response.json().guestUrl.includes(response.json().hostToken));
 });
 
+test("meeting passwords accept one character but reject empty and oversized values", async (t) => {
+  const f = await fixture(t);
+  rejected(await f.create({ password: "" }));
+  rejected(await f.create({ password: "x".repeat(257) }));
+  const { code } = await f.meeting({ password: "x" });
+  const guest = new Client(f.app, "198.51.100.20");
+  ok(
+    await guest.request("POST", `/api/meetings/${code}/join`, {
+      name: "Guest",
+      password: "x",
+    }),
+  );
+});
+
 test("self-hosted installations can select a custom meeting code", async (t) => {
   const f = await fixture(t, "self-hosted");
   rejected(await f.create({ customCode: "------" }));
