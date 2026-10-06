@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { AccessToken, ServerError } from "livekit-server-sdk";
 import { loadConfig } from "../src/config.js";
 import { LiveMedia } from "../src/media.js";
+import { createApp } from "../src/server.js";
 import {
   completeMediaFence,
   fenceParticipantMedia,
@@ -11,6 +12,7 @@ import {
 } from "../src/media-identity.js";
 import type { WebSocket } from "ws";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
+import { digest } from "../src/security.js";
 
 async function fixture(t: TestContext) {
   const config = loadConfig({
@@ -259,6 +261,51 @@ test("media cleanup preserves unrecognized, authentication, service and network 
     );
     await assert.rejects(f.media.end(f.meeting), (caught) => caught === error);
   }
+});
+
+test("unmetered browser leave retains its physical cleanup fence when media control is unavailable", async (t) => {
+  const f = await fixture(t);
+  const session = "unmetered-test-session";
+  await f.store.change(f.meeting.code, (m) => {
+    m.participants[0]!.tokenHash = digest(session);
+  });
+  const app = await createApp(f.config, f.store, f.media);
+  await app.ready();
+  t.after(() => app.close());
+  const removed: string[] = [];
+  f.media.client.removeParticipant = async (_room, identity) => {
+    removed.push(identity);
+  };
+  const leave = () =>
+    app.inject({
+      method: "POST",
+      url: `/api/meetings/${f.meeting.code}/leave`,
+      payload: {},
+      headers: {
+        origin: f.config.origin,
+        "x-requested-with": "MeetingPlatform",
+        cookie: `mp_${f.meeting.code}=${session}`,
+      },
+    });
+
+  f.media.available = false;
+  const unavailable = await leave();
+  assert.equal(unavailable.statusCode, 503);
+  const pending = (await f.store.get(f.meeting.code))!.participants[0]!;
+  assert.equal(pending.status, "left");
+  assert.equal(pending.enforcementPending, true);
+  assert.equal(pending.previousMediaIdentity, f.participant.id);
+  assert.equal(pending.previousRoom, f.meeting.room);
+  assert.deepEqual(removed, []);
+
+  f.media.available = true;
+  const retried = await leave();
+  assert.equal(retried.statusCode, 200, retried.body);
+  assert.deepEqual(removed, [f.participant.id]);
+  const settled = (await f.store.get(f.meeting.code))!.participants[0]!;
+  assert.equal(settled.enforcementPending, false);
+  assert.equal(settled.previousMediaIdentity, undefined);
+  assert.equal(settled.previousRoom, undefined);
 });
 
 test("delayed duplicate physical removal cannot disconnect or authorize a successor generation", async (t) => {

@@ -120,7 +120,8 @@ export class LiveMedia implements Media {
     for (const ws of this.sockets.get(identity) ?? [])
       ws.close(4003, "Session changed");
     this.sockets.delete(identity);
-    if (!this.available) return;
+    if (!this.available)
+      throw new HttpError(503, "Media cleanup is unavailable");
     try {
       await this.client.removeParticipant(
         p.previousRoom ?? participantRoom(m, p),
