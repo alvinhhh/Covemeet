@@ -1106,7 +1106,9 @@ function Conference({
             <span>
               · Ends at{" "}
               <time dateTime={new Date(state.meeting.deadlineAt).toISOString()}>
-                {new Date(state.meeting.deadlineAt).toLocaleTimeString([], {
+                {new Date(state.meeting.deadlineAt).toLocaleString([], {
+                  month: "short",
+                  day: "numeric",
                   hour: "numeric",
                   minute: "2-digit",
                 })}
