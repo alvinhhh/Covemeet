@@ -170,6 +170,7 @@ function App() {
   const [path, setPath] = useState(location.pathname);
   const [config, setConfig] = useState<Config>();
   const [error, setError] = useState("");
+  const [configAttempt, setConfigAttempt] = useState(0);
   useEffect(() => {
     if (!config) return;
     const logo = brandLogo(
@@ -232,14 +233,21 @@ function App() {
         document.title = value.brandName;
       })
       .catch((e) => setError(messageOf(e)));
-  }, []);
+  }, [configAttempt]);
   if (error)
     return (
       <Center>
         <Icon name="video" size={40} />
         <h1>Service unavailable</h1>
         <Notice>{error}</Notice>
-        <Button onClick={() => location.reload()}>Try again</Button>
+        <Button
+          onClick={() => {
+            setError("");
+            setConfigAttempt((attempt) => attempt + 1);
+          }}
+        >
+          Try again
+        </Button>
       </Center>
     );
   if (!config)
@@ -618,25 +626,41 @@ function Meeting({
   const [state, setState] = useState<MeetingState>();
   const [needsJoin, setNeedsJoin] = useState(false);
   const [error, setError] = useState("");
+  const [hostError, setHostError] = useState("");
   const [refresh, setRefresh] = useState(0);
+  const hostToken = useRef(hostEntry ? initialHostToken : "");
   const [bootstrapping, setBootstrapping] = useState(
-    hostEntry && Boolean(initialHostToken),
+    Boolean(hostToken.current),
   );
   const exchange = useRef<Promise<unknown> | null>(null);
   useEffect(() => {
     if (!bootstrapping) return;
+    initialHostToken = "";
     exchange.current ??= api(meetingPath(code, "/host"), {
-      token: initialHostToken,
+      token: hostToken.current,
     });
     exchange.current
-      .catch((e) => setError(messageOf(e)))
-      .finally(() => {
-        initialHostToken = "";
+      .then(() => {
+        hostToken.current = "";
+        setBootstrapping(false);
+      })
+      .catch(async (e) => {
+        try {
+          const current = await api<MeetingState>(meetingPath(code, "/state"));
+          if (current.me.role === "host") {
+            hostToken.current = "";
+            setState(current);
+            setBootstrapping(false);
+            return;
+          }
+        } catch {}
+        setHostError(messageOf(e));
+        exchange.current = null;
         setBootstrapping(false);
       });
   }, [code, bootstrapping]);
   useEffect(() => {
-    if (bootstrapping) return;
+    if (bootstrapping || hostError) return;
     const controller = new AbortController();
     let timeout: ReturnType<typeof setTimeout>;
     async function poll() {
@@ -673,7 +697,23 @@ function Meeting({
       controller.abort();
       clearTimeout(timeout);
     };
-  }, [code, refresh, bootstrapping]);
+  }, [code, refresh, bootstrapping, hostError]);
+  if (hostError)
+    return (
+      <Center>
+        <Logo name={config.brandName} />
+        <Notice>{hostError}</Notice>
+        <Button
+          onClick={() => {
+            setHostError("");
+            setBootstrapping(true);
+          }}
+        >
+          Retry host entry
+        </Button>
+        <Button onClick={() => navigate("/")}>{homeLabel()}</Button>
+      </Center>
+    );
   if (needsJoin)
     return (
       <Prejoin
@@ -1222,13 +1262,20 @@ function Conference({
             </div>
             <Button
               className="leave-button"
-              aria-label="Leave meeting"
-              title="Leave meeting"
+              aria-label={host ? "End meeting" : "Leave meeting"}
+              title={host ? "End meeting" : "Leave meeting"}
               disabled={busy}
-              onClick={() => void mutate("/leave")}
+              onClick={() => {
+                if (host) {
+                  if (window.confirm("End this meeting for everyone?"))
+                    void mutate("/end");
+                } else {
+                  void mutate("/leave");
+                }
+              }}
             >
               <Icon name="exit" />
-              <span>Leave</span>
+              <span>{host ? "End" : "Leave"}</span>
             </Button>
           </div>
           <div className="panel-tabs">
@@ -1298,18 +1345,6 @@ function Conference({
             )}
           </div>
         </div>
-        {host && (
-          <Button
-            className="end-button"
-            disabled={busy}
-            onClick={() => {
-              if (window.confirm("End this meeting for everyone?"))
-                void mutate("/end");
-            }}
-          >
-            End meeting
-          </Button>
-        )}
       </footer>
     </>
   );
@@ -1674,7 +1709,9 @@ function MediaControls({ me }: { me: Participant }) {
           title={microphoneAction}
           aria-label={microphoneAction}
         >
-          <Icon name={audioAllowed && isMicrophoneEnabled ? "mic" : "mic-off"} />
+          <Icon
+            name={audioAllowed && isMicrophoneEnabled ? "mic" : "mic-off"}
+          />
           <span>
             {!audioAllowed
               ? "Mic blocked"
@@ -1693,7 +1730,9 @@ function MediaControls({ me }: { me: Participant }) {
           title={cameraAction}
           aria-label={cameraAction}
         >
-          <Icon name={videoAllowed && isCameraEnabled ? "video" : "camera-off"} />
+          <Icon
+            name={videoAllowed && isCameraEnabled ? "video" : "camera-off"}
+          />
           <span>
             {!videoAllowed
               ? "Camera blocked"

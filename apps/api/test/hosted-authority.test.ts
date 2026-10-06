@@ -900,6 +900,7 @@ test("host exchange atomically reserves one slot per host, and closing media ret
   const index = starts.findIndex((r) => r.statusCode === 200);
   const first = [one, two][index]!;
   const second = [one, two][1 - index]!;
+  assert.ok((await f.store.get(second.code))!.hostTokenHash);
   const cookie = starts[index]!.cookies.map((c) => `${c.name}=${c.value}`).join(
     "; ",
   );
@@ -948,6 +949,147 @@ test("host exchange atomically reserves one slot per host, and closing media ret
       })
     ).statusCode,
     200,
+  );
+});
+
+test("host leave ends the room and releases its start reservation after cleanup", async (t) => {
+  const f = await fixture(t);
+  const first = (await f.create()).json();
+  const second = (await f.create({ operationId: randomUUID() })).json();
+  const cookie = await f.exchange(first.code, first.hostToken);
+  const left = await f.browser(`/api/meetings/${first.code}/leave`, {}, cookie);
+  assert.equal(left.statusCode, 200, left.body);
+  assert.deepEqual(left.json(), { ok: true, cleanupPending: false });
+  assert.equal((await f.store.get(first.code))!.ended, true);
+  assert.equal(
+    (await f.store.get(first.code))!.lifecycle?.cleanupConfirmed,
+    true,
+  );
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${second.code}/host`, {
+        token: second.hostToken,
+      })
+    ).statusCode,
+    200,
+  );
+});
+
+test("current owner can end an older left-host room but not a future-version room", async (t) => {
+  const f = await fixture(t);
+  const first = (await f.create()).json();
+  await f.exchange(first.code, first.hostToken);
+  const status = () =>
+    f.internal("meetings/status", { accountId: f.accountId, version: 2 });
+  const end = (changes = {}) =>
+    f.internal(`meetings/${first.code}/end`, {
+      accountId: f.accountId,
+      version: 2,
+      ...changes,
+    });
+  assert.deepEqual((await status()).json(), {
+    meetings: [{ code: first.code, status: "active" }],
+  });
+  await f.store.change(first.code, (m) => {
+    m.participants.find((p) => p.role === "host")!.status = "left";
+  });
+  assert.deepEqual((await status()).json(), {
+    meetings: [{ code: first.code, status: "orphaned" }],
+  });
+  await f.store.change(first.code, (m) => {
+    m.hosted!.version = 3;
+  });
+  assert.deepEqual((await status()).json(), { meetings: [] });
+  assert.equal((await end()).statusCode, 409);
+  await f.store.change(first.code, (m) => {
+    m.hosted!.version = 1;
+  });
+  assert.equal((await end({ accountId: f.foreignAccountId })).statusCode, 409);
+  assert.equal((await end({ billingOwnerId: randomUUID() })).statusCode, 400);
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "POST",
+        url: `/api/internal/hosted/meetings/${first.code}/end`,
+        headers: { origin, "x-requested-with": "MeetingPlatform" },
+        payload: {
+          accountId: f.accountId,
+          version: 1,
+        },
+      })
+    ).statusCode,
+    403,
+  );
+  f.media.failEnd = true;
+  const pending = await end();
+  assert.equal(pending.statusCode, 202, pending.body);
+  assert.deepEqual(pending.json(), { ok: true, cleanupPending: true });
+  assert.deepEqual((await status()).json(), {
+    meetings: [{ code: first.code, status: "ending" }],
+  });
+  assert.equal(
+    (
+      await f.internal("entitlements", {
+        ...f.grant,
+        revision: 2,
+        validUntil: Date.now() - 1,
+      })
+    ).statusCode,
+    200,
+  );
+  f.media.failEnd = false;
+  const completed = await end();
+  assert.equal(completed.statusCode, 200, completed.body);
+  assert.deepEqual((await status()).json(), { meetings: [] });
+});
+
+test("current owner can end an active room when the host tab disappears", async (t) => {
+  const f = await fixture(t);
+  const first = (await f.create()).json();
+  await f.exchange(first.code, first.hostToken);
+  assert.equal(
+    (await f.store.get(first.code))!.participants.find((p) => p.role === "host")
+      ?.status,
+    "admitted",
+  );
+  const ended = await f.internal(`meetings/${first.code}/end`, {
+    accountId: f.accountId,
+    version: 1,
+  });
+  assert.equal(ended.statusCode, 200, ended.body);
+  assert.equal(
+    (await f.store.get(first.code))!.lifecycle?.cleanupConfirmed,
+    true,
+  );
+});
+
+test("hosted owner can finish cleanup after the host ended a room", async (t) => {
+  const f = await fixture(t);
+  const first = (await f.create()).json();
+  const cookie = await f.exchange(first.code, first.hostToken);
+  f.media.failEnd = true;
+  assert.equal(
+    (await f.browser(`/api/meetings/${first.code}/end`, {}, cookie)).statusCode,
+    202,
+  );
+  assert.deepEqual(
+    (
+      await f.internal("meetings/status", {
+        accountId: f.accountId,
+        version: 1,
+      })
+    ).json(),
+    { meetings: [{ code: first.code, status: "ending" }] },
+  );
+  f.media.failEnd = false;
+  const completed = await f.internal(`meetings/${first.code}/end`, {
+    accountId: f.accountId,
+    version: 1,
+  });
+  assert.equal(completed.statusCode, 200, completed.body);
+  assert.equal(
+    (await f.store.get(first.code))!.lifecycle?.cleanupConfirmed,
+    true,
   );
 });
 

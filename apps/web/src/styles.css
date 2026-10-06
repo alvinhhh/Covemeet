@@ -1341,17 +1341,6 @@ input[type="checkbox"] {
   background: #ababab;
   color: #2f2f2f;
 }
-.meeting-bottom .end-button {
-  font-size: 11px;
-  min-height: 33px;
-  background: transparent;
-  border-color: #505050;
-  color: #a6a6a6;
-  padding: 8px 12px;
-}
-.meeting-bottom .end-button:hover {
-  background: #3d3d3d;
-}
 .chat-panel {
   flex: 1;
   min-height: 0;
@@ -1932,10 +1921,6 @@ input[type="checkbox"] {
     height: 13px;
     font-size: 8px;
   }
-  .meeting-bottom .end-button {
-    font-size: 10px;
-    padding: 7px 9px;
-  }
   .recording-status {
     font-size: 0;
     margin-right: 2px;
@@ -2088,9 +2073,6 @@ input[type="checkbox"] {
     width: 100%;
     max-width: 100%;
     box-shadow: none;
-  }
-  .meeting-bottom .end-button {
-    font-size: 9px;
   }
   .panel-tabs button {
     min-width: 52px;
@@ -2897,16 +2879,6 @@ input[type="checkbox"] {
   color: #151515;
   border: 1px solid #777777;
 }
-.conference .meeting-bottom .end-button {
-  justify-self: end;
-  min-height: 48px;
-  font-size: 12px;
-  white-space: nowrap;
-  color: #eeeeee;
-  padding: 8px 12px;
-  border-radius: 10px;
-  border-color: #666666;
-}
 .conference button:focus-visible {
   outline: 2px solid currentColor;
   outline-offset: 3px;
@@ -3289,13 +3261,6 @@ input[type="checkbox"] {
   /* Chat remains next to the primary controls; other tools scroll after it. */
   .conference .panel-tabs button:nth-of-type(2) {
     order: 0;
-  }
-  .conference .meeting-bottom .end-button {
-    order: 2;
-    flex-shrink: 0;
-    margin: 0 0 0 6px;
-    min-height: 48px;
-    padding: 8px 12px;
   }
   .conference .device-error {
     position: fixed;

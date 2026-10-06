@@ -354,6 +354,7 @@ export interface Store {
   setAsset(id: string, mime: string, data: string): Promise<void>;
   create(m: Meeting): Promise<void>;
   get(code: string): Promise<Meeting | null>;
+  hostedMeetings(accountId: string): Promise<Meeting[]>;
   byRoom(room: string): Promise<Meeting | null>;
   all(): Promise<Meeting[]>;
   change<T>(code: string, fn: (m: Meeting) => Promise<T> | T): Promise<T>;
@@ -1139,6 +1140,14 @@ export class PgStore implements Store {
       (await this.pool.query("SELECT data FROM meetings WHERE code=$1", [code]))
         .rows[0]?.data ?? null
     );
+  }
+  async hostedMeetings(accountId: string) {
+    return (
+      await this.pool.query(
+        "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1",
+        [accountId],
+      )
+    ).rows.map((row) => row.data as Meeting);
   }
   async byRoom(room: string) {
     return (
@@ -2152,6 +2161,11 @@ export class MemoryStore implements Store {
   }
   async get(code: string) {
     return structuredClone(this.data.get(code) ?? null);
+  }
+  async hostedMeetings(accountId: string) {
+    return structuredClone(
+      [...this.data.values()].filter((m) => m.hosted?.accountId === accountId),
+    );
   }
   async byRoom(room: string) {
     return structuredClone(

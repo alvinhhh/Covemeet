@@ -657,6 +657,58 @@ export async function createApp(config: Config, store: Store, media: Media) {
       guestUrl: `${config.origin}/join/${m.code}`,
     };
   });
+  app.post("/api/internal/hosted/meetings/status", async (req) => {
+    const { accountId, version } = z
+      .object({ accountId: hostedUuid, version: hostedVersion })
+      .strict()
+      .parse(req.body);
+    const meetings = await store.hostedMeetings(accountId);
+    return {
+      meetings: meetings
+        .filter(
+          (m) =>
+            m.hosted &&
+            m.hosted.version <= version &&
+            m.lifecycle &&
+            !m.lifecycle.cleanupConfirmed,
+        )
+        .map((m) => ({
+          code: m.code,
+          status: m.ended
+            ? "ending"
+            : m.participants.find((p) => p.role === "host")?.status === "left"
+              ? "orphaned"
+              : "active",
+        })),
+    };
+  });
+  app.post("/api/internal/hosted/meetings/:code/end", async (req, reply) => {
+    const { accountId, version } = z
+      .object({
+        accountId: hostedUuid,
+        version: hostedVersion,
+      })
+      .strict()
+      .parse(req.body);
+    const m = await store.change(codeOf(req), (m) => {
+      if (
+        m.hosted?.accountId !== accountId ||
+        m.hosted.version > version ||
+        !m.lifecycle
+      )
+        throw new HttpError(
+          409,
+          "Meeting ownership changed or has not started",
+        );
+      endMeeting(m);
+      return structuredClone(m);
+    });
+    const complete = await cleanupMeeting(m);
+    await store.audit(m.code, `hosted:${accountId}`, "meeting.end");
+    return reply
+      .code(complete ? 200 : 202)
+      .send({ ok: true, cleanupPending: !complete });
+  });
   async function cleanupMeeting(m: Meeting) {
     let failed = false;
     try {
@@ -1106,15 +1158,27 @@ export async function createApp(config: Config, store: Store, media: Media) {
       .code(complete ? 200 : 202)
       .send({ ok: true, cleanupPending: !complete });
   });
-  app.post("/api/meetings/:code/leave", async (req) => {
+  app.post("/api/meetings/:code/leave", async (req, reply) => {
     let who!: Participant;
     const m = await store.change(codeOf(req), (m) => {
       const p = actor(req, m);
-      p.status = "left";
-      fenceParticipantMedia(m, p);
+      if (p.role === "host") {
+        p.status = "left";
+        endMeeting(m);
+      } else {
+        p.status = "left";
+        fenceParticipantMedia(m, p);
+      }
       who = structuredClone(p);
       return structuredClone(m);
     });
+    if (who.role === "host") {
+      const complete = await cleanupMeeting(m);
+      await store.audit(m.code, "host", "meeting.end");
+      return reply
+        .code(complete ? 200 : 202)
+        .send({ ok: true, cleanupPending: !complete });
+    }
     await enforce(m, [who]);
     return { ok: true };
   });
