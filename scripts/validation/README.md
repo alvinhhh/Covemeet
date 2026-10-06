@@ -15,8 +15,13 @@ No browser, microphone, camera, audio source, speaker, or media playback is used
 - Kick followed by fresh lobby entry on the same device marker.
 - Device and IP meeting bans, each including SFU disconnection and stale reconnect denial.
 - Meeting end, removed publisher, and rejected host reconnect/new entry.
-- Webinar viewer publication denial, presenter promotion, demotion, and rotated media authority.
+- Webinar audience holding before Go live; backstage presenters decode each other’s silent video.
+- Go live physically removes old backstage identities. The audience decodes stage video while a separate backstage publisher continues sending RTP, with no private identity or frames visible.
+- Explicit presenter stage transfers remove the old publisher and reject its stale token at both gateway paths. Returning backstage stops audience decoding while live-stage reception and private RTP continue.
+- Presenter promotion goes backstage; demotion restores a receive-only stage connection. Broadcast end removes stage and backstage publishers and deletes both SFU rooms.
 - Explicit host handoff removes the original publisher, preserves the selected co-host’s SFU session/RTP, and permits that co-host to end the room.
+
+The webinar checks require the lifecycle API and must run only after deploying the matching core build. At most three native peers are connected at once, with generated 160×90 video and no audio. Video receivers count decoded frames without rendering them. Negative isolation checks last 1.5 seconds and require both increasing private-publisher RTP bytes and continued stage decoding during that interval; room metadata alone is insufficient.
 
 Each successful publisher must send actual RTP video bytes with DTLS connected and an SRTP cipher reported by the native SDK. The evidence records the negotiated cipher names; this does not assert end-to-end encryption or certification.
 

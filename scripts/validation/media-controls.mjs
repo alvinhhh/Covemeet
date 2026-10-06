@@ -17,6 +17,9 @@ process.umask(0o077);
 process.env.RUST_LOG = "error";
 const {
   Room,
+  RoomEvent,
+  TrackKind,
+  VideoStream,
   VideoSource,
   VideoFrame,
   LocalVideoTrack,
@@ -73,7 +76,7 @@ const report = {
     mediaPlayback: false,
   },
   scope:
-    "Isolated meetings and webinar; authorization, screen sharing and host handoff, not load or browser UX",
+    "Isolated meetings and webinar; authorization, screen sharing, host handoff and broadcast isolation, not load or browser UX",
   requiredMediaRoute: forcedRelay
     ? `TURN/${forcedRelay.toUpperCase()} relay`
     : "any ICE route",
@@ -266,7 +269,7 @@ function claims(grant) {
     Buffer.from(grant.token.split(".")[1], "base64url").toString(),
   );
 }
-async function connect(client, grant) {
+async function connect(client, grant, receiveVideo = false) {
   const token = claims(grant);
   roomNames.add(token.video.room);
   const bridge = await relay(grant.url, client.header(), grant.token);
@@ -280,12 +283,49 @@ async function connect(client, grant) {
     stop: false,
     frames: 0,
     closed: false,
+    decoded: new Map(),
+    readers: new Map(),
+    decodeTasks: [],
   };
+  if (receiveVideo) {
+    const cancel = (sid) => {
+      const reader = peer.readers.get(sid);
+      peer.readers.delete(sid);
+      void reader?.cancel().catch(() => {});
+    };
+    room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      if (track.kind !== TrackKind.KIND_VIDEO || !publication.sid) return;
+      cancel(publication.sid);
+      const reader = new VideoStream(track).getReader();
+      peer.readers.set(publication.sid, reader);
+      peer.decodeTasks.push(
+        (async () => {
+          try {
+            while (!peer.closed) {
+              const { done } = await reader.read();
+              if (done || peer.closed) break;
+              peer.decoded.set(
+                participant.identity,
+                (peer.decoded.get(participant.identity) ?? 0) + 1,
+              );
+            }
+          } finally {
+            await reader.cancel().catch(() => {});
+            if (peer.readers.get(publication.sid) === reader)
+              peer.readers.delete(publication.sid);
+          }
+        })().catch(() => {}),
+      );
+    });
+    room.on(RoomEvent.TrackUnsubscribed, (_track, publication) =>
+      cancel(publication.sid),
+    );
+  }
   peers.add(peer);
   try {
     await bounded(
       room.connect(bridge.url, grant.token, {
-        autoSubscribe: false,
+        autoSubscribe: receiveVideo,
         dynacast: false,
         ...(forcedRelay
           ? {
@@ -416,6 +456,72 @@ async function publish(peer, screenShare = false) {
   );
   return p;
 }
+async function videoBytes(peer) {
+  return (await peer.room.getRtcStats()).publisherStats
+    .filter((entry) => entry.stats.case === "outboundRtp")
+    .reduce(
+      (sum, entry) => sum + Number(entry.stats.value.sent?.bytesSent || 0),
+      0,
+    );
+}
+async function decoded(peer, publisher, label) {
+  return until(
+    label,
+    () =>
+      (peer.decoded.get(publisher.id) ?? 0) >= 5 &&
+      peer.decoded.get(publisher.id),
+  );
+}
+async function privateVideoExcluded(
+  audience,
+  backstage,
+  stagePeer,
+  label,
+  retiredIdentity,
+) {
+  // Sample after the room transition; old cached publish-time stats cannot prove continuity.
+  const sentBefore = await videoBytes(backstage);
+  const stageBefore = audience.decoded.get(stagePeer.id) ?? 0;
+  await delay(300); // Allow already-decoded/in-flight frames from a retired stage track to drain.
+  const retiredBefore = retiredIdentity
+    ? (audience.decoded.get(retiredIdentity) ?? 0)
+    : 0;
+  await delay(1500);
+  const sentAfter = await videoBytes(backstage);
+  assert(
+    sentAfter > sentBefore,
+    "Backstage source did not send RTP during the negative observation",
+  );
+  assert(
+    (audience.decoded.get(stagePeer.id) ?? 0) > stageBefore,
+    "Audience stage reception stalled during the isolation check",
+  );
+  assert.equal(
+    audience.decoded.get(backstage.id) ?? 0,
+    0,
+    "Audience decoded backstage video",
+  );
+  assert.equal(
+    audience.room.remoteParticipants.has(backstage.id),
+    false,
+    "Audience discovered the private backstage identity",
+  );
+  if (retiredIdentity)
+    assert.equal(
+      audience.decoded.get(retiredIdentity) ?? 0,
+      retiredBefore,
+      "Audience kept decoding the retired stage connection",
+    );
+  await checkpoint(label, {
+    backstageVideoBytesBefore: sentBefore,
+    backstageVideoBytesAfter: sentAfter,
+    stageFramesBefore: stageBefore,
+    stageFramesAfter: audience.decoded.get(stagePeer.id),
+    backstageFramesDecoded: 0,
+    ...(retiredIdentity ? { retiredStageFramesUnchanged: true } : {}),
+    negativeObservationMilliseconds: 1500,
+  });
+}
 async function deniedScreenShare(peer) {
   const track = LocalVideoTrack.createVideoTrack(
     "Denied screen-share validation",
@@ -454,8 +560,12 @@ async function close(peer) {
   peer.stop = true;
   await peer.framesTask;
   await peer.track?.close().catch(() => {});
+  await Promise.allSettled(
+    [...peer.readers.values()].map((reader) => reader.cancel()),
+  );
   await peer.room.disconnect().catch(() => {});
   await peer.bridge.close();
+  await Promise.allSettled(peer.decodeTasks);
   peers.delete(peer);
 }
 async function removed(peer, label) {
@@ -991,7 +1101,7 @@ try {
   );
   await checkpoint("ended meeting rejects new entry and media credentials");
 
-  stage = "webinar viewer restriction";
+  stage = "webinar backstage creation";
   const webinar = await host.call("/meetings", {
     title: `Silent webinar validation ${runId.slice(0, 8)}`,
     hostName: "Validation webinar host",
@@ -1002,15 +1112,101 @@ try {
   code = webinar.code;
   ended = false;
   await host.call(route("/host"), { token: webinar.hostToken });
-  const viewer = new Client();
+  const viewer = new Client(),
+    presenter = new Client();
   const audience = await viewer.call(route("/join"), {
     name: "Validation viewer",
     password: meetingPassword,
   });
+  const presenterIdentity = await presenter.call(route("/join"), {
+    name: "Validation backstage presenter",
+    password: meetingPassword,
+  });
   await action(audience.participantId, "admit");
+  await action(presenterIdentity.participantId, "admit");
+  await action(presenterIdentity.participantId, "promote");
+  const backstageState = await host.call(route("/state"));
+  assert.equal(
+    backstageState.meeting.webinar.phase,
+    "backstage",
+    "Run this harness against the webinar lifecycle candidate",
+  );
+  assert.equal((await viewer.call(route("/state"))).me.mediaAllowed, false);
+  await viewer.call(route("/media"), {}, "POST", 403);
+  const rehearsalHostGrant = await media(host),
+    rehearsalPresenterGrant = await media(presenter);
+  let webinarHost = await connect(host, rehearsalHostGrant, true);
+  let webinarPresenter = await connect(
+    presenter,
+    rehearsalPresenterGrant,
+    true,
+  );
+  assert.equal(webinarHost.roomName, webinarPresenter.roomName);
+  const backstageRoom = webinarHost.roomName;
+  await publish(webinarHost);
+  await publish(webinarPresenter);
+  await decoded(
+    webinarHost,
+    webinarPresenter,
+    "host decodes private rehearsal video",
+  );
+  await decoded(
+    webinarPresenter,
+    webinarHost,
+    "presenter decodes private rehearsal video",
+  );
+  await viewer.call(route("/media"), {}, "POST", 403);
+  await checkpoint(
+    "backstage presenters exchange decoded silent video while audience media stays blocked",
+    {
+      hostDecodedFrames: webinarHost.decoded.get(webinarPresenter.id),
+      presenterDecodedFrames: webinarPresenter.decoded.get(webinarHost.id),
+      audienceMediaStatus: 403,
+    },
+  );
+
+  stage = "webinar go live";
+  await host.call(route("/webinar/start"), {
+    expectedRevision: backstageState.meeting.webinar.revision,
+    expectedControlRevision: backstageState.meeting.controlRevision,
+  });
+  await removed(
+    webinarHost,
+    "Go live removes the old backstage host publisher",
+  );
+  await removed(
+    webinarPresenter,
+    "Go live removes the old backstage presenter publisher",
+  );
+  await deniedGateway(
+    host,
+    rehearsalHostGrant,
+    "old backstage host token cannot reconnect after Go live",
+  );
+  await deniedGateway(
+    presenter,
+    rehearsalPresenterGrant,
+    "old backstage presenter token cannot reconnect after Go live",
+  );
+  const webinarHostGrant = await media(host);
+  webinarHost = await connect(host, webinarHostGrant, true);
+  await publish(webinarHost);
+  let presenterGrant = await media(presenter);
+  webinarPresenter = await connect(presenter, presenterGrant, true);
+  await publish(webinarPresenter);
+  assert.equal(webinarPresenter.roomName, backstageRoom);
+  assert.notEqual(webinarHost.roomName, backstageRoom);
   grant = await media(viewer);
   assert.equal(claims(grant).video.canPublish, false);
-  peer = await connect(viewer, grant);
+  peer = await connect(viewer, grant, true);
+  assert.equal(peer.roomName, webinarHost.roomName);
+  await decoded(peer, webinarHost, "audience decodes live stage host");
+  await privateVideoExcluded(
+    peer,
+    webinarPresenter,
+    webinarHost,
+    "audience receives live stage frames while backstage RTP remains private",
+  );
   let viewerPublishRejected = false;
   try {
     await publish(peer);
@@ -1019,55 +1215,146 @@ try {
   }
   assert.equal(viewerPublishRejected, true);
   assert.equal((await member(peer)).tracks.length, 0);
-  await host.call(
-    route(`/participants/${audience.participantId}/action`),
-    { action: "allow-video" },
-    "POST",
-    409,
-  );
-  await host.call(
-    route(`/participants/${audience.participantId}/action`),
-    { action: "allow-audio" },
-    "POST",
-    409,
-  );
+  for (const actionName of ["allow-video", "allow-audio"])
+    await host.call(
+      route(`/participants/${audience.participantId}/action`),
+      { action: actionName },
+      "POST",
+      409,
+    );
   await checkpoint(
-    "webinar viewer cannot publish camera or bypass stage through device controls",
+    "webinar viewer cannot publish camera or bypass presenter role through device controls",
   );
 
-  stage = "webinar stage promotion";
+  const movePresenter = async (location) => {
+    const current = await host.call(route("/state"));
+    await host.call(
+      route(`/webinar/participants/${presenterIdentity.participantId}`),
+      {
+        location,
+        expectedRevision: current.meeting.webinar.revision,
+        expectedControlRevision: current.meeting.controlRevision,
+      },
+      "PUT",
+    );
+  };
+  stage = "webinar presenter to stage";
+  await movePresenter("stage");
+  await removed(
+    webinarPresenter,
+    "stage transfer removes the actual backstage publisher",
+  );
+  await deniedGateway(
+    presenter,
+    presenterGrant,
+    "old backstage token cannot reconnect after stage transfer",
+  );
+  presenterGrant = await media(presenter);
+  webinarPresenter = await connect(presenter, presenterGrant, true);
+  await publish(webinarPresenter);
+  assert.equal(webinarPresenter.roomName, peer.roomName);
+  await decoded(
+    peer,
+    webinarPresenter,
+    "audience decodes the explicitly selected presenter",
+  );
+  await checkpoint(
+    "explicit stage transfer delivers decoded presenter frames to the audience",
+    {
+      audienceDecodedPresenterFrames: peer.decoded.get(webinarPresenter.id),
+      mediaTransport: webinarPresenter.transportEvidence,
+    },
+  );
+  const retiredStageIdentity = webinarPresenter.id;
+  stage = "webinar presenter back to backstage";
+  await movePresenter("backstage");
+  await removed(
+    webinarPresenter,
+    "backstage transfer removes the actual live-stage publisher",
+  );
+  await deniedGateway(
+    presenter,
+    presenterGrant,
+    "old stage token cannot reconnect after backstage transfer",
+  );
+  presenterGrant = await media(presenter);
+  webinarPresenter = await connect(presenter, presenterGrant, true);
+  await publish(webinarPresenter);
+  assert.equal(webinarPresenter.roomName, backstageRoom);
+  await privateVideoExcluded(
+    peer,
+    webinarPresenter,
+    webinarHost,
+    "audience stops decoding the transferred presenter while stage and backstage RTP continue",
+    retiredStageIdentity,
+  );
+
+  stage = "webinar presenter promotion and demotion";
   await action(audience.participantId, "promote");
-  await removed(peer, "stage promotion rotates the viewer connection");
+  await removed(peer, "presenter promotion rotates the viewer connection");
   await deniedGateway(
     viewer,
     grant,
     "pre-promotion viewer token cannot reconnect",
   );
   grant = await media(viewer);
-  peer = await connect(viewer, grant);
+  peer = await connect(viewer, grant, true);
   await publish(peer);
-  assert.equal((await viewer.call(route("/state"))).me.role, "participant");
-  await checkpoint("promoted webinar presenter publishes real silent video");
-
-  stage = "webinar stage demotion";
+  assert.equal(
+    peer.roomName,
+    backstageRoom,
+    "Promotion alone must not put a presenter on the live stage",
+  );
+  await decoded(
+    peer,
+    webinarPresenter,
+    "new presenter decodes only backstage rehearsal",
+  );
+  assert.equal(peer.room.remoteParticipants.has(webinarHost.id), false);
+  await checkpoint(
+    "promoted webinar presenter publishes real silent video backstage",
+  );
   await action(audience.participantId, "demote");
-  await removed(peer, "demotion removes actual presenter publisher from SFU");
+  await removed(
+    peer,
+    "demotion removes actual backstage presenter publisher from SFU",
+  );
   await deniedGateway(
     viewer,
     grant,
     "demoted presenter token cannot reconnect",
   );
   grant = await media(viewer);
-  peer = await connect(viewer, grant);
+  peer = await connect(viewer, grant, true);
   assert.equal((await member(peer)).permission.canPublish, false);
   assert.equal((await viewer.call(route("/state"))).me.role, "viewer");
+  await decoded(peer, webinarHost, "demoted viewer receives stage again");
   await checkpoint(
-    "demoted presenter reconnects with SFU publication disabled",
+    "demoted presenter reconnects to stage with SFU publication disabled",
   );
+  stage = "webinar end";
   await host.call(route("/end"), {});
   ended = true;
   await removed(peer, "webinar end disconnects the audience connection");
+  await removed(webinarHost, "webinar end removes the live-stage publisher");
+  await removed(
+    webinarPresenter,
+    "webinar end removes the private backstage publisher",
+  );
   await deniedGateway(viewer, grant, "ended webinar rejects viewer reconnect");
+  await deniedGateway(
+    presenter,
+    presenterGrant,
+    "ended webinar rejects backstage presenter reconnect",
+  );
+  await until(
+    "both webinar rooms deleted",
+    async () =>
+      (await sfu.listRooms([backstageRoom, webinarHost.roomName])).length === 0,
+  );
+  await checkpoint(
+    "ending the broadcast deletes both stage and backstage SFU rooms",
+  );
   stage = "host handoff creation";
   const handoffMeeting = await host.call("/meetings", {
     title: `Silent handoff validation ${runId.slice(0, 8)}`,
