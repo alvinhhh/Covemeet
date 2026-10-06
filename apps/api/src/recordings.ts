@@ -1190,6 +1190,33 @@ export class RecordingService {
         if (first && !first.done && !handedOff) first.value.fill(0);
         await reader.return?.();
       })());
+    const currentAccess = (state: Meeting | null) => {
+      signal?.throwIfAborted();
+      if (!state) throw new HttpError(403, "Download unavailable");
+      authorize?.(state);
+      const saved = state.recordings.find((row) => row.id === r.id);
+      if (
+        state.id !== current.m.id ||
+        state.hosted?.revoked ||
+        !saved ||
+        saved.status !== "ready" ||
+        saved.createdAt <= Date.now() - retentionMs ||
+        (saved.expiresAt ?? 0) <= Date.now() ||
+        saved.tokenHash !== current.r.tokenHash ||
+        saved.passwordHash !== current.r.passwordHash ||
+        saved.ciphertextId !== current.r.ciphertextId ||
+        !isDeepStrictEqual(saved.metadata, current.r.metadata)
+      )
+        throw new HttpError(403, "Download unavailable");
+    };
+    const authorizeFrame = async (frame: Buffer) => {
+      try {
+        currentAccess(await this.store.get(m.code));
+      } catch (error) {
+        frame.fill(0);
+        throw error;
+      }
+    };
     try {
       if (signal) addAbortSignal(signal, source);
       // Open the file and authenticate its first frame before charging. The
@@ -1198,35 +1225,24 @@ export class RecordingService {
       await this.store.debitRecordingDownload(
         m.code,
         current.r.metadata.plaintextBytes,
-        (state) => {
-          signal?.throwIfAborted();
-          authorize?.(state);
-          const saved = state.recordings.find((row) => row.id === r.id);
-          if (
-            state.id !== current.m.id ||
-            state.hosted?.revoked ||
-            !saved ||
-            saved.status !== "ready" ||
-            saved.createdAt <= Date.now() - retentionMs ||
-            (saved.expiresAt ?? 0) <= Date.now() ||
-            saved.tokenHash !== current.r.tokenHash ||
-            saved.passwordHash !== current.r.passwordHash ||
-            saved.ciphertextId !== current.r.ciphertextId ||
-            !isDeepStrictEqual(saved.metadata, current.r.metadata)
-          )
-            throw new HttpError(403, "Download unavailable");
-        },
+        currentAccess,
       );
       await this.store.audit(m.code, "host", "recording.download", r.id);
       signal?.throwIfAborted();
       const output = Readable.from(
         (async function* () {
           try {
+            // A revocation on another API process blocks the next frame; bytes
+            // already handed to the transport cannot be recalled.
             if (!first!.done) {
+              await authorizeFrame(first!.value);
               handedOff = true;
               yield first!.value;
             }
-            for await (const chunk of reader) yield chunk;
+            for await (const chunk of reader) {
+              await authorizeFrame(chunk);
+              yield chunk;
+            }
           } finally {
             await close();
           }

@@ -43,7 +43,11 @@ const creationKey = "test-recording-creation-key-more-than-32-characters";
 const forbidden = (error: unknown) =>
   error instanceof HttpError && error.status === 403;
 
-async function fixture(t: TestContext, status = "ready") {
+async function fixture(
+  t: TestContext,
+  status = "ready",
+  payloadBytes = 80_000,
+) {
   const directory = await mkdtemp(
     path.join(tmpdir(), "meeting-recording-service-"),
   );
@@ -130,7 +134,7 @@ async function fixture(t: TestContext, status = "ready") {
   };
   const plaintext = Buffer.concat([
     Buffer.from("synthetic recording payload\n"),
-    Buffer.alloc(80_000, 42),
+    Buffer.alloc(payloadBytes, 42),
   ]);
   const raw = path.join(directory, "raw", `${recording.id}.mp4`);
   const encrypted = path.join(directory, "encrypted", `${recording.id}.mprec`);
@@ -201,6 +205,40 @@ async function fixture(t: TestContext, status = "ready") {
   };
 }
 
+function gateSecondFrameRead(store: MemoryStore, code: string) {
+  const get = store.get.bind(store);
+  const debit = store.debitRecordingDownload.bind(store);
+  let debitCompleted = false;
+  let frameReads = 0;
+  let release!: () => void;
+  let enter!: () => void;
+  let unavailable = false;
+  const entered = new Promise<void>((resolve) => (enter = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  store.debitRecordingDownload = async (...args) => {
+    await debit(...args);
+    if (args[0] === code) debitCompleted = true;
+  };
+  store.get = async (currentCode) => {
+    if (currentCode === code && debitCompleted && ++frameReads === 2) {
+      // Count frame checks after debit, independent of hosted or legacy preflight reads.
+      enter();
+      await gate;
+      if (unavailable) throw new Error("Synthetic shared-store outage");
+    }
+    return get(currentCode);
+  };
+  return {
+    entered,
+    release,
+    fail: () => (unavailable = true),
+    restore: () => {
+      store.get = get;
+      store.debitRecordingDownload = debit;
+    },
+  };
+}
+
 test("recording links last 24 hours and send the password without the capability URL", async (t) => {
   const f = await fixture(t);
   const before = Date.now();
@@ -245,6 +283,78 @@ test("regenerating, expiring, and revoking a link invalidate old credentials", a
   await f.service.revoke(f.meeting, f.recording.id);
   assert.equal(await f.service.findToken(third.token, f.meeting.code), null);
   await assert.rejects(f.collect(third.token, third.password), forbidden);
+});
+
+test("a revoked download stops before its next plaintext frame, including across service instances", async (t) => {
+  const f = await fixture(t, "ready", 2 * 1024 * 1024 + 17);
+  const used = await downloadAllowance(f, f.plaintext.length * 2);
+  const link = await f.link();
+  const gate = gateSecondFrameRead(f.store, f.meeting.code);
+  const stream = await f.service.download(
+    f.meeting,
+    f.recording,
+    link.token,
+    link.password,
+  );
+  t.after(() => {
+    gate.release();
+    gate.restore();
+    stream.destroy();
+  });
+  const frames = stream[Symbol.asyncIterator]();
+  const first = await frames.next();
+  assert.equal(first.done, false);
+  assert.equal(first.value.length, 1024 * 1024);
+
+  const otherInstance = new RecordingService(f.config, f.store, f.mail);
+  const next = frames.next();
+  await Promise.race([
+    gate.entered,
+    next.then(() => assert.fail("Second plaintext frame escaped authorization")),
+  ]);
+  try {
+    await otherInstance.revoke(f.meeting, f.recording.id);
+  } finally {
+    gate.release();
+  }
+  await assert.rejects(next, forbidden);
+  assert.equal(stream.destroyed, true);
+  assert.equal(await used(), f.plaintext.length);
+
+  const renewed = await f.link();
+  assert.deepEqual(
+    await f.collect(renewed.token, renewed.password),
+    f.plaintext,
+  );
+  assert.equal(await used(), f.plaintext.length * 2);
+});
+
+test("an active download stops if current recording authority is unavailable", async (t) => {
+  const f = await fixture(t, "ready", 2 * 1024 * 1024 + 17);
+  const link = await f.link();
+  const gate = gateSecondFrameRead(f.store, f.meeting.code);
+  const stream = await f.service.download(
+    f.meeting,
+    f.recording,
+    link.token,
+    link.password,
+  );
+  t.after(() => {
+    gate.release();
+    gate.restore();
+    stream.destroy();
+  });
+  const frames = stream[Symbol.asyncIterator]();
+  assert.equal((await frames.next()).value.length, 1024 * 1024);
+  const next = frames.next();
+  await Promise.race([
+    gate.entered,
+    next.then(() => assert.fail("Second plaintext frame escaped authorization")),
+  ]);
+  gate.fail();
+  gate.release();
+  await assert.rejects(next, /Synthetic shared-store outage/);
+  assert.equal(stream.destroyed, true);
 });
 
 test("email failure revokes the newly generated download credentials", async (t) => {
