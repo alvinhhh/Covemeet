@@ -877,10 +877,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
         .parse(req.body);
       const session = randomToken();
       const code = codeOf(req);
-      const id = await store.change(code, async (m) => {
+      const found = await find(req);
+      active(found);
+      if (found.locked) throw new HttpError(403, "Meeting is locked");
+      // Password work must not hold the meeting lock needed by host controls.
+      if (!(await checkPassword(found.passwordHash, body.password)))
+        throw new HttpError(403, "Meeting credentials are invalid");
+      const id = await store.change(code, (m) => {
         active(m);
         if (m.locked) throw new HttpError(403, "Meeting is locked");
-        if (!(await checkPassword(m.passwordHash, body.password)))
+        if (m.passwordHash !== found.passwordHash)
           throw new HttpError(403, "Meeting credentials are invalid");
         const ids = identity(req, reply, code);
         if (

@@ -6,6 +6,7 @@ import { createApp } from "../src/server.js";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import type { Media } from "../src/media.js";
 import { RecordingService } from "../src/recordings.js";
+import argon2 from "argon2";
 
 const origin = "http://localhost:5173";
 const creationKey = "test-creation-key-that-is-longer-than-32-characters";
@@ -336,6 +337,62 @@ test("locking rejects new guests while admitted participants retain access", asy
       password,
     }),
   );
+});
+
+test("guest password verification does not block moderation and admission rechecks the lock", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  let verifying!: () => void;
+  const started = new Promise<void>((resolve) => (verifying = resolve));
+  let release!: (valid: boolean) => void;
+  t.mock.method(argon2, "verify", async () => {
+    verifying();
+    return new Promise<boolean>((resolve) => (release = resolve));
+  });
+  const guest = new Client(f.app, "198.51.100.40");
+  const joining = guest.request("POST", `/api/meetings/${m.code}/join`, {
+    name: "Guest",
+    password,
+  });
+  await started;
+  const locking = f.host.request("PATCH", `/api/meetings/${m.code}`, {
+    locked: true,
+  });
+  let timeout!: ReturnType<typeof setTimeout>;
+  const locked = await Promise.race([
+    locking,
+    new Promise<undefined>((resolve) => {
+      timeout = setTimeout(resolve, 1000);
+    }),
+  ]);
+  clearTimeout(timeout);
+  release(true);
+  const joined = await joining;
+  await locking;
+  assert.ok(locked, "Host moderation waited for guest password verification");
+  ok(locked);
+  assert.equal(joined.statusCode, 403);
+  assert.match(joined.json().error, /locked/i);
+  assert.equal((await f.store.get(m.code))!.participants.length, 1);
+});
+
+test("admission rejects a password changed while verification was pending", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  t.mock.method(argon2, "verify", async () => {
+    await f.store.change(m.code, (meeting) => {
+      meeting.passwordHash = "replaced-password-hash";
+    });
+    return true;
+  });
+  const response = await new Client(f.app, "198.51.100.40").request(
+    "POST",
+    `/api/meetings/${m.code}/join`,
+    { name: "Guest", password },
+  );
+  assert.equal(response.statusCode, 403);
+  assert.match(response.json().error, /credentials/i);
+  assert.equal((await f.store.get(m.code))!.participants.length, 1);
 });
 
 test("source restrictions revoke previous grants and cannot be lifted by a guest", async (t) => {
