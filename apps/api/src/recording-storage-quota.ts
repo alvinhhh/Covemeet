@@ -8,6 +8,7 @@ import type {
   RecordingObjectReference,
 } from "@meeting-platform/recording";
 import type { HostedEntitlement } from "./meeting-limits.js";
+import { recordingContext } from "./recording-context.js";
 import { HttpError } from "./security.js";
 import type { Meeting, Recording } from "./store.js";
 
@@ -220,12 +221,14 @@ export function prepareRecordingStorage(
     return row;
   }
   const metadata = prepared.metadata;
+  const expectedContext = recordingContext(m, r);
   if (
     row.state !== "reserved" ||
     prepared.kind !== row.kind ||
     metadata.version !== 1 ||
-    metadata.context.meetingId !== m.id ||
-    metadata.context.recordingId !== r.id ||
+    metadata.context.tenantId !== expectedContext.tenantId ||
+    metadata.context.meetingId !== expectedContext.meetingId ||
+    metadata.context.recordingId !== expectedContext.recordingId ||
     !metadata.recordingKeyId ||
     !bytes(metadata.plaintextBytes) ||
     !bytes(metadata.encryptedBytes) ||

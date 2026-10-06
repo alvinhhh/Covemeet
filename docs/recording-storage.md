@@ -2,6 +2,8 @@
 
 The application supports its existing local encrypted files, a rotating local keyring, AWS KMS envelope wrapping, and private S3-compatible ciphertext storage. Existing `operator-kek-v1` envelopes remain readable with the original `RECORDING_KEK`. These adapters do not establish FIPS validation, media E2EE, production readiness, or compliance.
 
+New hosted recordings stamp context version 2 at reservation and authenticate the creation-time billing owner in their encryption, key envelopes, object references, and links. Missing markers on older recordings and version 1 self-hosted recordings retain the `installation` context. An invalid or missing owner on a version 2 row, or an unsupported version, fails closed. This tenant binding does not provide separate per-tenant KEKs, KMS keys, S3 identities, or database isolation. Upgrade all API workers together before creating version 2 recordings.
+
 Recording starts only after the host enables recording and verifies an email address. The recorder is a trusted participant that can access plaintext media. Keep its raw spool on bounded tmpfs or an encrypted ephemeral volume, with encrypted/disabled swap and restricted access. The encryption package authenticates each chunk with AES-256-GCM and a separate per-recording data key before storage. It cannot retroactively secure a raw file already written to a durable unencrypted filesystem.
 
 ## Hosted recording time

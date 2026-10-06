@@ -6,6 +6,7 @@ import {
   entitlementSchema,
   type HostedEntitlement,
 } from "../src/meeting-limits.js";
+import { recordingContext } from "../src/recording-context.js";
 import {
   MemoryStore,
   type Meeting,
@@ -88,11 +89,7 @@ async function fixture(t: TestContext, limit = 1000) {
     meeting = m,
   ): EncryptedRecordingMetadata => ({
     version: 1,
-    context: {
-      tenantId: "installation",
-      meetingId: meeting.id,
-      recordingId: r.id,
-    },
+    context: recordingContext(meeting, r),
     recordingKeyId: randomUUID(),
     wrappedKey: {
       provider: "fixture",
@@ -114,6 +111,16 @@ async function fixture(t: TestContext, limit = 1000) {
     usage: async () => (await store.hostedUsage(owner)).recordingStorageBytes,
   };
 }
+
+test("legacy recording metadata retains the installation context", async (t) => {
+  const f = await fixture(t);
+  const legacy = { id: randomUUID(), status: "ready" as const, createdAt: now };
+  assert.equal(recordingContext(f.m, legacy).tenantId, "installation");
+  assert.equal(
+    recordingContext(f.m, { ...legacy, contextVersion: 1 }).tenantId,
+    "installation",
+  );
+});
 
 test("capture reserves both encrypted copies atomically and rejected starts persist no time or row", async (t) => {
   const f = await fixture(t),

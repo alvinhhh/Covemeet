@@ -1367,7 +1367,7 @@ test(
     const metadata = {
       version: 1 as const,
       context: {
-        tenantId: "installation",
+        tenantId: `hosted-owner:${owner}`,
         meetingId: current.id,
         recordingId: id,
       },

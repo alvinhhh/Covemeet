@@ -30,6 +30,7 @@ import {
   verifyRecordingPassword,
 } from "@meeting-platform/recording";
 import type { Config } from "./config.js";
+import { recordingContext } from "./recording-context.js";
 import type {
   Meeting,
   Recording,
@@ -159,7 +160,7 @@ export class RecordingService {
       );
   }
   private context(m: Meeting, r: Recording) {
-    return { tenantId: "installation", meetingId: m.id, recordingId: r.id };
+    return recordingContext(m, r);
   }
   private file(r: Recording, raw = false) {
     if (!/^[a-f0-9-]{36}$/.test(r.id)) throw new Error("Invalid recording ID");

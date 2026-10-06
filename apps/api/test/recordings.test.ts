@@ -1243,6 +1243,9 @@ function boundedSourceClose(source: Readable) {
 test("download starts debit the full file once, and a retry consumes another full debit", async (t) => {
   const f = await fixture(t);
   const used = await downloadAllowance(f, f.plaintext.length * 2);
+  const legacy = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(legacy.contextVersion, undefined);
+  assert.equal(legacy.metadata.context.tenantId, "installation");
   const link = await f.link();
   assert.deepEqual(await f.collect(link.token, link.password), f.plaintext);
   assert.equal(await used(), f.plaintext.length);
@@ -1252,6 +1255,144 @@ test("download starts debit the full file once, and a retry consumes another ful
     code: "RECORDING_DOWNLOAD_QUOTA_UNAVAILABLE",
   });
   assert.equal(await used(), f.plaintext.length * 2);
+});
+
+test("recording reservation stamps context from the locked room, never a supplied marker", async (t) => {
+  const f = await fixture(t);
+  await f.store.change(f.meeting.code, (m) => { m.recordings = []; });
+  const reserve = (id: string) => f.store.withRecordingLock(
+    f.meeting.code,
+    id,
+    (lock) => lock.reserveRecording(
+      { id, status: "starting", createdAt: Date.now(), contextVersion: 1 },
+      () => {},
+      { maxBytes: 1_000_000, copies: 1 },
+    ),
+  );
+  const selfHosted = await reserve(randomUUID());
+  assert.equal(selfHosted.acquired && selfHosted.value.contextVersion, 1);
+  const accountId = randomUUID(), owner = randomUUID();
+  await f.store.change(f.meeting.code, (m) => {
+    m.recordings = [];
+    m.hosted = { accountId, billingOwnerId: owner, version: 1 };
+  });
+  await f.store.setHostedEntitlement({
+    billingOwnerId: owner,
+    revision: 1,
+    enabled: true,
+    validUntil: Date.now() + 300_000,
+    hostAccountIds: [accountId],
+    limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 1 },
+    quota: {
+      anchorAt: Date.now() - day,
+      participantSecondsPerMonth: 360_000,
+      recordingSecondsPerMonth: null,
+      storageBytes: 2_000_000,
+    },
+  });
+  const hosted = await reserve(randomUUID());
+  assert.equal(hosted.acquired && hosted.value.contextVersion, 2);
+  const saved = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(saved.contextVersion, 2);
+  const attempt = saved.storage!.attempts[0]!;
+  const metadata = {
+    version: 1,
+    context: {
+      tenantId: "installation",
+      meetingId: f.meeting.id,
+      recordingId: saved.id,
+    },
+    recordingKeyId: randomBytes(16).toString("hex"),
+    wrappedKey: { provider: "fixture", keyId: "fixture", ciphertext: "wrapped" },
+    plaintextBytes: 1,
+    encryptedBytes: 400,
+  } as EncryptedRecordingMetadata;
+  await assert.rejects(
+    f.store.withRecordingLock(f.meeting.code, saved.id, (lock) =>
+      lock.prepareRecordingStorage(attempt.id, { kind: "local", metadata }),
+    ),
+    /Recording storage attempt changed/,
+  );
+  const accepted = await f.store.withRecordingLock(
+    f.meeting.code,
+    saved.id,
+    (lock) => lock.prepareRecordingStorage(attempt.id, {
+      kind: "local",
+      metadata: {
+        ...metadata,
+        context: { ...metadata.context, tenantId: `hosted-owner:${owner}` },
+      },
+    }),
+  );
+  assert.equal(accepted.acquired, true);
+  await f.store.change(f.meeting.code, (m) => { delete m.hosted!.billingOwnerId; });
+  await assert.rejects(reserve(randomUUID()), /Recording owner is unavailable/);
+});
+
+test("hosted recording context binds links and ciphertext to the original billing owner", async (t) => {
+  const f = await fixture(t);
+  const accountId = randomUUID(), originalOwner = randomUUID();
+  await f.store.change(f.meeting.code, (m) => {
+    m.hosted = { accountId, billingOwnerId: originalOwner, version: 1 };
+    m.recordings[0]!.contextVersion = 2;
+  });
+  await f.store.setHostedEntitlement({
+    billingOwnerId: originalOwner,
+    revision: 1,
+    enabled: true,
+    validUntil: Date.now() + 300_000,
+    hostAccountIds: [accountId],
+    limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 1 },
+    quota: {
+      anchorAt: Date.now() - day,
+      participantSecondsPerMonth: 360_000,
+      recordingSecondsPerMonth: null,
+      storageBytes: 1_000_000,
+      downloadBytesPerMonth: f.plaintext.length * 3,
+    },
+  });
+  await writeFile(f.raw, f.plaintext, { mode: 0o600 });
+  await unlink(f.encrypted);
+  const key = Buffer.from(f.config.recordingKek, "base64");
+  const provider = new LocalKeyProvider({ keyId: "operator-kek-v1", key });
+  try {
+    const metadata = await encryptRecording(
+      f.raw,
+      f.encrypted,
+      {
+        tenantId: `hosted-owner:${originalOwner}`,
+        meetingId: f.meeting.id,
+        recordingId: f.recording.id,
+      },
+      provider,
+    );
+    await f.store.change(f.meeting.code, (m) => { m.recordings[0]!.metadata = metadata; });
+  } finally {
+    provider.destroy();
+    key.fill(0);
+  }
+  const link = await f.link();
+  assert.deepEqual(await f.collect(link.token, link.password), f.plaintext);
+  // A later team move does not rewrite the room's creation-time owner.
+  const nextOwner = randomUUID();
+  await f.store.setHostedEntitlement({
+    billingOwnerId: nextOwner,
+    revision: 1,
+    enabled: true,
+    validUntil: Date.now() + 300_000,
+    hostAccountIds: [accountId],
+    limits: { participants: 100, durationSeconds: 7200, concurrentMeetings: 1 },
+    quota: { anchorAt: Date.now() - day, participantSecondsPerMonth: 360_000 },
+  });
+  assert.equal((await f.store.get(f.meeting.code))!.hosted!.billingOwnerId, originalOwner);
+  assert.deepEqual(await f.collect(link.token, link.password), f.plaintext);
+  await f.store.change(f.meeting.code, (m) => { m.hosted!.billingOwnerId = nextOwner; });
+  await assert.rejects(f.service.currentLink(f.meeting, f.recording.id));
+  await f.store.change(f.meeting.code, (m) => { delete m.hosted!.billingOwnerId; });
+  await assert.rejects(f.service.currentLink(f.meeting, f.recording.id), /tenant binding/);
+  await f.store.change(f.meeting.code, (m) => { m.hosted!.billingOwnerId = originalOwner; });
+  await f.store.change(f.meeting.code, (m) => { (m.recordings[0] as any).contextVersion = 3; });
+  await assert.rejects(f.service.currentLink(f.meeting, f.recording.id), /Unsupported recording context version/);
 });
 
 test("invalid credentials and missing or unauthentic ciphertext never debit download bytes", async (t) => {

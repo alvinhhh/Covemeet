@@ -124,6 +124,8 @@ export type Participant = {
   previousRoom?: string;
 };
 export type Recording = {
+  // Absent on pre-migration recordings, whose authenticated context was installation-wide.
+  contextVersion?: 1 | 2;
   storage?: RecordingStorage;
   timeReservation?: RecordingTimeReservation;
   rawCleanupPending?: boolean;
@@ -333,6 +335,10 @@ function recordingTimeMethods(
         )
           throw new HttpError(409, "Recording reservation changed");
         const r = structuredClone(recording);
+        if (m.hosted && !m.hosted.billingOwnerId)
+          throw new HttpError(403, "Recording owner is unavailable");
+        // Stamp from the locked room, never from the request or a later team seat.
+        r.contextVersion = m.hosted ? 2 : 1;
         if (m.hosted?.billingOwnerId) {
           if (!ledger)
             throw new HttpError(404, "Usage unavailable", "USAGE_UNAVAILABLE");
