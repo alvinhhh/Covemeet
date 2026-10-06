@@ -1124,7 +1124,12 @@ try {
   assert.equal(afterHandoff.meeting.canEnd, true);
   assert.equal(afterHandoff.me.role, "participant");
   assert.equal((await member(successorPeer)).sid, successorSid);
-  const bytesBefore = successorPeer.transportEvidence.videoBytesSent;
+  const bytesBefore = (await successorPeer.room.getRtcStats()).publisherStats
+    .filter((entry) => entry.stats.case === "outboundRtp")
+    .reduce(
+      (sum, entry) => sum + Number(entry.stats.value.sent?.bytesSent || 0),
+      0,
+    );
   const bytesAfter = await until(
     "co-host video continues after handoff",
     async () => {
