@@ -9,6 +9,7 @@ Built with React, TypeScript, LiveKit, Fastify, PostgreSQL and Redis.
 - **Meetings and webinars** with screen sharing, chat, and presenter/viewer roles.
 - **Host controls** for admitting guests, locking meetings, muting microphones, disabling cameras, kicking participants and banning them from a meeting.
 - **Breakout rooms** with separate chat, host announcements and return-to-main controls.
+- **Shared whiteboard** with drawing, text, pan and zoom, and host editing controls.
 - **Custom branding** with your own name, logo, background and landing page.
 - **Optional encrypted recordings** with password-protected, revocable 24-hour download links. Self-hosted installations can use their own recording keys.
 - **Flexible setup** with custom meeting codes and separate domains for the control panel and meetings.
