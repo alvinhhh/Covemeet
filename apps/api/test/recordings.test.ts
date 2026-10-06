@@ -2662,6 +2662,7 @@ test("recording-only credentials cannot act in an active room", async (t) => {
 });
 
 test("recording recovery expiration and failed email leave no usable capability", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const f = await fixture(t),
     app = await f.app(),
     base = `/api/meetings/${f.meeting.code}`;
@@ -2680,9 +2681,8 @@ test("recording recovery expiration and failed email leave no usable capability"
     c.name.startsWith("mp_recording_recovery_"),
   )!;
   const otp = /Verification code: (\d{6})/.exec(f.emails.at(-1)!.text)![1]!;
-  await f.store.change(f.meeting.code, (m) => {
-    m.recordingRecovery!.expiresAt = Date.now() - 1;
-  });
+  const challenge = (await f.store.get(f.meeting.code))!.recordingRecovery!;
+  t.mock.timers.setTime(challenge.expiresAt + 1);
   const invalid = await app.inject({
     method: "POST",
     url: base + "/recording-access/verify",
@@ -2694,6 +2694,11 @@ test("recording recovery expiration and failed email leave no usable capability"
     payload: { otp },
   });
   assert.equal(invalid.statusCode, 403);
+  assert.deepEqual(
+    (await f.store.get(f.meeting.code))!.recordingRecovery,
+    challenge,
+    "Expiry must reject the unchanged challenge, not a mismatched HMAC",
+  );
   await f.store.change(f.meeting.code, (m) => {
     m.recordingRecoveryRequestedAt = 0;
   });
