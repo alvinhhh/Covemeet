@@ -2657,6 +2657,10 @@ input[type="checkbox"] {
   pointer-events: visiblePainted;
   user-select: none;
 }
+.whiteboard-canvas [role="button"]:focus-visible {
+  outline: 3px solid #171717;
+  outline-offset: 4px;
+}
 .whiteboard-text-entry {
   position: absolute;
   z-index: 2;

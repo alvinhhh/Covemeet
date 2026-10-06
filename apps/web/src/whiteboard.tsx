@@ -1,20 +1,25 @@
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type FormEvent,
+  type KeyboardEvent,
   type PointerEvent,
   type ReactNode,
 } from "react";
 import { api, meetingPath, messageOf } from "./api";
 import { Icon } from "./icons";
 import {
-  applyBoardEvents,
+  applyBoardPage,
+  applyBoardWrite,
+  initialBoardState,
+  initialViewport,
   sampleStroke,
+  savedViewport,
   worldPoint,
   zoomAt,
   type BoardEvent,
-  type BoardItem,
   type Viewport,
 } from "./whiteboard-state";
 
@@ -33,12 +38,24 @@ type Write =
   | { kind: "clear" }
   | { kind: "policy"; readOnly: boolean };
 
-export function Whiteboard({ code, host }: { code: string; host: boolean }) {
-  const [items, setItems] = useState<BoardItem[]>([]);
-  const [readOnly, setReadOnly] = useState(false);
+export function Whiteboard({
+  code,
+  host,
+  scope,
+  viewportStore,
+}: {
+  code: string;
+  host: boolean;
+  scope: string;
+  viewportStore: Map<string, Viewport>;
+}) {
+  const [board, setBoard] = useState(initialBoardState);
+  const { items, readOnly } = board;
   const epochRef = useRef(0);
   const [tool, setTool] = useState<Tool>("pen");
-  const [viewport, setViewport] = useState<Viewport>({ x: 0, y: 0, scale: 1 });
+  const [viewport, setViewport] = useState<Viewport>(() =>
+    savedViewport(viewportStore, scope),
+  );
   const [stroke, setStroke] = useState<[number, number][]>([]);
   const [textAt, setTextAt] = useState<{
     x: number;
@@ -55,6 +72,10 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
     | undefined
   >(undefined);
   const editable = host || !readOnly;
+  const canErase = editable && tool === "eraser";
+  useLayoutEffect(() => {
+    viewportStore.set(scope, viewport);
+  }, [scope, viewport, viewportStore]);
   function zoomCentered(factor: number) {
     const rect = canvas.current?.getBoundingClientRect();
     setViewport((view) =>
@@ -79,9 +100,8 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
           if (controller.signal.aborted) return;
           if (page.epoch < epochRef.current) break;
           epochRef.current = page.epoch;
-          setItems((current) => applyBoardEvents(current, page.events));
-          setReadOnly(page.readOnly);
-          cursor = page.cursor;
+          setBoard((current) => applyBoardPage(current, page));
+          cursor = Math.max(cursor, page.cursor);
           more = page.hasMore;
         } while (more);
         setError("");
@@ -105,8 +125,7 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
       );
       if (event.epoch < epochRef.current) return;
       epochRef.current = event.epoch;
-      setItems((current) => applyBoardEvents(current, [event]));
-      if (event.kind === "policy") setReadOnly(event.readOnly);
+      setBoard((current) => applyBoardWrite(current, event));
       setError("");
     } catch (cause) {
       setError(messageOf(cause));
@@ -188,8 +207,24 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
       });
     setTextAt(undefined);
   }
+  function addTextAtCenter() {
+    if (!editable) return;
+    const rect = canvas.current?.getBoundingClientRect();
+    const screenX = (rect?.width ?? 500) / 2;
+    const screenY = (rect?.height ?? 400) / 2;
+    const [x, y] = worldPoint(viewport, screenX, screenY);
+    setTextAt({ x, y, screenX, screenY });
+    setText("");
+  }
   function removeItem(event: PointerEvent, id: string) {
-    if (tool !== "eraser" || !editable) return;
+    if (!canErase) return;
+    event.stopPropagation();
+    void write({ kind: "delete", targetId: id });
+  }
+  function removeItemWithKey(event: KeyboardEvent, id: string) {
+    if (!canErase) return;
+    if (!["Enter", " ", "Backspace", "Delete"].includes(event.key)) return;
+    event.preventDefault();
     event.stopPropagation();
     void write({ kind: "delete", targetId: id });
   }
@@ -246,6 +281,9 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
               <span>{label}</span>
             </button>
           ))}
+          <button type="button" disabled={!editable} onClick={addTextAtCenter}>
+            Add text
+          </button>
         </div>
         <div className="whiteboard-view-controls">
           <button
@@ -263,10 +301,7 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
           >
             +
           </button>
-          <button
-            type="button"
-            onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
-          >
+          <button type="button" onClick={() => setViewport(initialViewport)}>
             Reset view
           </button>
           <button type="button" onClick={downloadView}>
@@ -304,7 +339,7 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
         <svg
           ref={canvas}
           className="whiteboard-canvas"
-          role="img"
+          role="group"
           aria-label="Shared whiteboard canvas"
           style={{
             cursor:
@@ -338,10 +373,16 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
           <g
             transform={`translate(${viewport.x} ${viewport.y}) scale(${viewport.scale})`}
           >
-            {items.map((item) =>
+            {items.map((item, index) =>
               item.kind === "stroke" ? (
                 <path
                   key={item.id}
+                  role={canErase ? "button" : undefined}
+                  aria-label={
+                    canErase ? `Erase stroke ${index + 1}` : undefined
+                  }
+                  aria-hidden={!canErase}
+                  tabIndex={canErase ? 0 : -1}
                   d={item.points
                     .map(([x, y], index) => `${index ? "L" : "M"}${x} ${y}`)
                     .join(" ")}
@@ -351,15 +392,21 @@ export function Whiteboard({ code, host }: { code: string; host: boolean }) {
                   strokeLinecap="round"
                   strokeLinejoin="round"
                   onPointerDown={(event) => removeItem(event, item.id)}
+                  onKeyDown={(event) => removeItemWithKey(event, item.id)}
                 />
               ) : (
                 <text
                   key={item.id}
+                  role={canErase ? "button" : undefined}
+                  aria-label={canErase ? `Erase text: ${item.text}` : undefined}
+                  aria-hidden={!canErase}
+                  tabIndex={canErase ? 0 : -1}
                   x={item.x}
                   y={item.y}
                   fill="#171717"
                   fontSize="24"
                   onPointerDown={(event) => removeItem(event, item.id)}
+                  onKeyDown={(event) => removeItemWithKey(event, item.id)}
                 >
                   {item.text}
                 </text>

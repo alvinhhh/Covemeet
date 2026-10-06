@@ -7,6 +7,28 @@ export type AudioSignal = {
   bars: number;
 };
 
+export function offscreenSpeakers<
+  T extends { id: string; mediaIdentity?: string; audioAllowed: boolean },
+>(
+  participants: T[],
+  signals: ReadonlyMap<string, AudioSignal>,
+  eligible: ReadonlySet<string>,
+  visibleIds: ReadonlySet<string>,
+  boardOpen: boolean,
+  selfId: string,
+): T[] {
+  return participants.filter((participant) => {
+    const identity = participant.mediaIdentity ?? participant.id;
+    return (
+      participant.id !== selfId &&
+      eligible.has(identity) &&
+      participant.audioAllowed &&
+      signals.get(identity)?.speaking &&
+      (boardOpen || !visibleIds.has(identity))
+    );
+  });
+}
+
 // SDK speech state can briefly outlive a mute or reconnect. Never display that
 // stale signal when the microphone, room connection or host permission is off.
 export function audioSignal(input: {

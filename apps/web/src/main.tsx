@@ -42,11 +42,16 @@ import { brandLogo } from "./brand";
 import { scheduledMeetingPending } from "./scheduled-status";
 import { BrandingEditor } from "./branding";
 import { selectStage } from "./stage-policy";
-import { observeAudioSignals, type AudioSignal } from "./audio-signal";
+import {
+  observeAudioSignals,
+  offscreenSpeakers,
+  type AudioSignal,
+} from "./audio-signal";
 import { DeviceCheck } from "./device-check";
 import { Chat } from "./chat";
 import { ChatUnread } from "./chat-state";
 import { Whiteboard } from "./whiteboard";
+import { type Viewport } from "./whiteboard-state";
 import { SpeakingBadge } from "./speaking-badge";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
@@ -926,6 +931,7 @@ function Conference({
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
   >(null);
   const [boardOpen, setBoardOpen] = useState(false);
+  const boardViews = useRef(new Map<string, Viewport>());
   const [audioSignals, setAudioSignals] = useState<Map<string, AudioSignal>>(
     new Map(),
   );
@@ -1047,6 +1053,16 @@ function Conference({
       );
     }
   }
+  const boardScope = `${code}:${state.me.breakoutId ?? "main"}`;
+  const board = (
+    <Whiteboard
+      key={boardScope}
+      code={code}
+      host={host}
+      scope={boardScope}
+      viewportStore={boardViews.current}
+    />
+  );
   const stage = (
     <>
       <div className="stage-content">
@@ -1058,20 +1074,10 @@ function Conference({
             boardOpen={boardOpen}
             signals={audioSignals}
             setSignals={setAudioSignals}
-            board={
-              <Whiteboard
-                key={`${code}:${state.me.breakoutId ?? "main"}`}
-                code={code}
-                host={host}
-              />
-            }
+            board={board}
           />
         ) : boardOpen ? (
-          <Whiteboard
-            key={`${code}:${state.me.breakoutId ?? "main"}`}
-            code={code}
-            host={host}
-          />
+          board
         ) : (
           <div className="offline-stage">
             <span className="stage-avatar">{initials(state.me.name)}</span>
@@ -1501,15 +1507,13 @@ function MediaStage({
     .map(participantMediaIdentity)
     .sort()
     .join(",");
-  const otherSpeakers = participants.filter(
-    (participant) =>
-      selection.eligibleIds.has(participantMediaIdentity(participant)) &&
-      participant.audioAllowed &&
-      signals.get(participantMediaIdentity(participant))?.speaking &&
-      !visible.some(
-        (track) =>
-          track.participant.identity === participantMediaIdentity(participant),
-      ),
+  const otherSpeakers = offscreenSpeakers(
+    participants,
+    signals,
+    selection.eligibleIds,
+    new Set(visible.map((track) => track.participant.identity)),
+    boardOpen,
+    me.id,
   );
   useEffect(() => {
     const stop = observeAudioSignals(
@@ -1634,7 +1638,6 @@ function MediaStage({
               return (
                 <div
                   className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""}`}
-                  data-speaking={signal?.speaking ? "true" : "false"}
                   key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
                 >
                   <SpeakingBadge surface="tile" signal={signal} />

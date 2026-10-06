@@ -5,6 +5,7 @@ import { RoomEvent } from "livekit-client";
 import { participantMediaIdentity } from "../src/api.ts";
 import {
   audioSignal,
+  offscreenSpeakers,
   observeAudioSignals,
   type AudioSignal,
 } from "../src/audio-signal.ts";
@@ -38,6 +39,45 @@ test("speaking indication follows real SDK speech and bounded audio levels", () 
   assert.equal(audioSignal({ ...active, audioLevel: 9 }).bars, 4);
   for (const audioLevel of [-1, NaN, Infinity])
     assert.equal(audioSignal({ ...active, audioLevel }).bars, 0);
+});
+
+test("remote active speaker is named while the whiteboard hides camera tiles", () => {
+  const local = {
+    identity: "self",
+    isMicrophoneEnabled: true,
+    isSpeaking: false,
+    audioLevel: 0,
+  };
+  const remote = { ...local, identity: "guest", isSpeaking: false };
+  const room = Object.assign(new EventEmitter(), {
+    state: "connected",
+    localParticipant: local,
+    remoteParticipants: new Map([[remote.identity, remote]]),
+  });
+  const people = [
+    { id: "self", name: "Me", audioAllowed: true },
+    { id: "guest", name: "Guest", audioAllowed: true },
+  ];
+  const eligible = new Set(["self", "guest"]);
+  let signals = new Map<string, AudioSignal>();
+  const stop = observeAudioSignals(room, eligible, eligible, (value) => {
+    signals = value;
+  });
+  remote.isSpeaking = true;
+  remote.audioLevel = 0.3;
+  room.emit(RoomEvent.ActiveSpeakersChanged, [remote]);
+  const visible = new Set(["self", "guest"]);
+  assert.deepEqual(
+    offscreenSpeakers(people, signals, eligible, visible, false, "self"),
+    [],
+  );
+  assert.deepEqual(
+    offscreenSpeakers(people, signals, eligible, visible, true, "self").map(
+      (person) => person.name,
+    ),
+    ["Guest"],
+  );
+  stop();
 });
 
 test("mute, host block, and disconnect suppress stale local or remote speech signals", () => {
