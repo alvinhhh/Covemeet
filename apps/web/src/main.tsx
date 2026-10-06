@@ -2663,7 +2663,11 @@ function Recordings({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
-  const [link, setLink] = useState<{ url: string; expiresAt: number }>();
+  const [link, setLink] = useState<{
+    url: string;
+    expiresAt: number;
+    passwordEmailSent: boolean;
+  }>();
   const code = state.meeting.code;
   const active = state.recordings.some((r) =>
     ["starting", "recording", "active", "stopping"].includes(r.status),
@@ -2680,7 +2684,11 @@ function Recordings({
     setNotice("");
     setBusy(true);
     try {
-      const result = await api<{ url?: string; expiresAt?: number }>(
+      const result = await api<{
+        url?: string;
+        expiresAt?: number;
+        passwordEmailSent?: boolean;
+      }>(
         meetingPath(code, suffix),
         method === "GET" ? undefined : body,
         method,
@@ -2829,8 +2837,10 @@ function Recordings({
             Open download
           </a>
           <small>
-            Expires {new Date(link.expiresAt).toLocaleString()}. The password
-            was sent by email.
+            Expires {new Date(link.expiresAt).toLocaleString()}.{" "}
+            {link.passwordEmailSent
+              ? "The password was sent by email."
+              : "Password email is pending."}
           </small>
           <Button
             className="small"
@@ -2886,13 +2896,22 @@ function Recordings({
                 className="small"
                 disabled={busy}
                 onClick={async () => {
+                  setLink(undefined);
                   const result = await request(
                     `/recordings/${encodeURIComponent(recording.id)}/link`,
                     {},
                     "GET",
                   );
-                  if (result?.url && result.expiresAt)
-                    setLink({ url: result.url, expiresAt: result.expiresAt });
+                  if (
+                    result?.url &&
+                    result.expiresAt &&
+                    typeof result.passwordEmailSent === "boolean"
+                  )
+                    setLink({
+                      url: result.url,
+                      expiresAt: result.expiresAt,
+                      passwordEmailSent: result.passwordEmailSent,
+                    });
                 }}
               >
                 Show download link
@@ -2901,11 +2920,20 @@ function Recordings({
                 className="small"
                 disabled={busy}
                 onClick={async () => {
+                  setLink(undefined);
                   const result = await request(
                     `/recordings/${encodeURIComponent(recording.id)}/link`,
                   );
-                  if (result?.url && result.expiresAt)
-                    setLink({ url: result.url, expiresAt: result.expiresAt });
+                  if (
+                    result?.url &&
+                    result.expiresAt &&
+                    typeof result.passwordEmailSent === "boolean"
+                  )
+                    setLink({
+                      url: result.url,
+                      expiresAt: result.expiresAt,
+                      passwordEmailSent: result.passwordEmailSent,
+                    });
                 }}
               >
                 Create new 24-hour link
@@ -2914,12 +2942,12 @@ function Recordings({
                 className="text-button danger-text"
                 disabled={busy}
                 onClick={async () => {
+                  setLink(undefined);
                   if (
                     await request(
                       `/recordings/${encodeURIComponent(recording.id)}/revoke`,
                     )
                   ) {
-                    setLink(undefined);
                     setNotice("Download links revoked.");
                   }
                 }}

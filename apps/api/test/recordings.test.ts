@@ -252,7 +252,12 @@ test("recording links last 24 hours and send the password without the capability
   assert.ok(!f.emails.at(-1)!.text.includes(link.url));
   assert.ok(!f.emails.at(-1)!.text.includes(link.token));
   const apiResult = await f.service.link(f.meeting, f.recording.id);
-  assert.deepEqual(Object.keys(apiResult).sort(), ["expiresAt", "url"]);
+  assert.deepEqual(Object.keys(apiResult).sort(), [
+    "expiresAt",
+    "passwordEmailSent",
+    "url",
+  ]);
+  assert.equal(apiResult.passwordEmailSent, true);
   const stored = (await f.store.get(f.meeting.code))!.recordings[0]!;
   assert.notEqual(stored.passwordHash, link.password);
   assert.notEqual(stored.tokenHash, link.token);
@@ -402,6 +407,7 @@ test("completed recording issues one recoverable link, emails only the password,
   assert.ok(row.delivery?.token.wrappedKey.ciphertext);
   assert.equal(row.delivery?.mode, "auto");
   const link = await service.currentLink(f.meeting, f.recording.id);
+  assert.equal(link.passwordEmailSent, true);
   assert.equal(new URL(link.url).pathname, `/download/${f.meeting.code}`);
   assert.ok(!f.emails[0]!.text.includes(link.url));
   assert.ok(!f.emails[0]!.text.includes(new URL(link.url).hash.slice(1)));
@@ -420,11 +426,53 @@ test("completed recording issues one recoverable link, emails only the password,
   });
   assert.equal(host.statusCode, 200);
   assert.equal(host.json().url, link.url);
+  assert.equal(host.json().passwordEmailSent, true);
   assert.equal(host.headers["cache-control"], "no-store");
   await service.revoke(f.meeting, f.recording.id);
   await assert.rejects(service.currentLink(f.meeting, f.recording.id));
   const revoked = (await f.store.get(f.meeting.code))!.recordings[0]!;
   assert.equal(revoked.delivery, undefined);
+});
+
+test("current link reports pending password email until delivery is acknowledged", async (t) => {
+  const f = await fixture(t);
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.autoLinkPending = true;
+    meeting.recordings[0]!.readyAt = Date.now();
+  });
+  const sendMail = f.mail.sendMail.bind(f.mail);
+  f.mail.sendMail = (async () => {
+    throw new Error("Synthetic mail outage");
+  }) as typeof f.mail.sendMail;
+  await f.service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  const app = await f.app();
+  const url = `/api/meetings/${f.meeting.code}/recordings/${f.recording.id}/link`;
+  const getLink = () =>
+    app.inject({
+      method: "GET",
+      url,
+      headers: { cookie: `mp_${f.meeting.code}=${f.hostSession}` },
+    });
+  const pending = await getLink();
+  assert.equal(pending.statusCode, 200);
+  assert.equal(pending.json().passwordEmailSent, false);
+  assert.equal(f.emails.length, 0);
+  assert.equal(
+    (await f.store.get(f.meeting.code))!.recordings[0]!.delivery?.sentAt,
+    undefined,
+  );
+
+  f.mail.sendMail = sendMail as typeof f.mail.sendMail;
+  await f.store.change(f.meeting.code, (meeting) => {
+    meeting.recordings[0]!.delivery!.nextAttemptAt = 0;
+  });
+  await f.service.reconcileDelivery((await f.store.get(f.meeting.code))!);
+  const sent = await getLink();
+  assert.equal(sent.statusCode, 200);
+  assert.equal(sent.json().passwordEmailSent, true);
+  assert.equal(sent.json().url, pending.json().url);
+  assert.equal(f.emails.length, 1);
+  assert.ok((await f.store.get(f.meeting.code))!.recordings[0]!.delivery?.sentAt);
 });
 
 test("ambiguous password mail retries the same message and credentials without reminting", async (t) => {
@@ -1841,10 +1889,10 @@ test("rotation rewraps pending password delivery before the old key is retired",
   );
   await recovered.reconcileDelivery((await f.store.get(f.meeting.code))!);
   assert.equal(messages.length, 1);
-  assert.deepEqual(
-    await recovered.currentLink(f.meeting, f.recording.id),
-    original,
-  );
+  assert.deepEqual(await recovered.currentLink(f.meeting, f.recording.id), {
+    ...original,
+    passwordEmailSent: true,
+  });
   assert.equal(
     (await f.store.get(f.meeting.code))!.recordings[0]!.delivery?.password,
     undefined,

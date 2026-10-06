@@ -1392,7 +1392,7 @@ export class RecordingService {
             "Password email is pending. Try again later.",
           );
         await lock.audit("host", "recording.link", id);
-        return link;
+        return { ...link, passwordEmailSent: true };
       },
     );
     if (!result.acquired) throw new HttpError(409, "Recording is busy; retry");
@@ -1445,6 +1445,7 @@ export class RecordingService {
     return {
       url: `${this.config.origin}/download/${m.code}#${token}`,
       expiresAt: current.expiresAt,
+      passwordEmailSent: Boolean(current.delivery?.sentAt),
     };
   }
   async revoke(m: Meeting, id: string, authorize?: (meeting: Meeting) => void) {
