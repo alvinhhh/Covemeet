@@ -73,7 +73,7 @@ const report = {
     mediaPlayback: false,
   },
   scope:
-    "Isolated meeting and webinar; authorization and media enforcement, not load or browser UX",
+    "Isolated meetings and webinar; authorization, screen sharing and host handoff, not load or browser UX",
   requiredMediaRoute: forcedRelay
     ? `TURN/${forcedRelay.toUpperCase()} relay`
     : "any ICE route",
@@ -319,17 +319,19 @@ async function member(peer) {
     throw error;
   }
 }
-async function publish(peer) {
+async function publish(peer, screenShare = false) {
   const source = new VideoSource(160, 90);
   peer.track = LocalVideoTrack.createVideoTrack(
     "Silent validation video",
     source,
   );
   const options = new TrackPublishOptions();
-  options.source = TrackSource.SOURCE_CAMERA;
+  options.source = screenShare
+    ? TrackSource.SOURCE_SCREENSHARE
+    : TrackSource.SOURCE_CAMERA;
   await bounded(
     peer.room.localParticipant.publishTrack(peer.track, options),
-    "camera publication",
+    screenShare ? "screen-share publication" : "camera publication",
     8000,
   );
   peer.framesTask = (async () => {
@@ -346,9 +348,12 @@ async function publish(peer) {
       await delay(100);
     }
   })();
-  const p = await until("SFU camera track", async () => {
+  const expectedSource = screenShare
+    ? ServerSource.SCREEN_SHARE
+    : ServerSource.CAMERA;
+  const p = await until("SFU video track", async () => {
     const value = await member(peer);
-    return value?.tracks.some((t) => t.source === ServerSource.CAMERA) &&
+    return value?.tracks.some((t) => t.source === expectedSource) &&
       peer.frames >= 5
       ? value
       : false;
@@ -410,6 +415,38 @@ async function publish(peer) {
     },
   );
   return p;
+}
+async function deniedScreenShare(peer) {
+  const track = LocalVideoTrack.createVideoTrack(
+    "Denied screen-share validation",
+    new VideoSource(160, 90),
+  );
+  const options = new TrackPublishOptions();
+  options.source = TrackSource.SOURCE_SCREENSHARE;
+  let accepted = false;
+  try {
+    try {
+      await bounded(
+        peer.room.localParticipant.publishTrack(track, options),
+        "prohibited screen-share publication",
+        8000,
+      );
+      accepted = true;
+    } catch {}
+    assert.equal(
+      accepted,
+      false,
+      "SFU accepted screen sharing without permission",
+    );
+    assert.equal(
+      (await member(peer)).tracks.some(
+        (entry) => entry.source === ServerSource.SCREEN_SHARE,
+      ),
+      false,
+    );
+  } finally {
+    await track.close().catch(() => {});
+  }
 }
 async function close(peer) {
   if (peer.closed) return;
@@ -621,7 +658,8 @@ const host = new Client(),
   guest = new Client();
 const meetingPassword = `Local-${randomUUID()}`;
 let code,
-  ended = false;
+  ended = false,
+  endingClient = host;
 let stage = "configuration";
 const route = (suffix = "") => `/meetings/${code}${suffix}`;
 const media = (client) => client.call(route("/media"), {});
@@ -686,6 +724,28 @@ try {
     { cameraTracks: 1, generatedFrames: peer.frames },
   );
 
+  stage = "screen-share default restriction";
+  assert.equal(
+    (await guest.call(route("/state"))).me.screenShareAllowed,
+    false,
+  );
+  assert(!claims(grant).video.canPublishSources.includes("screen_share"));
+  assert(
+    !(await member(peer)).permission.canPublishSources.includes(
+      ServerSource.SCREEN_SHARE,
+    ),
+  );
+  await deniedScreenShare(peer);
+  assert(
+    (await member(peer)).tracks.some(
+      (entry) => entry.source === ServerSource.CAMERA,
+    ),
+  );
+  await checkpoint("camera-approved guest cannot publish a screen share", {
+    cameraTracks: 1,
+    screenShareTracks: 0,
+  });
+
   stage = "meeting lock";
   await host.call(route(), { locked: true }, "PATCH");
   await new Client().call(
@@ -743,6 +803,42 @@ try {
     "SFU rejects a real camera publication when audio and video are blocked",
     { cameraTracks: 0 },
   );
+  stage = "independent screen-share grant";
+  await action(id, "allow-screen-share");
+  await removed(peer, "screen-share grant rotates the previous connection");
+  await deniedGateway(guest, grant, "pre-share-grant token cannot reconnect");
+  grant = await media(guest);
+  assert.deepEqual(claims(grant).video.canPublishSources, ["screen_share"]);
+  peer = await connect(guest, grant);
+  await publish(peer, true);
+  const shareState = (await guest.call(route("/state"))).me;
+  assert.equal(shareState.videoAllowed, false);
+  assert.equal(shareState.audioAllowed, false);
+  assert.equal(shareState.screenShareAllowed, true);
+  await checkpoint(
+    "host-approved screen share publishes RTP with camera and microphone blocked",
+    {
+      screenShareTracks: 1,
+      generatedFrames: peer.frames,
+      mediaTransport: peer.transportEvidence,
+    },
+  );
+  await action(id, "block-screen-share");
+  await removed(
+    peer,
+    "screen-share revocation removes the actual SFU publisher",
+  );
+  await deniedGateway(
+    guest,
+    grant,
+    "revoked screen-share token cannot reconnect",
+  );
+  grant = await media(guest);
+  assert.equal(claims(grant).video.canPublish, false);
+  peer = await connect(guest, grant);
+  await deniedScreenShare(peer);
+  await checkpoint("fresh token cannot restore a revoked screen share");
+
   await action(id, "allow-video");
   await removed(peer, "restoring video rotates the previous connection");
   grant = await media(guest);
@@ -972,6 +1068,93 @@ try {
   ended = true;
   await removed(peer, "webinar end disconnects the audience connection");
   await deniedGateway(viewer, grant, "ended webinar rejects viewer reconnect");
+  stage = "host handoff creation";
+  const handoffMeeting = await host.call("/meetings", {
+    title: `Silent handoff validation ${runId.slice(0, 8)}`,
+    hostName: "Validation owner",
+    password: meetingPassword,
+    mode: "meeting",
+    ...(env.CREATION_KEY ? { creationKey: env.CREATION_KEY } : {}),
+  });
+  code = handoffMeeting.code;
+  ended = false;
+  await host.call(route("/host"), { token: handoffMeeting.hostToken });
+  const ownerGrant = await media(host);
+  const ownerPeer = await connect(host, ownerGrant);
+  await publish(ownerPeer);
+  const successor = new Client();
+  const successorIdentity = await successor.call(route("/join"), {
+    name: "Validation successor",
+    password: meetingPassword,
+  });
+  await action(successorIdentity.participantId, "admit");
+  await host.call(
+    route(`/participants/${successorIdentity.participantId}/moderator`),
+    { enabled: true },
+    "PUT",
+  );
+  const successorGrant = await media(successor);
+  const successorPeer = await connect(successor, successorGrant);
+  await publish(successorPeer);
+  const beforeHandoff = await host.call(route("/state"));
+  const successorState = beforeHandoff.participants.find(
+    (p) => p.id === successorIdentity.participantId,
+  );
+  const successorSid = (await member(successorPeer)).sid;
+  endingClient = successor;
+  stage = "host handoff media enforcement";
+  await host.call(route("/handoff"), {
+    participantId: successorIdentity.participantId,
+    grantRevision: successorState.moderatorRevision,
+    expectedRevision: beforeHandoff.meeting.controlRevision,
+    requestId: randomUUID(),
+  });
+  await removed(ownerPeer, "host handoff removes the original SFU publisher");
+  await deniedGateway(
+    host,
+    ownerGrant,
+    "departed owner token cannot reconnect after handoff",
+  );
+  await host.call(route("/media"), {}, "POST", 403);
+  const afterHandoff = await successor.call(route("/state"));
+  assert.equal(
+    afterHandoff.meeting.controllerId,
+    successorIdentity.participantId,
+  );
+  assert.equal(afterHandoff.meeting.canEnd, true);
+  assert.equal(afterHandoff.me.role, "participant");
+  assert.equal((await member(successorPeer)).sid, successorSid);
+  const bytesBefore = successorPeer.transportEvidence.videoBytesSent;
+  const bytesAfter = await until(
+    "co-host video continues after handoff",
+    async () => {
+      const stats = (await successorPeer.room.getRtcStats()).publisherStats;
+      const bytes = stats
+        .filter((entry) => entry.stats.case === "outboundRtp")
+        .reduce(
+          (sum, entry) => sum + Number(entry.stats.value.sent?.bytesSent || 0),
+          0,
+        );
+      return bytes > bytesBefore ? bytes : false;
+    },
+  );
+  await checkpoint(
+    "selected co-host keeps the same SFU session and ongoing RTP",
+    {
+      sameSfuSession: true,
+      videoBytesBefore: bytesBefore,
+      videoBytesAfter: bytesAfter,
+    },
+  );
+  stage = "delegated meeting end";
+  await successor.call(route("/end"), {});
+  ended = true;
+  await removed(successorPeer, "selected co-host ends the actual media room");
+  await deniedGateway(
+    successor,
+    successorGrant,
+    "ended handoff room rejects old co-host token",
+  );
   report.result = "passed";
 } catch (error) {
   report.result = "failed";
@@ -987,11 +1170,14 @@ try {
 } finally {
   for (const peer of peers) await close(peer).catch(() => {});
   if (code && !ended) {
-    try {
-      await host.call(route("/end"), {});
-      ended = true;
-    } catch {
-      /* Report incomplete cleanup below. */
+    for (const client of new Set([endingClient, host])) {
+      try {
+        await client.call(route("/end"), {});
+        ended = true;
+        break;
+      } catch {
+        /* Try the run's other owner; report incomplete cleanup below. */
+      }
     }
   }
   let roomsRemoved = true;

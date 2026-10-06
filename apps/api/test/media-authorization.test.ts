@@ -101,10 +101,35 @@ test("media token claims deny data publishing, metadata changes, and blocked tra
   assert.equal(full.video?.canPublishData, false);
   assert.equal(full.video?.canUpdateOwnMetadata, false);
   assert.equal(full.video?.canSubscribe, true);
+  assert.deepEqual(full.video?.canPublishSources, ["microphone", "camera"]);
   const audio = await inspect({ ...f.participant, videoAllowed: false });
   assert.deepEqual(audio.video?.canPublishSources, ["microphone"]);
   const video = await inspect({ ...f.participant, audioAllowed: false });
-  assert.deepEqual(video.video?.canPublishSources, ["camera", "screen_share"]);
+  assert.deepEqual(video.video?.canPublishSources, ["camera"]);
+  const share = await inspect({
+    ...f.participant,
+    videoAllowed: false,
+    screenShareAllowed: true,
+  });
+  assert.deepEqual(share.video?.canPublishSources, [
+    "microphone",
+    "screen_share",
+    "screen_share_audio",
+  ]);
+  const mutedShare = await inspect({
+    ...f.participant,
+    audioAllowed: false,
+    videoAllowed: false,
+    screenShareAllowed: true,
+  });
+  assert.deepEqual(mutedShare.video?.canPublishSources, ["screen_share"]);
+  const host = await inspect({
+    ...f.participant,
+    role: "host",
+    audioAllowed: false,
+    videoAllowed: false,
+  });
+  assert.deepEqual(host.video?.canPublishSources, ["screen_share"]);
   const viewer = await inspect({
     ...f.participant,
     role: "viewer",
@@ -116,9 +141,50 @@ test("media token claims deny data publishing, metadata changes, and blocked tra
   const inconsistentViewer = await inspect({
     ...f.participant,
     role: "viewer",
+    screenShareAllowed: true,
   });
   assert.equal(inconsistentViewer.video?.canPublish, false);
   assert.deepEqual(inconsistentViewer.video?.canPublishSources, []);
+  const phone = await inspect({
+    ...f.participant,
+    transport: "phone",
+    screenShareAllowed: true,
+  });
+  assert.deepEqual(phone.video?.canPublishSources, ["microphone"]);
+});
+
+test("screen-share grant and revocation fence stale media tokens", async (t) => {
+  const f = await fixture(t);
+  const initial = await f.media.token(f.meeting, f.participant);
+  await f.store.change(f.meeting.code, (m) => {
+    const p = m.participants[0]!;
+    fenceParticipantMedia(m, p);
+    p.screenShareAllowed = true;
+    completeMediaFence(p, structuredClone(p));
+  });
+  await assert.rejects(f.media.authorize(initial));
+  let current = (await f.store.get(f.meeting.code))!;
+  const granted = await f.media.token(current, current.participants[0]!);
+  assert.deepEqual(
+    (await f.media.verifier.verify(granted)).video?.canPublishSources,
+    ["microphone", "camera", "screen_share", "screen_share_audio"],
+  );
+  await f.store.change(f.meeting.code, (m) => {
+    const p = m.participants[0]!;
+    fenceParticipantMedia(m, p);
+    p.screenShareAllowed = false;
+    completeMediaFence(p, structuredClone(p));
+  });
+  await assert.rejects(f.media.authorize(granted));
+  current = (await f.store.get(f.meeting.code))!;
+  assert.deepEqual(
+    (
+      await f.media.verifier.verify(
+        await f.media.token(current, current.participants[0]!),
+      )
+    ).video?.canPublishSources,
+    ["microphone", "camera"],
+  );
 });
 
 test("kick, ban, lobby, expired session, and pending enforcement all deny existing tokens", async (t) => {

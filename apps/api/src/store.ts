@@ -109,6 +109,7 @@ export type Participant = {
   auditReferenced?: boolean;
   audioAllowed: boolean;
   videoAllowed: boolean;
+  screenShareAllowed?: boolean;
   mediaVersion: number;
   mediaIdentity?: string;
   previousMediaIdentity?: string;
@@ -261,6 +262,10 @@ export function participantRoom(m: Meeting, p: Participant) {
     ? (m.breakouts.find((b) => b.id === p.breakoutId)?.room ?? m.room)
     : m.room;
 }
+export const canShareScreen = (p: Participant) =>
+  p.transport !== "phone" &&
+  p.role !== "viewer" &&
+  (p.role === "host" || p.screenShareAllowed === true);
 export interface RecordingLock {
   get(): Promise<Meeting | null>;
   check(): Promise<void>;

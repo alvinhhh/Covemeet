@@ -628,6 +628,92 @@ test("source restrictions revoke previous grants and cannot be lifted by a guest
   assert.equal(f.media.issued.at(-1)?.participant.videoAllowed, false);
 });
 
+test("only the host grants screen sharing independently of camera and stage", async (t) => {
+  const f = await fixture(t);
+  const meeting = await f.meeting();
+  const guest = await f.join(meeting.code);
+  await f.action(meeting.code, guest.id, "admit");
+  const path = `/api/meetings/${meeting.code}`;
+  const state = () => guest.client.request("GET", `${path}/state`);
+  assert.equal((await state()).json().me.videoAllowed, true);
+  assert.equal((await state()).json().me.screenShareAllowed, false);
+  rejected(
+    await guest.client.request("POST", `${path}/participants/${guest.id}/action`, {
+      action: "allow-screen-share",
+    }),
+  );
+
+  const cohost = await f.join(meeting.code, "198.51.100.31");
+  await f.action(meeting.code, cohost.id, "admit");
+  ok(
+    await f.host.request("PUT", `${path}/participants/${cohost.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  assert.equal(
+    (
+      await cohost.client.request(
+        "POST",
+        `${path}/participants/${guest.id}/action`,
+        { action: "allow-screen-share" },
+      )
+    ).statusCode,
+    403,
+  );
+  await f.action(meeting.code, guest.id, "allow-screen-share");
+  let current = (await f.store.get(meeting.code))!.participants.find(
+    (p) => p.id === guest.id,
+  )!;
+  assert.equal(current.screenShareAllowed, true);
+  assert.equal((await state()).json().me.screenShareAllowed, true);
+  const grantedVersion = current.mediaVersion;
+
+  await f.action(meeting.code, guest.id, "block-video");
+  current = (await f.store.get(meeting.code))!.participants.find(
+    (p) => p.id === guest.id,
+  )!;
+  assert.equal(current.videoAllowed, false);
+  assert.equal(current.screenShareAllowed, true);
+  await f.action(meeting.code, guest.id, "block-screen-share");
+  current = (await f.store.get(meeting.code))!.participants.find(
+    (p) => p.id === guest.id,
+  )!;
+  assert.equal(current.videoAllowed, false);
+  assert.equal(current.screenShareAllowed, false);
+  assert.ok(current.mediaVersion > grantedVersion);
+  assert.equal((await state()).json().me.screenShareAllowed, false);
+  assert.ok(f.media.removed.includes(guest.id));
+
+  const webinar = await f.meeting({ mode: "webinar" });
+  const viewer = await f.join(webinar.code, "198.51.100.41");
+  await f.action(webinar.code, viewer.id, "admit");
+  assert.equal(
+    (
+      await f.host.request(
+        "POST",
+        `/api/meetings/${webinar.code}/participants/${viewer.id}/action`,
+        { action: "allow-screen-share" },
+      )
+    ).statusCode,
+    409,
+  );
+  await f.action(webinar.code, viewer.id, "promote");
+  assert.equal(
+    (
+      await viewer.client.request("GET", `/api/meetings/${webinar.code}/state`)
+    ).json().me.screenShareAllowed,
+    false,
+  );
+  await f.action(webinar.code, viewer.id, "allow-screen-share");
+  await f.action(webinar.code, viewer.id, "demote");
+  assert.equal(
+    (await f.store.get(webinar.code))!.participants.find(
+      (p) => p.id === viewer.id,
+    )!.screenShareAllowed,
+    false,
+  );
+});
+
 test("ended meetings cannot issue media credentials or admit new participants", async (t) => {
   const f = await fixture(t);
   const m = await f.meeting();

@@ -12,6 +12,7 @@ const host: Participant = {
   status: "admitted",
   audioAllowed: true,
   videoAllowed: true,
+  screenShareAllowed: true,
   mediaVersion: 1,
   breakoutId: null,
   transport: "browser",

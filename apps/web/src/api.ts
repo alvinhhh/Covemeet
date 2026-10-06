@@ -35,6 +35,7 @@ export type Participant = {
   status: "waiting" | "admitted" | "kicked" | "banned" | "left";
   audioAllowed: boolean;
   videoAllowed: boolean;
+  screenShareAllowed: boolean;
   mediaVersion: number;
   mediaIdentity?: string;
   breakoutId: string | null;

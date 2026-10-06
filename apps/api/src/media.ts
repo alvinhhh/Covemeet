@@ -26,7 +26,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import type { Config } from "./config.js";
 import type { Meeting, Participant, Store } from "./store.js";
-import { participantRoom } from "./store.js";
+import { canShareScreen, participantRoom } from "./store.js";
 import { digest, safeEqual, HttpError } from "./security.js";
 export interface Media {
   available: boolean;
@@ -71,10 +71,11 @@ export class LiveMedia implements Media {
       p.role !== "viewer" && p.audioAllowed && (!p.phone || !p.phone.muted);
     const videoAllowed =
       p.transport !== "phone" && p.role !== "viewer" && p.videoAllowed;
+    const screenShareAllowed = canShareScreen(p);
     if (audioAllowed) sources.push(TrackSource.MICROPHONE);
-    if (videoAllowed)
-      sources.push(TrackSource.CAMERA, TrackSource.SCREEN_SHARE);
-    if (audioAllowed && videoAllowed)
+    if (videoAllowed) sources.push(TrackSource.CAMERA);
+    if (screenShareAllowed) sources.push(TrackSource.SCREEN_SHARE);
+    if (audioAllowed && screenShareAllowed)
       sources.push(TrackSource.SCREEN_SHARE_AUDIO);
     token.addGrant({
       room: participantRoom(m, p),

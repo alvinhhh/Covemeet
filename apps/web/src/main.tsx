@@ -2000,6 +2000,7 @@ function MediaControls({ me }: { me: Participant }) {
   const [error, setError] = useState("");
   const audioAllowed = me.role !== "viewer" && me.audioAllowed;
   const videoAllowed = me.role !== "viewer" && me.videoAllowed;
+  const screenShareAllowed = me.screenShareAllowed;
   const microphoneAction = !audioAllowed
     ? "Microphone blocked by host"
     : isMicrophoneEnabled
@@ -2010,7 +2011,7 @@ function MediaControls({ me }: { me: Participant }) {
     : isCameraEnabled
       ? "Turn camera off"
       : "Turn camera on";
-  const shareAction = !videoAllowed
+  const shareAction = !screenShareAllowed
     ? "Screen sharing blocked by host"
     : isScreenShareEnabled
       ? "Stop sharing"
@@ -2022,15 +2023,17 @@ function MediaControls({ me }: { me: Participant }) {
         .catch((e) => setError(messageOf(e)));
   }, [localParticipant, audioAllowed]);
   useEffect(() => {
-    if (!videoAllowed) {
+    if (!videoAllowed)
       void localParticipant
         .setCameraEnabled(false)
         .catch((e) => setError(messageOf(e)));
+  }, [localParticipant, videoAllowed]);
+  useEffect(() => {
+    if (!screenShareAllowed)
       void localParticipant
         .setScreenShareEnabled(false)
         .catch((e) => setError(messageOf(e)));
-    }
-  }, [localParticipant, videoAllowed]);
+  }, [localParticipant, screenShareAllowed]);
   return (
     <>
       {error && (
@@ -2080,7 +2083,7 @@ function MediaControls({ me }: { me: Participant }) {
           </span>
         </TrackToggle>
       </fieldset>
-      <fieldset className="media-control-guard" disabled={!videoAllowed}>
+      <fieldset className="media-control-guard" disabled={!screenShareAllowed}>
         <TrackToggle
           className="button media-toggle"
           source={Track.Source.ScreenShare}
@@ -2482,6 +2485,27 @@ function Participants({
                   {p.videoAllowed
                     ? "Turn off and block camera"
                     : "Allow camera"}
+                </button>
+              )}
+              {host && p.transport !== "phone" && (
+                <button
+                  disabled={busy || p.role === "viewer"}
+                  title={
+                    p.role === "viewer"
+                      ? "Invite to stage to allow screen sharing"
+                      : undefined
+                  }
+                  onClick={() =>
+                    void action(p.id, {
+                      action: p.screenShareAllowed
+                        ? "block-screen-share"
+                        : "allow-screen-share",
+                    })
+                  }
+                >
+                  {p.screenShareAllowed
+                    ? "Stop and block screen sharing"
+                    : "Allow screen sharing"}
                 </button>
               )}
               {host && p.transport === "phone" && (

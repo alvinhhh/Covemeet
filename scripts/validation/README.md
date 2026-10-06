@@ -1,6 +1,6 @@
 # Media control validation
 
-This harness creates a disposable meeting and webinar and checks the application against a real LiveKit server. It asserts SFU participant and track removal after moderation, then tries the previous token at the actual signaling gateway. It is a prerequisite check for load testing, not a 100-person or 1,000-viewer capacity result.
+This harness creates two disposable meetings and a webinar and checks the application against a real LiveKit server. It asserts SFU participant and track removal after moderation, then tries the previous token at the actual signaling gateway. It is a prerequisite check for load testing, not a 100-person or 1,000-viewer capacity result.
 
 No browser, microphone, camera, audio source, speaker, or media playback is used. Published media consists only of generated 160×90 video frames. Microphone restrictions are verified in the signed grants and SFU permissions, and by disconnecting a current publisher. Actual audio-packet behavior remains a separate test.
 
@@ -10,11 +10,13 @@ No browser, microphone, camera, audio source, speaker, or media playback is used
 - Cookie requirement, another participant's cookie rejection and foreign-Origin rejection at both `/rtc` and `/rtc/v1`; every stale-token reconnect check exercises both paths.
 - Lock rejection of new guests while admitted media remains connected.
 - Audio/video restrictions, stale-token rejection, and a real denied camera publication.
+- Separate screen-sharing permission: denied while camera works, explicit grant with camera/microphone blocked, active share removal and stale-token denial on revocation.
 - Breakout moves, return to main, closing breakout rooms, scoped chat, and broadcast.
 - Kick followed by fresh lobby entry on the same device marker.
 - Device and IP meeting bans, each including SFU disconnection and stale reconnect denial.
 - Meeting end, removed publisher, and rejected host reconnect/new entry.
 - Webinar viewer publication denial, presenter promotion, demotion, and rotated media authority.
+- Explicit host handoff removes the original publisher, preserves the selected co-host’s SFU session/RTP, and permits that co-host to end the room.
 
 Each successful publisher must send actual RTP video bytes with DTLS connected and an SRTP cipher reported by the native SDK. The evidence records the negotiated cipher names; this does not assert end-to-end encryption or certification.
 

@@ -16,7 +16,7 @@ import { z } from "zod";
 import { whiteboardInput } from "./whiteboard.js";
 import type { Config } from "./config.js";
 import type { ChatMessage, Meeting, Participant, Store } from "./store.js";
-import { clearRecordingLink } from "./store.js";
+import { canShareScreen, clearRecordingLink } from "./store.js";
 import type { Media } from "./media.js";
 import { LiveMedia } from "./media.js";
 import {
@@ -1357,6 +1357,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         status: x.status,
         audioAllowed: x.audioAllowed,
         videoAllowed: x.videoAllowed,
+        screenShareAllowed: canShareScreen(x),
         mediaVersion: x.mediaVersion,
         mediaIdentity: mediaIdentity(x),
         breakoutId: x.breakoutId,
@@ -1502,6 +1503,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
           "block-audio",
           "allow-video",
           "block-video",
+          "allow-screen-share",
+          "block-screen-share",
           "promote",
           "demote",
           "rename",
@@ -1536,7 +1539,12 @@ export async function createApp(config: Config, store: Store, media: Media) {
             400,
             "Phone callers do not have browser IP or device bans",
           );
-        if (body.action === "allow-video" || body.action === "block-video")
+        if (
+          body.action === "allow-video" ||
+          body.action === "block-video" ||
+          body.action === "allow-screen-share" ||
+          body.action === "block-screen-share"
+        )
           throw new HttpError(400, "Phone callers use audio only");
         if (body.banCallerId && !p.phone?.callerHash)
           throw new HttpError(400, "Caller identity is unavailable");
@@ -1545,7 +1553,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
       if (body.action === "rename" && !body.name)
         throw new HttpError(400, "Participant name is required");
       if (
-        (body.action === "allow-audio" || body.action === "allow-video") &&
+        (body.action === "allow-audio" ||
+          body.action === "allow-video" ||
+          body.action === "allow-screen-share") &&
         p.role === "viewer"
       )
         throw new HttpError(
@@ -1604,6 +1614,10 @@ export async function createApp(config: Config, store: Store, media: Media) {
         }
         if (body.action === "allow-video") p.videoAllowed = true;
         if (body.action === "block-video") p.videoAllowed = false;
+        if (body.action === "allow-screen-share")
+          p.screenShareAllowed = true;
+        if (body.action === "block-screen-share")
+          p.screenShareAllowed = false;
         if (body.action === "promote") {
           p.role = "participant";
           p.audioAllowed = true;
@@ -1613,6 +1627,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           p.role = "viewer";
           p.audioAllowed = false;
           p.videoAllowed = false;
+          p.screenShareAllowed = false;
           if (p.phone) p.phone.muted = true;
         }
         if (body.action === "rename") p.name = body.name!;
