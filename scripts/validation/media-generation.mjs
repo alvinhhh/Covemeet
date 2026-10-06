@@ -173,7 +173,6 @@ async function apiInstance() {
   const port = instance.app.server.address().port;
   config.origin = `http://127.0.0.1:${port}`;
   config.portalOrigin = config.origin;
-  config.mediaUrl = `ws://127.0.0.1:${port}`;
   return instance;
 }
 class Session {
@@ -401,7 +400,7 @@ async function denied(api, grant, cookie) {
     const status = await bounded(
       new Promise((resolveStatus, reject) => {
         const ws = new WebSocket(
-          `${api.config.mediaUrl}${path}?access_token=${encodeURIComponent(grant.token)}`,
+          `${api.config.origin.replace(/^http/, "ws")}${path}?access_token=${encodeURIComponent(grant.token)}`,
           {
             headers: { Origin: api.config.origin, Cookie: cookie },
             handshakeTimeout: 4000,

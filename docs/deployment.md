@@ -27,7 +27,6 @@ Do not change the dev bindings to `0.0.0.0` to invite remote users. The local ra
 | `MEETING_DURATION_SECONDS`               | Self-hosted session length from first host entry; 0 is unlimited, otherwise up to 86,400 seconds.                                    |
 | `FREE_MAX_ACTIVE_ROOMS`                  | Hosted Free rooms running or awaiting media cleanup across the installation; defaults to 1. Increase only after load and cost tests. |
 | `LIVEKIT_URL`                            | Private API/signaling destination: localhost in development, `http://livekit:7880` inside Compose.                                   |
-| `LIVEKIT_PUBLIC_URL`                     | Browser gateway origin, such as `ws://localhost:4100`; the SDK appends `/rtc`. It must never point at raw LiveKit.                   |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Server-only credentials shared with LiveKit/Egress.                                                                                  |
 | `LIVEKIT_NODE_IP`                        | IP advertised for media candidates. Local setup uses `127.0.0.1`.                                                                    |
 | `RECORDING_KEK`                          | Base64 encoding of a 32-byte operator-owned recording wrapping key.                                                                  |
@@ -61,7 +60,7 @@ Issuing a link emails its password automatically to the verified host. The link 
 
 `infra/compose.production.yaml` is a single-host staging template. It does not establish a high-availability service. Start with a private staging network and synthetic data.
 
-1. Set the real `SITE_ORIGIN=https://…`, `LIVEKIT_PUBLIC_URL=wss://…` (origin only), and reachable `LIVEKIT_NODE_IP` in a protected environment file. Supply SMTP credentials separately from source control.
+1. Set the real `SITE_ORIGIN=https://…` and reachable `LIVEKIT_NODE_IP` in a protected environment file. The browser signaling gateway uses `SITE_ORIGIN` with `wss://`. Supply SMTP credentials separately from source control.
 2. Render configuration with `node scripts/bootstrap.mjs --production`. Supply PostgreSQL TLS files as described below.
 3. Validate with `docker compose --env-file .env -f infra/compose.production.yaml config --quiet`.
 4. Review and build with `docker compose --env-file .env -f infra/compose.production.yaml build`.

@@ -100,24 +100,21 @@ export function loadConfig(env = process.env) {
   const phoneTrunkId = env.PHONE_TRUNK_ID ?? "";
   const phoneDialInNumber = env.PHONE_DIAL_IN_NUMBER ?? "";
   const phoneSipAddress = env.PHONE_SIP_ADDRESS ?? "";
-  const boundedPhoneValue = (
-    value: string | undefined,
+  const boundedLimit = (
+    key: string,
     fallback: number,
     maximum: number,
+    minimum = 1,
   ) => {
-    const n = Number(value ?? fallback);
-    if (!Number.isSafeInteger(n) || n < 1 || n > maximum)
-      throw new Error(`Phone limit must be between 1 and ${maximum}`);
-    return n;
+    const value = Number(env[key] ?? fallback);
+    if (!Number.isSafeInteger(value) || value < minimum || value > maximum)
+      throw new Error(`${key} must be between ${minimum} and ${maximum}`);
+    return value;
   };
-  const phoneMaxCalls = boundedPhoneValue(env.PHONE_MAX_CALLS, 20, 20);
-  const phoneLobbySeconds = boundedPhoneValue(
-    env.PHONE_LOBBY_SECONDS,
-    300,
-    300,
-  );
-  const phoneMaxDurationSeconds = boundedPhoneValue(
-    env.PHONE_MAX_DURATION_SECONDS,
+  const phoneMaxCalls = boundedLimit("PHONE_MAX_CALLS", 20, 20);
+  const phoneLobbySeconds = boundedLimit("PHONE_LOBBY_SECONDS", 300, 300);
+  const phoneMaxDurationSeconds = boundedLimit(
+    "PHONE_MAX_DURATION_SECONDS",
     7200,
     7200,
   );
@@ -152,34 +149,23 @@ export function loadConfig(env = process.env) {
   ) {
     throw new Error("RECORDING_MAX_BYTES must be between 93 bytes and 64 GiB");
   }
-  const meetingLimit = (
-    key: string,
-    fallback: number,
-    maximum: number,
-    minimum = 1,
-  ) => {
-    const value = Number(env[key] ?? fallback);
-    if (!Number.isSafeInteger(value) || value < minimum || value > maximum)
-      throw new Error(`${key} must be between ${minimum} and ${maximum}`);
-    return value;
-  };
-  const meetingParticipantLimit = meetingLimit(
+  const meetingParticipantLimit = boundedLimit(
     "MEETING_PARTICIPANT_LIMIT",
     100,
     1000,
   );
-  const webinarParticipantLimit = meetingLimit(
+  const webinarParticipantLimit = boundedLimit(
     "WEBINAR_PARTICIPANT_LIMIT",
     1010,
     1010,
   );
-  const meetingDurationSeconds = meetingLimit(
+  const meetingDurationSeconds = boundedLimit(
     "MEETING_DURATION_SECONDS",
     0,
     86400,
     0,
   );
-  const freeMaxActiveRooms = meetingLimit("FREE_MAX_ACTIVE_ROOMS", 1, 1000);
+  const freeMaxActiveRooms = boundedLimit("FREE_MAX_ACTIVE_ROOMS", 1, 1000);
   return {
     meetingParticipantLimit,
     webinarParticipantLimit,
@@ -199,7 +185,6 @@ export function loadConfig(env = process.env) {
     livekitUrl: env.LIVEKIT_URL ?? "http://127.0.0.1:7880",
     livekitKey: env.LIVEKIT_API_KEY ?? "",
     livekitSecret: env.LIVEKIT_API_SECRET ?? env.LIVEKIT_SECRET ?? "",
-    mediaUrl: env.LIVEKIT_PUBLIC_URL ?? "ws://localhost:4100",
     phoneEnabled,
     // Only the isolated RTC stand-in tests may omit native dialog ownership.
     phoneAllowUnjournaledTestCalls: env.NODE_ENV === "test",

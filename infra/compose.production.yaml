@@ -13,7 +13,6 @@ services:
       PORT: 4100
       STATIC_DIR: /app/apps/web/dist
       SITE_ORIGIN: ${SITE_ORIGIN:?Set HTTPS public origin}
-      LIVEKIT_PUBLIC_URL: ${LIVEKIT_PUBLIC_URL:?Set WSS gateway URL}
       DATABASE_URL: postgresql://meeting:${POSTGRES_PASSWORD}@postgres:5432/meeting
       DATABASE_CA_FILE: /etc/postgresql/root.crt
       LIVEKIT_URL: http://livekit:7880
