@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import nodemailer from "nodemailer";
+import { STSClient } from "@aws-sdk/client-sts";
+import { SESv2Client } from "@aws-sdk/client-sesv2";
 import { createServer, type Socket } from "node:net";
 import { loadMailConfig } from "../src/config.js";
 import {
@@ -120,7 +122,22 @@ test("each SES send binds one temporary credential snapshot and rechecks rotated
     "send",
     "close",
   ]);
-  assert.equal(Object.isFrozen(f.snapshots[0]), true);
+  // Exercise the installed SDK credential resolution without network calls.
+  // Both clients add source metadata to the captured credential object.
+  const keys = { ...f.snapshots[0]! };
+  for (const Client of [STSClient, SESv2Client]) {
+    const client = new Client({
+      credentials: f.snapshots[0]!,
+      region: "us-east-2",
+    });
+    try {
+      const resolved = await client.config.credentials();
+      for (const [key, value] of Object.entries(keys))
+        assert.deepEqual(resolved[key as keyof typeof resolved], value);
+    } finally {
+      client.destroy();
+    }
+  }
   f.events.length = 0;
   f.setCredentials(temporary("temporary-two"));
   f.setIdentity({

@@ -156,12 +156,13 @@ function snapshot(value: Credentials): Credentials {
     expiration.getTime() <= Date.now() + SEND_DEADLINE_MS
   )
     throw new Error("Fresh temporary instance credentials are required");
-  return Object.freeze({
+  // Keep a separate snapshot; the AWS SDK adds credential-source metadata.
+  return {
     accessKeyId: value.accessKeyId,
     secretAccessKey: value.secretAccessKey,
     sessionToken: value.sessionToken,
     expiration: new Date(expiration.getTime()),
-  });
+  };
 }
 
 async function abortable<T>(
