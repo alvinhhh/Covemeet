@@ -1133,6 +1133,7 @@ function Conference({
   const [mediaError, setMediaError] = useState("");
   const [attempt, setAttempt] = useState(0);
   const host = state.me.role === "host";
+  const moderator = host || !!state.me.moderator;
   const usage = host ? state.meeting.usage : undefined;
   const quotaNotice =
     usage === null
@@ -1385,6 +1386,13 @@ function Conference({
                 action={(id, data) =>
                   mutate(`/participants/${encodeURIComponent(id)}/action`, data)
                 }
+                grant={(id, enabled) =>
+                  mutate(
+                    `/participants/${encodeURIComponent(id)}/moderator`,
+                    { enabled },
+                    "PUT",
+                  )
+                }
               />
             ) : panel === "chat" ? (
               <Chat
@@ -1416,13 +1424,13 @@ function Conference({
                 }
                 busy={busy}
               />
-            ) : panel === "breakouts" ? (
+            ) : panel === "breakouts" && moderator ? (
               <Breakouts state={state} busy={busy} mutate={mutate} />
             ) : panel === "phone" && host && config.phoneAvailable ? (
               <PhoneAccessPanel key={code} code={code} />
-            ) : (
+            ) : panel === "recordings" && host ? (
               <Recordings state={state} config={config} refresh={refresh} />
-            )}
+            ) : null}
           </aside>
         )}
         {panel === null && unreadChat > 0 && (
@@ -1439,9 +1447,11 @@ function Conference({
         <span className="session-role">
           {host
             ? "Host"
-            : state.me.role === "viewer"
-              ? "Viewer"
-              : "Participant"}
+            : state.me.moderator
+              ? "Co-host"
+              : state.me.role === "viewer"
+                ? "Viewer"
+                : "Participant"}
           <span> · {state.me.name}</span>
           <SpeakingBadge
             surface="dock"
@@ -1521,7 +1531,7 @@ function Conference({
             >
               <Icon name="users" />
               <span>Participants</span>
-              {host && waiting.length > 0 && <b>{waiting.length}</b>}
+              {moderator && waiting.length > 0 && <b>{waiting.length}</b>}
             </button>
             <button
               ref={chatButton}
@@ -1546,7 +1556,7 @@ function Conference({
                 ? `${unreadChat} unread chat ${unreadChat === 1 ? "message" : "messages"}`
                 : ""}
             </span>
-            {host && (
+            {moderator && (
               <button
                 className={panel === "breakouts" ? "selected" : ""}
                 aria-label="Breakout rooms"
@@ -1606,7 +1616,7 @@ function Conference({
             <Icon name="link" size={17} />
             <span>Invite</span>
           </Button>
-          {host && (
+          {moderator && (
             <Button
               className={state.meeting.locked ? "lock-active" : ""}
               aria-label={
@@ -2146,12 +2156,14 @@ function Participants({
   signals,
   busy,
   action,
+  grant,
   openPhone,
 }: {
   state: MeetingState;
   signals: Map<string, AudioSignal>;
   busy: boolean;
   action: (id: string, data: object) => Promise<boolean>;
+  grant: (id: string, enabled: boolean) => Promise<boolean>;
   openPhone?: () => void;
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -2161,6 +2173,12 @@ function Participants({
   const [renaming, setRenaming] = useState<string | null>(null);
   const [name, setName] = useState("");
   const host = state.me.role === "host";
+  const moderator = host || !!state.me.moderator;
+  const canControl = (p: Participant) =>
+    moderator &&
+    p.id !== state.me.id &&
+    p.role !== "host" &&
+    (host || !p.moderator);
   const webinar = state.meeting.webinar;
   const stageFull = !!webinar && webinar.presenters >= webinar.presenterLimit;
   const audienceFull = !!webinar && webinar.viewers >= webinar.viewerLimit;
@@ -2173,7 +2191,7 @@ function Participants({
           Phone access
         </Button>
       )}
-      {host && waiting.length > 0 && (
+      {moderator && waiting.length > 0 && (
         <section className="waiting-list">
           <div className="section-label">
             WAITING ROOM <span>{waiting.length}</span>
@@ -2223,7 +2241,7 @@ function Participants({
           ))}
         </section>
       )}
-      {host && webinar && (
+      {moderator && webinar && (
         <p className="panel-note">
           Stage: {webinar.presenters}/{webinar.presenterLimit} · Audience:{" "}
           {webinar.viewers}/{webinar.viewerLimit}
@@ -2254,11 +2272,13 @@ function Participants({
                 {p.transport === "phone" && "Phone caller · "}
                 {p.role === "host"
                   ? "Host"
-                  : p.role === "viewer"
-                    ? "Viewer"
-                    : state.meeting.mode === "webinar"
-                      ? "Presenter"
-                      : "Participant"}
+                  : p.moderator
+                    ? "Co-host"
+                    : p.role === "viewer"
+                      ? "Viewer"
+                      : state.meeting.mode === "webinar"
+                        ? "Presenter"
+                        : "Participant"}
               </small>
               {p.transport === "phone" && (
                 <small>
@@ -2287,7 +2307,7 @@ function Participants({
                 <Icon name="video" size={14} />
               </span>
             )}
-            {host && p.id !== state.me.id && (
+            {canControl(p) && (
               <button
                 className="icon-button"
                 aria-expanded={expanded === p.id}
@@ -2298,7 +2318,7 @@ function Participants({
               </button>
             )}
           </div>
-          {expanded === p.id && (
+          {canControl(p) && expanded === p.id && (
             <div className="participant-actions">
               <button
                 disabled={busy || p.role === "viewer"}
@@ -2342,7 +2362,7 @@ function Participants({
                     : "Allow camera"}
                 </button>
               )}
-              {p.transport === "phone" && (
+              {host && p.transport === "phone" && (
                 <button
                   disabled={busy}
                   onClick={() => {
@@ -2353,7 +2373,7 @@ function Participants({
                   Rename caller
                 </button>
               )}
-              {renaming === p.id && (
+              {host && renaming === p.id && (
                 <form
                   className="form-stack"
                   onSubmit={async (event) => {
@@ -2385,7 +2405,7 @@ function Participants({
                   </div>
                 </form>
               )}
-              {state.meeting.mode === "webinar" && (
+              {host && state.meeting.mode === "webinar" && (
                 <button
                   disabled={
                     busy || (p.role === "viewer" ? stageFull : audienceFull)
@@ -2428,11 +2448,19 @@ function Participants({
                     : "Ban from meeting…"}
                 </button>
               )}
+              {host && p.transport !== "phone" && (
+                <button
+                  disabled={busy}
+                  onClick={() => void grant(p.id, !p.moderator)}
+                >
+                  {p.moderator ? "Remove co-host" : "Make co-host"}
+                </button>
+              )}
             </div>
           )}
         </div>
       ))}
-      {host && (
+      {moderator && (
         <p className="panel-note">
           Permission changes reconnect media. Participants choose when to turn
           allowed devices back on.
@@ -2440,7 +2468,7 @@ function Participants({
             " Allowing a phone caller to speak leaves the call muted until the caller unmutes."}
         </p>
       )}
-      {ban && (
+      {ban && moderator && (
         <div className="ban-form">
           <h3>
             {ban.transport === "phone" ? "Block caller ID" : "Ban"}: {ban.name}
@@ -2526,11 +2554,20 @@ function Breakouts({
   const [name, setName] = useState("");
   const [broadcast, setBroadcast] = useState("");
   const [sent, setSent] = useState(false);
+  const host = state.me.role === "host";
   const rooms = [
     { id: "", name: "Main room" },
     ...(state.meeting.breakouts || []),
   ];
   const admitted = state.participants.filter((p) => p.status === "admitted");
+  const protectedInBreakout =
+    !host &&
+    admitted.some(
+      (p) =>
+        p.breakoutId &&
+        p.id !== state.me.id &&
+        (p.role === "host" || p.moderator),
+    );
   return (
     <div className="panel-scroll breakout-panel">
       <form
@@ -2587,11 +2624,21 @@ function Breakouts({
                 <label>
                   <span className="sr-only">Room for {p.name}</span>
                   <select
-                    disabled={busy || p.transport === "phone"}
+                    disabled={
+                      busy ||
+                      p.transport === "phone" ||
+                      (!host &&
+                        p.id !== state.me.id &&
+                        (p.role === "host" || !!p.moderator))
+                    }
                     title={
                       p.transport === "phone"
                         ? "Phone callers cannot move to breakout rooms yet"
-                        : undefined
+                        : !host &&
+                            p.id !== state.me.id &&
+                            (p.role === "host" || p.moderator)
+                          ? "Only the host can move this participant"
+                          : undefined
                     }
                     value={p.breakoutId || ""}
                     onChange={(e) =>
@@ -2618,7 +2665,12 @@ function Breakouts({
       {(state.meeting.breakouts?.length || 0) > 0 && (
         <Button
           className="small full-width"
-          disabled={busy}
+          disabled={busy || protectedInBreakout}
+          title={
+            protectedInBreakout
+              ? "Return the host and other co-hosts to the main room first"
+              : undefined
+          }
           onClick={() => {
             if (
               window.confirm(
@@ -2631,45 +2683,47 @@ function Breakouts({
           Close all breakout rooms
         </Button>
       )}
-      <form
-        className="breakout-broadcast"
-        onSubmit={async (e) => {
-          e.preventDefault();
-          if (state.meeting.chatMode === "disabled") return;
-          if (await mutate("/broadcast", { text: broadcast.trim() })) {
-            setBroadcast("");
-            setSent(true);
-          }
-        }}
-      >
-        <Field label="Message all rooms">
-          <textarea
-            value={broadcast}
-            disabled={state.meeting.chatMode === "disabled"}
-            onChange={(e) => {
-              setBroadcast(e.target.value);
-              setSent(false);
-            }}
-            maxLength={2000}
-            rows={3}
-            placeholder="Message to all participants"
-            required
-          />
-        </Field>
-        <Button
-          className="small"
-          type="submit"
-          disabled={
-            busy || state.meeting.chatMode === "disabled" || !broadcast.trim()
-          }
+      {host && (
+        <form
+          className="breakout-broadcast"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (state.meeting.chatMode === "disabled") return;
+            if (await mutate("/broadcast", { text: broadcast.trim() })) {
+              setBroadcast("");
+              setSent(true);
+            }
+          }}
         >
-          Send to all rooms
-        </Button>
-        {state.meeting.chatMode === "disabled" && (
-          <Notice kind="info">Chat is off</Notice>
-        )}
-        {sent && <Notice kind="success">Message sent to all rooms.</Notice>}
-      </form>
+          <Field label="Message all rooms">
+            <textarea
+              value={broadcast}
+              disabled={state.meeting.chatMode === "disabled"}
+              onChange={(e) => {
+                setBroadcast(e.target.value);
+                setSent(false);
+              }}
+              maxLength={2000}
+              rows={3}
+              placeholder="Message to all participants"
+              required
+            />
+          </Field>
+          <Button
+            className="small"
+            type="submit"
+            disabled={
+              busy || state.meeting.chatMode === "disabled" || !broadcast.trim()
+            }
+          >
+            Send to all rooms
+          </Button>
+          {state.meeting.chatMode === "disabled" && (
+            <Notice kind="info">Chat is off</Notice>
+          )}
+          {sent && <Notice kind="success">Message sent to all rooms.</Notice>}
+        </form>
+      )}
       <p className="panel-note">
         Moving rooms reconnects audio and video. Participants choose when to
         turn their devices back on.

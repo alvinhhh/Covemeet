@@ -303,6 +303,32 @@ export async function createApp(config: Config, store: Store, media: Media) {
       throw new HttpError(403, "Host session is inactive");
     return p;
   }
+  function canModerate(m: Meeting, p: Participant) {
+    return !!(
+      p.moderator &&
+      p.transport !== "phone" &&
+      p.status === "admitted" &&
+      !p.enforcementPending &&
+      p.expiresAt > Date.now() &&
+      meetingAllowed(m)
+    );
+  }
+  function moderationActor(req: FastifyRequest, m: Meeting) {
+    const p = actor(req, m);
+    if (p.role === "host") return actor(req, m, true);
+    if (!canModerate(m, p))
+      throw new HttpError(403, "Moderation permission required");
+    return p;
+  }
+  const moderatorActions = new Set([
+    "admit",
+    "kick",
+    "ban",
+    "allow-audio",
+    "block-audio",
+    "allow-video",
+    "block-video",
+  ]);
   const recordingCookie = (code: string) => `mp_recordings_${code}`;
   const recoveryCookie = (code: string) => `mp_recording_recovery_${code}`;
   function retainedRecordings(m: Meeting) {
@@ -1278,6 +1304,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         id: x.id,
         name: x.name,
         role: x.role,
+        moderator: canModerate(m, x),
         status: x.status,
         audioAllowed: x.audioAllowed,
         videoAllowed: x.videoAllowed,
@@ -1336,6 +1363,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
             (x) =>
               x.id === p.id ||
               p.role === "host" ||
+              canModerate(m, p) ||
               (canSee &&
                 x.status === "admitted" &&
                 x.breakoutId === p.breakoutId),
@@ -1372,6 +1400,44 @@ export async function createApp(config: Config, store: Store, media: Media) {
       };
     },
   );
+  app.put("/api/meetings/:code/participants/:id/moderator", async (req) => {
+    const { enabled } = z
+      .object({ enabled: z.boolean() })
+      .strict()
+      .parse(req.body);
+    const target = (req.params as any).id;
+    const hostId = await store.change(codeOf(req), (m) => {
+      active(m);
+      const host = actor(req, m, true);
+      const p = m.participants.find((x) => x.id === target);
+      if (!p || p.role === "host" || p.transport === "phone")
+        throw new HttpError(400, "Select a browser participant");
+      if (enabled) {
+        if (
+          p.status !== "admitted" ||
+          p.expiresAt <= Date.now() ||
+          p.enforcementPending
+        )
+          throw new HttpError(409, "Participant session is inactive");
+        p.moderator = {
+          grantedBy: host.id,
+          grantedAt: Date.now(),
+          revision: m.revision + 1,
+        };
+      } else {
+        delete p.moderator;
+      }
+      p.auditReferenced = true;
+      return host.id;
+    });
+    await store.audit(
+      codeOf(req),
+      hostId,
+      enabled ? "moderator.grant" : "moderator.revoke",
+      target,
+    );
+    return { ok: true };
+  });
   app.post("/api/meetings/:code/participants/:id/action", async (req) => {
     const body = z
       .object({
@@ -1397,12 +1463,18 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const target = (req.params as any).id;
     if (body.action === "admit") await store.checkUsage(codeOf(req));
     let changed!: Participant;
+    let actorId!: string;
     const m = await store.change(codeOf(req), (m) => {
       active(m);
-      actor(req, m, true);
+      const self = moderationActor(req, m);
+      actorId = self.id;
+      if (self.role !== "host" && !moderatorActions.has(body.action))
+        throw new HttpError(403, "Host permission required");
       const p = m.participants.find((x) => x.id === target);
       if (!p || p.role === "host")
         throw new HttpError(400, "Select a guest participant");
+      if (self.role !== "host" && (p.id === self.id || !!p.moderator))
+        throw new HttpError(403, "Another moderator cannot be changed");
       if (!occupiesSeat(p))
         throw new HttpError(409, "Participant session is inactive");
       if (p.transport === "phone") {
@@ -1497,7 +1569,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       changed = structuredClone(p);
       return structuredClone(m);
     });
-    await store.audit(m.code, actor(req, m, true).id, body.action, target);
+    await store.audit(m.code, actorId, body.action, target);
     if (changed.enforcementPending) await enforce(m, [changed]);
     return { ok: true };
   });
@@ -1510,9 +1582,18 @@ export async function createApp(config: Config, store: Store, media: Media) {
       })
       .strict()
       .parse(req.body);
+    let actorId!: string;
     const m = await store.change(codeOf(req), (m) => {
       active(m);
-      actor(req, m, true);
+      const self = moderationActor(req, m);
+      actorId = self.id;
+      if (
+        self.role !== "host" &&
+        (body.locked === undefined ||
+          body.recordingAllowed !== undefined ||
+          body.chatMode !== undefined)
+      )
+        throw new HttpError(403, "Host permission required");
       if (body.recordingAllowed && !recordingIncluded(m))
         throw new HttpError(403, "Recording is not available on this plan");
       Object.assign(m, body);
@@ -1523,7 +1604,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       return structuredClone(m);
     });
     if (body.recordingAllowed === false) await recordings.stopAll(m);
-    await store.audit(m.code, actor(req, m, true).id, "meeting.policy");
+    await store.audit(m.code, actorId, "meeting.policy");
     return { ok: true };
   });
   app.post("/api/meetings/:code/end", async (req, reply) => {
@@ -1710,9 +1791,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
   );
   app.post("/api/meetings/:code/breakouts", async (req) => {
     const { name: roomName } = z.object({ name }).parse(req.body);
-    await store.change(codeOf(req), (m) => {
+    const actorId = await store.change(codeOf(req), (m) => {
       active(m);
-      actor(req, m, true);
+      const self = moderationActor(req, m);
       if (m.breakouts.length >= 20)
         throw new HttpError(409, "Maximum 20 breakout rooms");
       m.breakouts.push({
@@ -1720,7 +1801,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
         name: roomName,
         room: `b_${randomUUID()}`,
       });
+      return self.id;
     });
+    await store.audit(codeOf(req), actorId, "breakout.create");
     return { ok: true };
   });
   for (const route of ["move", "return-main", "close-breakouts"])
@@ -1735,9 +1818,12 @@ export async function createApp(config: Config, store: Store, media: Media) {
               .parse(req.body)
           : null;
       const moved: Participant[] = [];
+      let actorId!: string;
       const m = await store.change(codeOf(req), (m) => {
         active(m);
-        const self = actor(req, m, route !== "return-main");
+        const self =
+          route === "return-main" ? actor(req, m) : moderationActor(req, m);
+        actorId = self.id;
         if (
           body?.breakoutId &&
           !m.breakouts.some((b) => b.id === body.breakoutId)
@@ -1756,6 +1842,13 @@ export async function createApp(config: Config, store: Store, media: Media) {
         for (const p of targets) {
           if (!p || p.status !== "admitted")
             throw new HttpError(400, "Participant is not admitted");
+          if (
+            route !== "return-main" &&
+            self.role !== "host" &&
+            p.id !== self.id &&
+            (p.role === "host" || !!p.moderator)
+          )
+            throw new HttpError(403, "Another moderator cannot be moved");
           if (p.transport === "phone")
             throw new HttpError(
               409,
@@ -1774,7 +1867,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         return structuredClone(m);
       });
       await enforce(m, moved);
-      await store.audit(m.code, "host", `breakout.${route}`);
+      await store.audit(m.code, actorId, `breakout.${route}`);
       return { ok: true };
     });
   app.post(

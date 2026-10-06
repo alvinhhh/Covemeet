@@ -38,7 +38,7 @@ class Client {
     readonly ip: string,
   ) {}
   async request(
-    method: "GET" | "POST" | "PATCH" | "DELETE",
+    method: "GET" | "POST" | "PATCH" | "DELETE" | "PUT",
     url: string,
     payload?: object,
     extraHeaders: Record<string, string> = {},
@@ -801,6 +801,224 @@ test("breakout moves rotate media authority and room chat stays scoped", async (
     await f.host.request("POST", `/api/meetings/${m.code}/close-breakouts`, {}),
   );
   assert.equal((await f.store.get(m.code))!.breakouts.length, 0);
+});
+
+test("a current co-host can moderate without receiving host-only state", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const cohost = await f.join(m.code, "198.51.100.31");
+  const guest = await f.join(m.code, "198.51.100.32");
+  const waiting = await f.join(m.code, "198.51.100.33");
+  await f.action(m.code, cohost.id, "admit");
+  await f.action(m.code, guest.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  ok(
+    await f.host.request("POST", `${path}/messages`, {
+      text: "Host private",
+      recipient: guest.id,
+    }),
+  );
+  await f.store.change(m.code, (current) => {
+    current.hostEmailVerified = true;
+    current.recordings.push({
+      id: randomUUID(),
+      status: "ready",
+      createdAt: Date.now(),
+    });
+  });
+  rejected(
+    await cohost.client.request(
+      "PUT",
+      `${path}/participants/${guest.id}/moderator`,
+      { enabled: true },
+    ),
+  );
+  ok(
+    await f.host.request("PUT", `${path}/participants/${cohost.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  const saved = (await f.store.get(m.code))!.participants.find(
+    (p) => p.id === cohost.id,
+  )!;
+  assert.equal(saved.moderator?.grantedBy, m.hostId);
+  assert.equal(typeof saved.moderator?.revision, "number");
+  const state = (await cohost.client.request("GET", `${path}/state`)).json();
+  assert.equal(state.me.moderator, true);
+  assert.ok(
+    state.participants.some((p: { id: string }) => p.id === waiting.id),
+  );
+  assert.equal(state.meeting.hostEmailVerified, undefined);
+  assert.equal(state.meeting.usage, undefined);
+  assert.deepEqual(state.recordings, []);
+  assert.ok(
+    !state.messages.some(
+      (entry: { text: string }) => entry.text === "Host private",
+    ),
+  );
+
+  ok(await cohost.client.request("PATCH", path, { locked: true }));
+  rejected(
+    await cohost.client.request("PATCH", path, {
+      locked: false,
+      recordingAllowed: true,
+    }),
+  );
+  rejected(
+    await cohost.client.request("PATCH", path, {
+      locked: false,
+      chatMode: "disabled",
+    }),
+  );
+  ok(await cohost.client.request("PATCH", path, { locked: false }));
+  ok(
+    await cohost.client.request(
+      "POST",
+      `${path}/participants/${waiting.id}/action`,
+      { action: "admit" },
+    ),
+  );
+  ok(
+    await cohost.client.request("POST", `${path}/breakouts`, { name: "Group" }),
+  );
+  const breakoutId = (
+    await cohost.client.request("GET", `${path}/state`)
+  ).json().meeting.breakouts[0].id;
+  ok(
+    await cohost.client.request("POST", `${path}/move`, {
+      participantId: guest.id,
+      breakoutId,
+    }),
+  );
+  const priorRemovals = f.media.removed.filter((id) => id === guest.id).length;
+  ok(
+    await cohost.client.request(
+      "POST",
+      `${path}/participants/${guest.id}/action`,
+      { action: "block-audio" },
+    ),
+  );
+  assert.equal(
+    f.media.removed.filter((id) => id === guest.id).length,
+    priorRemovals + 1,
+  );
+  assert.equal(
+    (await f.store.get(m.code))!.participants.find((p) => p.id === guest.id)!
+      .audioAllowed,
+    false,
+  );
+  ok(await cohost.client.request("POST", `${path}/close-breakouts`, {}));
+  ok(
+    await cohost.client.request(
+      "POST",
+      `${path}/participants/${waiting.id}/action`,
+      { action: "ban", banDevice: true },
+    ),
+  );
+  ok(
+    await cohost.client.request(
+      "POST",
+      `${path}/participants/${guest.id}/action`,
+      { action: "kick" },
+    ),
+  );
+  assert.equal(
+    (await f.store.get(m.code))!.participants.find((p) => p.id === guest.id)!
+      .status,
+    "kicked",
+  );
+  ok(
+    await f.host.request("PUT", `${path}/participants/${cohost.id}/moderator`, {
+      enabled: false,
+    }),
+  );
+  assert.equal(
+    (await cohost.client.request("GET", `${path}/state`)).json().me.moderator,
+    false,
+  );
+  rejected(await cohost.client.request("PATCH", path, { locked: true }));
+});
+
+test("co-host authority cannot change the host, another delegate or sensitive policy", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const first = await f.join(m.code, "198.51.100.41");
+  const second = await f.join(m.code, "198.51.100.42");
+  const guest = await f.join(m.code, "198.51.100.43");
+  const path = `/api/meetings/${m.code}`;
+  await f.action(m.code, first.id, "admit");
+  await f.action(m.code, second.id, "admit");
+  await f.action(m.code, guest.id, "admit");
+  rejected(
+    await f.host.request("PUT", `${path}/participants/${first.id}/moderator`, {
+      enabled: true,
+      role: "host",
+    }),
+  );
+  ok(
+    await f.host.request("PUT", `${path}/participants/${first.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  ok(
+    await f.host.request("PUT", `${path}/participants/${second.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  for (const id of [m.hostId, second.id]) {
+    rejected(
+      await first.client.request("POST", `${path}/participants/${id}/action`, {
+        action: "kick",
+      }),
+    );
+    rejected(
+      await first.client.request("POST", `${path}/move`, {
+        participantId: id,
+        breakoutId: null,
+      }),
+    );
+  }
+  for (const action of ["promote", "demote", "rename"] as const)
+    assert.equal(
+      (
+        await first.client.request(
+          "POST",
+          `${path}/participants/${guest.id}/action`,
+          { action, ...(action === "rename" ? { name: "Other" } : {}) },
+        )
+      ).statusCode,
+      403,
+    );
+  rejected(
+    await first.client.request("POST", `${path}/broadcast`, {
+      text: "Not host",
+    }),
+  );
+  rejected(await first.client.request("POST", `${path}/end`, {}));
+  rejected(
+    await first.client.request(
+      "PUT",
+      `${path}/participants/${second.id}/moderator`,
+      { enabled: false },
+    ),
+  );
+  ok(await f.host.request("POST", `${path}/breakouts`, { name: "Protected" }));
+  const breakoutId = (await f.host.request("GET", `${path}/state`)).json()
+    .meeting.breakouts[0].id;
+  ok(
+    await f.host.request("POST", `${path}/move`, {
+      participantId: second.id,
+      breakoutId,
+    }),
+  );
+  rejected(await first.client.request("POST", `${path}/close-breakouts`, {}));
+  assert.equal((await f.store.get(m.code))!.breakouts.length, 1);
+  ok(await f.host.request("POST", `${path}/close-breakouts`, {}));
+  await f.store.change(m.code, (current) => {
+    current.participants.find((p) => p.id === first.id)!.expiresAt =
+      Date.now() - 1;
+  });
+  rejected(await first.client.request("PATCH", path, { locked: true }));
 });
 
 test("whiteboard writes require admission, obey host policy, and replay by room", async (t) => {

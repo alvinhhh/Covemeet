@@ -30,6 +30,7 @@ export type Participant = {
   id: string;
   name: string;
   role: "host" | "participant" | "viewer";
+  moderator?: boolean;
   status: "waiting" | "admitted" | "kicked" | "banned" | "left";
   audioAllowed: boolean;
   videoAllowed: boolean;
