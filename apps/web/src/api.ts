@@ -58,6 +58,8 @@ export type PhoneAccess = {
   sipAddress?: string;
 };
 
+export type ChatMode = "everyone" | "host-only" | "disabled";
+
 export type MeetingState = {
   meeting: {
     code: string;
@@ -92,6 +94,7 @@ export type MeetingState = {
       blocked: boolean;
     };
     recordingAllowed: boolean;
+    chatMode?: ChatMode;
     recordingAvailable?: boolean;
     recordingActive?: boolean;
     createdAt: string;
@@ -102,7 +105,10 @@ export type MeetingState = {
   participants: Participant[];
   messages: {
     id: string;
+    sequence?: number;
     senderId?: string;
+    recipientId?: string;
+    deleted?: boolean;
     name: string;
     text: string;
     createdAt: string;

@@ -60,3 +60,27 @@ test("opening another room does not clear this room's unread messages", () => {
     0,
   );
 });
+
+test("message tombstones do not make older history unread again", () => {
+  const unread = new ChatUnread();
+  const history = Array.from({ length: 100 }, (_, index) => ({
+    id: String(index),
+    senderId: "guest",
+    text: String(index),
+    deleted: false,
+  }));
+  unread.update("main", history, "self", true);
+  const removed = history.map((message, index) =>
+    index === 99 ? { ...message, text: "", deleted: true } : message,
+  );
+  assert.equal(unread.update("main", removed, "self", false), 0);
+  assert.equal(
+    unread.update(
+      "main",
+      [...removed.slice(1), { id: "new", senderId: "guest" }],
+      "self",
+      false,
+    ),
+    1,
+  );
+});

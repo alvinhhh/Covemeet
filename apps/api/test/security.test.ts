@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import test, { type TestContext } from "node:test";
 import type { FastifyInstance } from "fastify";
 import { loadConfig } from "../src/config.js";
@@ -718,7 +719,6 @@ test("breakout moves rotate media authority and room chat stays scoped", async (
   ok(
     await first.client.request("POST", `/api/meetings/${m.code}/messages`, {
       text: "Breakout-only message",
-      senderId: second.id,
     }),
   );
   const mainState = await second.client.request(
@@ -1325,4 +1325,368 @@ test("poll limits reject forged cookie and code rotation before further store re
       readsAfterLimit: 0,
     })),
   );
+});
+
+test("chat policy controls every send using current meeting authority", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting({ mode: "webinar" });
+  const guest = await f.join(m.code);
+  const path = `/api/meetings/${m.code}`;
+  rejected(
+    await guest.client.request("POST", `${path}/messages`, { text: "Waiting" }),
+  );
+  await f.action(m.code, guest.id, "admit");
+  rejected(await guest.client.request("PATCH", path, { chatMode: "disabled" }));
+  // Existing serialized rooms without a policy retain public chat.
+  await f.store.change(m.code, (state) => {
+    delete state.chatMode;
+  });
+  assert.equal(
+    (await guest.client.request("GET", `${path}/state`)).json().meeting
+      .chatMode,
+    "everyone",
+  );
+  ok(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Viewer message",
+    }),
+  );
+  ok(await f.host.request("PATCH", path, { chatMode: "host-only" }));
+  for (const recipient of ["everyone", "host"])
+    rejected(
+      await guest.client.request("POST", `${path}/messages`, {
+        text: "Blocked",
+        recipient,
+      }),
+    );
+  ok(
+    await f.host.request("POST", `${path}/messages`, { text: "Host message" }),
+  );
+  ok(
+    await f.host.request("POST", `${path}/broadcast`, {
+      text: "Host announcement",
+    }),
+  );
+  ok(await f.host.request("PATCH", path, { chatMode: "disabled" }));
+  const count = (await f.store.get(m.code))!.messages.length;
+  for (const client of [guest.client, f.host])
+    for (const endpoint of ["messages", "broadcast"])
+      rejected(
+        await client.request("POST", `${path}/${endpoint}`, {
+          text: "Stale client send",
+        }),
+      );
+  assert.equal((await f.store.get(m.code))!.messages.length, count);
+  const reconnected = new Client(f.app, guest.client.ip);
+  reconnected.cookie = guest.client.cookie;
+  assert.equal(
+    (await reconnected.request("GET", `${path}/state`)).json().meeting.chatMode,
+    "disabled",
+  );
+  ok(await f.host.request("PATCH", path, { chatMode: "everyone" }));
+  ok(
+    await reconnected.request("POST", `${path}/messages`, {
+      text: "Re-enabled",
+    }),
+  );
+  rejected(await f.host.request("PATCH", path, { chatMode: "unknown" }));
+  await f.action(m.code, guest.id, "kick");
+  rejected(
+    await guest.client.request("POST", `${path}/messages`, { text: "Kicked" }),
+  );
+  await f.store.change(m.code, (state) => {
+    state.participants.find((p) => p.id === m.hostId)!.expiresAt =
+      Date.now() - 1;
+  });
+  rejected(await f.host.request("PATCH", path, { chatMode: "everyone" }));
+});
+
+test("private host chat and replies stay scoped across breakouts and reconnect", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code, "198.51.100.21");
+  const other = await f.join(m.code, "198.51.100.22");
+  await f.action(m.code, guest.id, "admit");
+  await f.action(m.code, other.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  ok(
+    await f.host.request("POST", `${path}/breakouts`, { name: "Small group" }),
+  );
+  const breakoutId = (await f.host.request("GET", `${path}/state`)).json()
+    .meeting.breakouts[0].id;
+  ok(
+    await f.host.request("POST", `${path}/move`, {
+      participantId: guest.id,
+      breakoutId,
+    }),
+  );
+  ok(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Breakout public",
+    }),
+  );
+  ok(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Private help",
+      recipient: "host",
+    }),
+  );
+  ok(
+    await f.host.request("POST", `${path}/messages`, {
+      text: "Private reply",
+      recipient: guest.id,
+    }),
+  );
+  const hostState = (await f.host.request("GET", `${path}/state`)).json();
+  assert.deepEqual(
+    hostState.messages.map((message: { text: string }) => message.text),
+    ["Private help", "Private reply"],
+  );
+  assert.equal(hostState.messages[0].recipientId, m.hostId);
+  assert.equal(hostState.messages[1].recipientId, guest.id);
+  const stored = (await f.store.get(m.code))!;
+  assert.deepEqual(
+    stored.messages.map((message) => message.text),
+    ["Breakout public"],
+  );
+  assert.equal(stored.privateMessages?.length, 2);
+  // The old serializer only sees messages, so a rollback cannot expose private text.
+  assert.ok(!JSON.stringify(stored.messages).includes("Private help"));
+  assert.ok(!JSON.stringify(stored.messages).includes("Private reply"));
+  assert.deepEqual(
+    (await other.client.request("GET", `${path}/state`)).json().messages,
+    [],
+  );
+  // A caller cannot choose a guest recipient, impersonate a sender or make a private broadcast.
+  rejected(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Guest DM",
+      recipient: other.id,
+    }),
+  );
+  rejected(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Spoofed",
+      senderId: m.hostId,
+    }),
+  );
+  rejected(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Spoofed scope",
+      recipientId: other.id,
+    }),
+  );
+  rejected(
+    await f.host.request("POST", `${path}/broadcast`, {
+      text: "Leaky broadcast",
+      recipient: guest.id,
+    }),
+  );
+  const foreign = await f.meeting();
+  const foreignGuest = await f.join(foreign.code, "198.51.100.23");
+  await f.action(foreign.code, foreignGuest.id, "admit");
+  rejected(
+    await f.host.request("POST", `${path}/messages`, {
+      text: "Foreign recipient",
+      recipient: foreignGuest.id,
+    }),
+  );
+  rejected(await foreignGuest.client.request("GET", `${path}/state`));
+  // Private host conversations follow their recipient; public breakout history does not.
+  ok(
+    await f.host.request("POST", `${path}/move`, {
+      participantId: guest.id,
+      breakoutId: null,
+    }),
+  );
+  const returning = new Client(f.app, guest.client.ip);
+  returning.cookie = guest.client.cookie;
+  assert.deepEqual(
+    (await returning.request("GET", `${path}/state`))
+      .json()
+      .messages.map((message: { text: string }) => message.text),
+    ["Private help", "Private reply"],
+  );
+  assert.deepEqual(
+    (await other.client.request("GET", `${path}/state`)).json().messages,
+    [],
+  );
+  ok(await guest.client.request("POST", `${path}/leave`, {}));
+  rejected(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Left message",
+      recipient: "host",
+    }),
+  );
+  rejected(
+    await f.host.request("POST", `${path}/messages`, {
+      text: "Departed recipient",
+      recipient: guest.id,
+    }),
+  );
+});
+
+test("host message removal preserves the history window and private scope", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  const other = await f.join(m.code, "198.51.100.25");
+  await f.action(m.code, guest.id, "admit");
+  await f.action(m.code, other.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  await f.store.change(m.code, (state) => {
+    state.messages = Array.from({ length: 101 }, (_, index) => ({
+      id: randomUUID(),
+      senderId: guest.id,
+      name: "Guest",
+      text: String(index),
+      createdAt: Date.now(),
+      breakoutId: null,
+    }));
+  });
+  const before = (await guest.client.request("GET", `${path}/state`)).json()
+    .messages;
+  const id = before.at(-1).id;
+  rejected(await guest.client.request("DELETE", `${path}/messages/${id}`, {}));
+  ok(await f.host.request("PATCH", path, { chatMode: "disabled" }));
+  ok(await f.host.request("DELETE", `${path}/messages/${id}`, {}));
+  ok(await f.host.request("DELETE", `${path}/messages/${id}`, {}));
+  const after = (await guest.client.request("GET", `${path}/state`)).json()
+    .messages;
+  assert.deepEqual(
+    after.map((message: { id: string }) => message.id),
+    before.map((message: { id: string }) => message.id),
+  );
+  assert.equal(after.at(-1).text, "");
+  assert.equal(after.at(-1).deleted, true);
+  assert.equal((await f.store.get(m.code))!.messages.at(-1)!.text, "");
+  ok(await f.host.request("PATCH", path, { chatMode: "everyone" }));
+  ok(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Private to remove",
+      recipient: "host",
+    }),
+  );
+  const privateId = (await f.host.request("GET", `${path}/state`))
+    .json()
+    .messages.at(-1).id;
+  ok(await f.host.request("DELETE", `${path}/messages/${privateId}`, {}));
+  assert.equal(
+    (await guest.client.request("GET", `${path}/state`)).json().messages.at(-1)
+      .deleted,
+    true,
+  );
+  assert.ok(
+    !(await other.client.request("GET", `${path}/state`))
+      .json()
+      .messages.some((message: { id: string }) => message.id === privateId),
+  );
+  const foreign = await f.meeting();
+  assert.equal(
+    (
+      await f.host.request(
+        "DELETE",
+        `/api/meetings/${foreign.code}/messages/${id}`,
+        {},
+      )
+    ).statusCode,
+    404,
+  );
+  assert.equal(
+    (await f.store.get(m.code))!.messages.find((message) => message.id === id)!
+      .deleted,
+    true,
+  );
+  // Public and private rows share one bounded history, not two independent limits.
+  await f.store.change(m.code, (state) => {
+    state.messages = Array.from({ length: 500 }, (_, index) => ({
+      id: randomUUID(),
+      senderId: guest.id,
+      name: "Guest",
+      text: String(index),
+      createdAt: Date.now() - 1000 + index,
+      breakoutId: null,
+    }));
+  });
+  ok(
+    await guest.client.request("POST", `${path}/messages`, {
+      text: "Newest private",
+      recipient: "host",
+    }),
+  );
+  const retained = (await f.store.get(m.code))!;
+  assert.equal(
+    retained.messages.length + retained.privateMessages!.length,
+    500,
+  );
+  assert.ok(
+    retained.privateMessages!.some(
+      (message) => message.text === "Newest private",
+    ),
+  );
+  assert.ok(!retained.messages.some((message) => message.recipientId));
+});
+
+test("same-clock chat preserves append order and drops the oldest shared history", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  await f.action(m.code, guest.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  const now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const oldest = [randomUUID(), randomUUID()];
+  await f.store.change(m.code, (state) => {
+    state.revision = 1000;
+    state.messages = [2, 1].map((offset) => ({
+      id: randomUUID(),
+      senderId: guest.id,
+      name: "Guest",
+      text: "Legacy public",
+      createdAt: now - offset,
+      breakoutId: null,
+    }));
+    state.privateMessages = Array.from({ length: 498 }, (_, index) => ({
+      id: oldest[index] ?? randomUUID(),
+      senderId: guest.id,
+      recipientId: m.hostId,
+      name: "Guest",
+      text: `Earlier ${index}`,
+      createdAt: now,
+      sequence: index + 1,
+      breakoutId: null,
+    }));
+  });
+  for (const [text, recipient] of [
+    ["First private", "host"],
+    ["Second public", "everyone"],
+    ["Third private", "host"],
+    ["Fourth public", "everyone"],
+  ])
+    ok(
+      await guest.client.request("POST", `${path}/messages`, {
+        text,
+        recipient,
+      }),
+    );
+  const state = (await guest.client.request("GET", `${path}/state`)).json();
+  assert.deepEqual(
+    state.messages.slice(-4).map((message: { text: string }) => message.text),
+    ["First private", "Second public", "Third private", "Fourth public"],
+  );
+  assert.ok(
+    state.messages
+      .slice(-4)
+      .every((message: { createdAt: number }) => message.createdAt === now),
+  );
+  const saved = (await f.store.get(m.code))!;
+  assert.equal(saved.messages.length + saved.privateMessages!.length, 500);
+  assert.ok(
+    !saved.privateMessages!.some((message) => oldest.includes(message.id)),
+  );
+  assert.ok(
+    !saved.messages.some((message) => message.text === "Legacy public"),
+  );
+  assert.ok(saved.messages.some((message) => message.text === "Second public"));
+  assert.ok(saved.messages.some((message) => message.text === "Fourth public"));
 });

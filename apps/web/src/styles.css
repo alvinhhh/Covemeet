@@ -1208,6 +1208,80 @@ input[type="checkbox"] {
   flex-direction: column;
   overflow: hidden;
 }
+.chat-policy {
+  padding: 16px 20px;
+  border-bottom: 1px solid #e6e6e6;
+  font-size: 12px;
+}
+.chat-policy > span {
+  display: block;
+  margin-bottom: 8px;
+}
+.chat-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.chat-options button {
+  padding: 8px 10px;
+  border: 1px solid #d6d6d6;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #333333;
+  font: inherit;
+  cursor: pointer;
+}
+.chat-options button[aria-pressed="true"] {
+  background: #222222;
+  border-color: #222222;
+  color: #ffffff;
+}
+.chat-options button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.chat-recipients {
+  align-self: stretch;
+  font-size: 12px;
+}
+.chat-recipient,
+.chat-private,
+.chat-restriction {
+  color: #666666;
+  font-size: 12px;
+}
+.chat-restriction {
+  align-self: stretch;
+  margin: 0;
+}
+.chat-private {
+  display: block;
+  margin-top: 5px;
+}
+.chat-message-actions {
+  display: flex;
+  gap: 14px;
+  margin-top: 6px;
+}
+.chat-message-actions button {
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: #555555;
+  font: inherit;
+  font-size: 11px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.chat-message-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.chat-message p.chat-removed {
+  color: #666666;
+  font-style: italic;
+}
 .chat-messages {
   flex: 1;
   min-height: 0;

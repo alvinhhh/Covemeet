@@ -1059,8 +1059,13 @@ function Conference({
   const chatButton = useRef<HTMLButtonElement>(null);
   const chatRead = useRef(new ChatUnread());
   const [chatDrafts, setChatDrafts] = useState<Record<string, string>>({});
+  const [chatRecipients, setChatRecipients] = useState<Record<string, string>>(
+    {},
+  );
   const [unreadChat, setUnreadChat] = useState(0);
   const chatRoom = `${state.meeting.code}:${state.me.id}:${state.me.breakoutId ?? "main"}`;
+  const chatRecipient = chatRecipients[chatRoom] ?? "everyone";
+  const chatDraftKey = `${chatRoom}:${chatRecipient}`;
   useEffect(() => {
     setUnreadChat(
       chatRead.current.update(
@@ -1350,17 +1355,30 @@ function Conference({
               <Chat
                 key={chatRoom}
                 state={state}
-                text={chatDrafts[chatRoom] ?? ""}
+                text={chatDrafts[chatDraftKey] ?? ""}
+                recipient={chatRecipient}
+                setRecipient={(recipient) =>
+                  setChatRecipients((recipients) => ({
+                    ...recipients,
+                    [chatRoom]: recipient,
+                  }))
+                }
                 setText={(update) =>
                   setChatDrafts((drafts) => ({
                     ...drafts,
-                    [chatRoom]:
+                    [chatDraftKey]:
                       typeof update === "function"
-                        ? update(drafts[chatRoom] ?? "")
+                        ? update(drafts[chatDraftKey] ?? "")
                         : update,
                   }))
                 }
-                send={(text) => mutate("/messages", { text })}
+                send={(text, recipient) =>
+                  mutate("/messages", { text, recipient })
+                }
+                setMode={(chatMode) => mutate("", { chatMode }, "PATCH")}
+                remove={(id) =>
+                  mutate(`/messages/${encodeURIComponent(id)}`, {}, "DELETE")
+                }
                 busy={busy}
               />
             ) : panel === "breakouts" ? (
@@ -2582,6 +2600,7 @@ function Breakouts({
         className="breakout-broadcast"
         onSubmit={async (e) => {
           e.preventDefault();
+          if (state.meeting.chatMode === "disabled") return;
           if (await mutate("/broadcast", { text: broadcast.trim() })) {
             setBroadcast("");
             setSent(true);
@@ -2591,6 +2610,7 @@ function Breakouts({
         <Field label="Message all rooms">
           <textarea
             value={broadcast}
+            disabled={state.meeting.chatMode === "disabled"}
             onChange={(e) => {
               setBroadcast(e.target.value);
               setSent(false);
@@ -2604,10 +2624,15 @@ function Breakouts({
         <Button
           className="small"
           type="submit"
-          disabled={busy || !broadcast.trim()}
+          disabled={
+            busy || state.meeting.chatMode === "disabled" || !broadcast.trim()
+          }
         >
           Send to all rooms
         </Button>
+        {state.meeting.chatMode === "disabled" && (
+          <Notice kind="info">Chat is off</Notice>
+        )}
         {sent && <Notice kind="success">Message sent to all rooms.</Notice>}
       </form>
       <p className="panel-note">

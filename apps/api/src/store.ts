@@ -135,6 +135,18 @@ export type Recording = {
   expiresAt?: number;
   error?: string;
 };
+export type ChatMessage = {
+  id: string;
+  sequence?: number;
+  senderId?: string;
+  name: string;
+  text: string;
+  createdAt: number;
+  breakoutId: string | null;
+  broadcast?: boolean;
+  recipientId?: string;
+  deleted?: boolean;
+};
 export type Meeting = {
   meetingMeter?: MeetingMeter;
   hostReentryRevision?: number;
@@ -173,6 +185,7 @@ export type Meeting = {
   locked: boolean;
   ended: boolean;
   recordingAllowed: boolean;
+  chatMode?: "everyone" | "host-only" | "disabled";
   createdAt: number;
   revision: number;
   passwordHash: string;
@@ -181,15 +194,8 @@ export type Meeting = {
   participants: Participant[];
   bans: { ip: string[]; device: string[]; caller?: string[] };
   breakouts: { id: string; name: string; room: string }[];
-  messages: {
-    id: string;
-    senderId?: string;
-    name: string;
-    text: string;
-    createdAt: number;
-    breakoutId: string | null;
-    broadcast?: boolean;
-  }[];
+  messages: ChatMessage[];
+  privateMessages?: ChatMessage[];
   recordings: Recording[];
   hostEmail?: string;
   hostEmailVerified?: boolean;

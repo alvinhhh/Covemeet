@@ -14,7 +14,7 @@ import { createMailBudget, createMailTransport } from "@meeting-platform/mail";
 import { z } from "zod";
 import { whiteboardInput } from "./whiteboard.js";
 import type { Config } from "./config.js";
-import type { Meeting, Participant, Store } from "./store.js";
+import type { ChatMessage, Meeting, Participant, Store } from "./store.js";
 import type { Media } from "./media.js";
 import { LiveMedia } from "./media.js";
 import {
@@ -63,6 +63,9 @@ const hostedUuid = z
   .uuid()
   .transform((value) => value.toLowerCase());
 const hostedVersion = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+// New entries use serialized meeting revisions; unsequenced legacy history stays first.
+const chatOrder = (a: ChatMessage, b: ChatMessage) =>
+  (a.sequence ?? 0) - (b.sequence ?? 0) || a.createdAt - b.createdAt;
 const webinarPresenterLimit = 10;
 const occupiesSeat = (p: Participant) =>
   (p.status === "admitted" || p.status === "waiting") &&
@@ -596,6 +599,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       locked: false,
       ended: false,
       recordingAllowed: false,
+      chatMode: "everyone",
       createdAt: Date.now(),
       revision: 1,
       passwordHash: await passwordHash(body.password),
@@ -1214,6 +1218,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           deadlineAt: m.lifecycle?.deadlineAt,
           usage,
           recordingAllowed: m.recordingAllowed,
+          chatMode: m.chatMode ?? "everyone",
           recordingAvailable: recordingIncluded(m),
           createdAt: m.createdAt,
           hostEmailVerified:
@@ -1235,8 +1240,18 @@ export async function createApp(config: Config, store: Store, media: Media) {
           )
           .map(pub),
         messages: canSee
-          ? m.messages
-              .filter((x) => x.broadcast || x.breakoutId === p.breakoutId)
+          ? [
+              ...m.messages.filter(
+                (x) => x.broadcast || x.breakoutId === p.breakoutId,
+              ),
+              ...(m.privateMessages ?? []).filter(
+                (x) =>
+                  x.senderId === p.id ||
+                  x.recipientId === p.id ||
+                  p.role === "host",
+              ),
+            ]
+              .sort(chatOrder)
               .slice(-100)
           : [],
         recordings:
@@ -1389,6 +1404,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
       .object({
         locked: z.boolean().optional(),
         recordingAllowed: z.boolean().optional(),
+        chatMode: z.enum(["everyone", "host-only", "disabled"]).optional(),
       })
       .strict()
       .parse(req.body);
@@ -1461,28 +1477,88 @@ export async function createApp(config: Config, store: Store, media: Media) {
     app.post(
       `/api/meetings/:code/${broadcast ? "broadcast" : "messages"}`,
       async (req) => {
-        const { text } = z
-          .object({ text: z.string().trim().min(1).max(2000) })
+        const { text, recipient } = z
+          .object({
+            text: z.string().trim().min(1).max(2000),
+            recipient: z
+              .union([z.enum(["everyone", "host"]), z.string().uuid()])
+              .optional(),
+          })
+          .strict()
           .parse(req.body);
+        if (broadcast && recipient && recipient !== "everyone")
+          throw new HttpError(400, "Announcements cannot be private");
         await store.change(codeOf(req), (m) => {
           active(m);
           const p = actor(req, m, broadcast);
           if (p.status !== "admitted")
             throw new HttpError(403, "Admission required");
-          m.messages.push({
+          if (m.chatMode === "disabled")
+            throw new HttpError(403, "Chat is off");
+          if (m.chatMode === "host-only" && p.role !== "host")
+            throw new HttpError(403, "Only the host can send messages");
+          let recipientId: string | undefined;
+          if (recipient && recipient !== "everyone") {
+            if (p.role !== "host" && recipient !== "host")
+              throw new HttpError(
+                403,
+                "Private messages can only be sent to the host",
+              );
+            const target =
+              recipient === "host"
+                ? m.participants.find((entry) => entry.role === "host")
+                : m.participants.find(
+                    (entry) =>
+                      entry.id === recipient &&
+                      entry.status === "admitted" &&
+                      entry.transport !== "phone",
+                  );
+            if (!target || target.id === p.id)
+              throw new HttpError(400, "Recipient unavailable");
+            recipientId = target.id;
+          }
+          const messages = recipientId
+            ? (m.privateMessages ??= [])
+            : m.messages;
+          messages.push({
             id: randomUUID(),
+            sequence: m.revision + 1,
             senderId: p.id,
             name: p.name,
             text,
             createdAt: Date.now(),
             breakoutId: p.breakoutId,
             broadcast,
+            ...(recipientId ? { recipientId } : {}),
           });
-          m.messages = m.messages.slice(-500);
+          const retained = [...m.messages, ...(m.privateMessages ?? [])]
+            .sort(chatOrder)
+            .slice(-500);
+          m.messages = retained.filter((entry) => !entry.recipientId);
+          m.privateMessages = retained.filter((entry) => entry.recipientId);
         });
         return { ok: true };
       },
     );
+  app.delete("/api/meetings/:code/messages/:messageId", async (req) => {
+    const { messageId } = z
+      .object({ messageId: z.string().uuid() })
+      .parse(req.params);
+    const hostId = await store.change(codeOf(req), (m) => {
+      active(m);
+      const host = actor(req, m, true);
+      const message = [...m.messages, ...(m.privateMessages ?? [])].find(
+        (entry) => entry.id === messageId,
+      );
+      if (!message) throw new HttpError(404, "Message unavailable");
+      // Keep its slot so removing content cannot reintroduce older unread history.
+      message.text = "";
+      message.deleted = true;
+      return host.id;
+    });
+    await store.audit(codeOf(req), hostId, "chat.message.remove", messageId);
+    return { ok: true };
+  });
   app.get(
     "/api/meetings/:code/whiteboard",
     {

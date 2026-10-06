@@ -6,7 +6,7 @@ import {
   type FormEvent,
   type SetStateAction,
 } from "react";
-import type { MeetingState } from "./api";
+import type { ChatMode, MeetingState } from "./api";
 import { Icon } from "./icons";
 import { sendsChatOnEnter } from "./chat-state";
 
@@ -16,12 +16,20 @@ export function Chat({
   setText,
   send,
   busy,
+  recipient,
+  setRecipient,
+  setMode,
+  remove,
 }: {
   state: MeetingState;
   text: string;
   setText: Dispatch<SetStateAction<string>>;
-  send: (text: string) => Promise<boolean>;
+  send: (text: string, recipient: string) => Promise<boolean>;
   busy: boolean;
+  recipient: string;
+  setRecipient: (recipient: string) => void;
+  setMode: (mode: ChatMode) => Promise<boolean>;
+  remove: (id: string) => Promise<boolean>;
 }) {
   const [sending, setSending] = useState(false);
   const [below, setBelow] = useState(false);
@@ -29,6 +37,35 @@ export function Chat({
   const messages = useRef<HTMLDivElement>(null);
   const following = useRef(true);
   const last = state.messages.at(-1);
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  const host = state.me.role === "host";
+  const mode = state.meeting.chatMode ?? "everyone";
+  const target = state.participants.find((entry) => entry.id === recipient);
+  const unavailable =
+    recipient !== "everyone" &&
+    recipient !== "host" &&
+    (!host ||
+      !target ||
+      target.status !== "admitted" ||
+      target.transport === "phone");
+  const restriction =
+    mode === "disabled"
+      ? "Chat is off"
+      : mode === "host-only" && !host
+        ? "Only the host can send messages"
+        : unavailable
+          ? "Recipient unavailable"
+          : "";
+  const messageLabel =
+    recipient === "everyone"
+      ? "Message this room"
+      : recipient === "host"
+        ? "Message host"
+        : `Message ${target?.name ?? "participant"}`;
+  function reply(id: string) {
+    setRecipient(id);
+    textarea.current?.focus();
+  }
   function latest() {
     const element = messages.current;
     if (element) element.scrollTop = element.scrollHeight;
@@ -41,12 +78,12 @@ export function Chat({
   }, [last?.id]);
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (busy || pending.current || !text.trim()) return;
+    if (busy || pending.current || restriction || !text.trim()) return;
     const draft = text;
     pending.current = true;
     setSending(true);
     try {
-      if (await send(draft.trim())) {
+      if (await send(draft.trim(), recipient)) {
         // Preserve anything typed while the request was pending.
         setText((current) => (current === draft ? "" : current));
         latest();
@@ -58,6 +95,34 @@ export function Chat({
   }
   return (
     <div className="chat-panel">
+      {host && (
+        <div className="chat-policy">
+          <span id="chat-policy-label">Who can send?</span>
+          <div
+            className="chat-options"
+            role="group"
+            aria-labelledby="chat-policy-label"
+          >
+            {(
+              [
+                ["everyone", "Everyone"],
+                ["host-only", "Host only"],
+                ["disabled", "No one"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={mode === value}
+                disabled={busy}
+                onClick={() => void setMode(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       <div
         className="chat-messages"
         ref={messages}
@@ -77,7 +142,6 @@ export function Chat({
           <div className="empty-panel">
             <Icon name="chat" size={30} />
             <h3>No messages</h3>
-            <p>Messages are visible to participants in this room.</p>
           </div>
         )}
         {state.messages.map((message) => (
@@ -94,7 +158,53 @@ export function Chat({
                 })}
               </time>
             </header>
-            <p>{message.text}</p>
+            {message.recipientId && (
+              <small className="chat-private">
+                {message.recipientId === state.me.id
+                  ? "Private to you"
+                  : state.participants.find(
+                        (entry) => entry.id === message.recipientId,
+                      )?.role === "host"
+                    ? "Private to host"
+                    : state.participants.some(
+                          (entry) => entry.id === message.recipientId,
+                        )
+                      ? `Private to ${state.participants.find((entry) => entry.id === message.recipientId)!.name}`
+                      : "Private message"}
+              </small>
+            )}
+            <p className={message.deleted ? "chat-removed" : undefined}>
+              {message.deleted ? "Message removed" : message.text}
+            </p>
+            {host && (
+              <div className="chat-message-actions">
+                {!message.deleted &&
+                  message.senderId !== state.me.id &&
+                  state.participants.some(
+                    (entry) =>
+                      entry.id === message.senderId &&
+                      entry.status === "admitted" &&
+                      entry.transport !== "phone",
+                  ) && (
+                    <button
+                      type="button"
+                      disabled={busy || mode === "disabled"}
+                      onClick={() => reply(message.senderId!)}
+                    >
+                      Reply privately
+                    </button>
+                  )}
+                {!message.deleted && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void remove(message.id)}
+                  >
+                    Remove
+                  </button>
+                )}
+              </div>
+            )}
           </article>
         ))}
       </div>
@@ -104,12 +214,48 @@ export function Chat({
         </button>
       )}
       <form className="chat-compose" onSubmit={(event) => void submit(event)}>
+        <div
+          className="chat-options chat-recipients"
+          role="group"
+          aria-label="Message recipient"
+        >
+          <button
+            type="button"
+            aria-pressed={recipient === "everyone"}
+            disabled={busy}
+            onClick={() => setRecipient("everyone")}
+          >
+            Everyone
+          </button>
+          {!host && (
+            <button
+              type="button"
+              aria-pressed={recipient === "host"}
+              disabled={busy}
+              onClick={() => setRecipient("host")}
+            >
+              Host
+            </button>
+          )}
+          {host && recipient !== "everyone" && (
+            <span className="chat-recipient">
+              {target?.name ?? "Participant unavailable"} · Private
+            </span>
+          )}
+        </div>
+        {restriction && (
+          <p className="chat-restriction" role="status">
+            {restriction}
+          </p>
+        )}
         <label className="sr-only" htmlFor="chat-text">
-          Message this room
+          {messageLabel}
         </label>
         <textarea
           id="chat-text"
-          placeholder="Message this room"
+          placeholder={messageLabel}
+          ref={textarea}
+          disabled={Boolean(restriction)}
           value={text}
           onChange={(event) => setText(event.target.value)}
           onKeyDown={(event) => {
@@ -128,7 +274,7 @@ export function Chat({
           <button
             className="button primary small"
             type="submit"
-            disabled={busy || sending || !text.trim()}
+            disabled={busy || sending || Boolean(restriction) || !text.trim()}
           >
             {sending ? "Sending…" : "Send"}
             <Icon name="arrow" size={16} />
