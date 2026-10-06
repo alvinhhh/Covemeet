@@ -66,6 +66,20 @@ const webinarPresenterLimit = 10;
 const occupiesSeat = (p: Participant) =>
   (p.status === "admitted" || p.status === "waiting") &&
   p.expiresAt > Date.now();
+const expiredUnauditedGuest = (p: Participant, now: number) =>
+  // ponytail: retain legacy/audited history; separate history storage if it grows.
+  p.auditReferenced === false &&
+  p.role !== "host" &&
+  p.transport !== "phone" &&
+  p.phone === undefined &&
+  p.status === "left" &&
+  p.expiresAt <= now &&
+  !p.enforcementPending &&
+  p.previousMediaIdentity === undefined &&
+  p.previousRoom === undefined &&
+  p.gatewayConnectionId === undefined &&
+  p.gatewayPresenceUntil === undefined &&
+  p.meter === undefined;
 const imageUrl = z
   .string()
   .max(400)
@@ -908,6 +922,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           name: body.name,
           role: m.mode === "webinar" ? "viewer" : "participant",
           status: "waiting",
+          auditReferenced: false,
           audioAllowed: m.mode === "meeting",
           videoAllowed: m.mode === "meeting",
           mediaVersion: 1,
@@ -1174,6 +1189,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
         }
         if (body.action === "rename") p.name = body.name!;
       }
+      // Preserve identity even if the audit write below is delayed or fails.
+      p.auditReferenced = true;
       changed = structuredClone(p);
       return structuredClone(m);
     });
@@ -1570,6 +1587,14 @@ export async function createApp(config: Config, store: Store, media: Media) {
             await store.reconcileParticipantMeters(m.code).catch(() => {});
             m = (await store.get(m.code))!;
           }
+          const now = Date.now();
+          if (m.participants.some((p) => expiredUnauditedGuest(p, now)))
+            m = await store.change(m.code, (state) => {
+              state.participants = state.participants.filter(
+                (p) => !expiredUnauditedGuest(p, now),
+              );
+              return structuredClone(state);
+            });
           if (!m.ended && !meetingAllowed(m)) {
             m = await store.change(m.code, (state) => {
               if (!meetingAllowed(state)) endMeeting(state);

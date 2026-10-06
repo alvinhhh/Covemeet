@@ -160,6 +160,127 @@ async function fixture(
   return { app, store, media, host, create, meeting, join, action };
 }
 
+test("terminal browser history prunes only expired unaudited guests after cleanup", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const client = new Client(f.app, "198.51.100.20");
+  const departed: string[] = [];
+  for (let i = 0; i < 4; i++) {
+    const guest = await f.join(m.code, client.ip, client);
+    departed.push(guest.id);
+    ok(await client.request("POST", `/api/meetings/${m.code}/leave`, {}));
+  }
+  const state = await client.request("GET", `/api/meetings/${m.code}/state`);
+  ok(state);
+  assert.equal(state.json().me.status, "left");
+  const held: Partial<Participant>[] = [
+    { auditReferenced: undefined },
+    { auditReferenced: true },
+    { role: "host" },
+    { transport: "phone" },
+    {
+      phone: {
+        callId: "retained-call",
+        trunkId: "fixture",
+        muted: true,
+        handRaised: false,
+        leaseExpiresAt: 0,
+        callExpiresAt: 0,
+        closed: true,
+      },
+    },
+    { status: "waiting" },
+    { status: "admitted" },
+    { status: "kicked" },
+    { status: "banned" },
+    { enforcementPending: true },
+    { previousMediaIdentity: "retired-identity" },
+    { previousRoom: "retired-room" },
+    { gatewayConnectionId: "held-connection" },
+    { gatewayPresenceUntil: 0 },
+    {
+      meter: {
+        connectionId: "held-meter",
+        mediaVersion: 2,
+        phase: "closing",
+        accountedAt: 0,
+        fundedUntil: 0,
+        presenceUntil: 0,
+      },
+    },
+  ];
+  await f.store.change(m.code, (current) => {
+    const sample = current.participants.find((p) => p.id === departed[0])!;
+    for (const p of current.participants)
+      if (departed.slice(0, -1).includes(p.id)) p.expiresAt = Date.now() - 1;
+    for (const [index, patch] of held.entries())
+      current.participants.push({
+        ...structuredClone(sample),
+        id: `retained-${index}`,
+        tokenHash: `retained-${index}`,
+        ...patch,
+      });
+  });
+  // Unresolved test rows must keep their cleanup proof, not be silently settled.
+  t.mock.method(f.media, "remove", async () => {
+    throw new Error("Media unavailable");
+  });
+  t.mock.timers.tick(5000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    (await f.store.get(m.code))!.participants.map((p) => p.id).sort(),
+    [m.hostId, departed.at(-1)!, ...held.map((_, i) => `retained-${i}`)].sort(),
+    "Expired cleaned unaudited browser history was retained or protected rows were lost",
+  );
+  const terminal = await client.request("GET", `/api/meetings/${m.code}/state`);
+  ok(terminal);
+  assert.equal(terminal.json().me.status, "left");
+});
+
+test("terminal browser history retains identity while its moderation audit is pending", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const pending = new Promise<void>((resolve) => (entered = resolve));
+  const audit = f.store.audit.bind(f.store);
+  t.mock.method(f.store, "audit", async (code, actor, action, target) => {
+    if (target === guest.id) {
+      entered();
+      await gate;
+    }
+    await audit(code, actor, action, target);
+  });
+  const admission = f.action(m.code, guest.id, "admit");
+  try {
+    await pending;
+    assert.equal(
+      f.store.auditEvents.some((event) => event.target === guest.id),
+      false,
+    );
+    ok(await guest.client.request("POST", `/api/meetings/${m.code}/leave`, {}));
+    await f.store.change(m.code, (current) => {
+      current.participants.find((p) => p.id === guest.id)!.expiresAt =
+        Date.now() - 1;
+    });
+    t.mock.timers.tick(5000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const retained = (await f.store.get(m.code))!.participants.find(
+      (p) => p.id === guest.id,
+    );
+    assert.equal(retained?.auditReferenced, true);
+    assert.equal(retained?.name, "Guest");
+  } finally {
+    release();
+    await admission;
+  }
+  assert(f.store.auditEvents.some((event) => event.target === guest.id));
+});
+
 test("hosted creation requires its server credential and rejects custom meeting codes", async (t) => {
   const f = await fixture(t);
   rejected(await f.create({ creationKey: undefined }));

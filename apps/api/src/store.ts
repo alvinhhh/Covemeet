@@ -103,6 +103,7 @@ export type Participant = {
   name: string;
   role: "host" | "participant" | "viewer";
   status: "waiting" | "admitted" | "kicked" | "banned" | "left";
+  auditReferenced?: boolean;
   audioAllowed: boolean;
   videoAllowed: boolean;
   mediaVersion: number;
