@@ -1271,6 +1271,7 @@ function Conference({
           <span> · {state.me.name}</span>
           <SpeakingBadge
             surface="dock"
+            name={state.me.name}
             signal={audioSignals.get(participantMediaIdentity(state.me))}
           />
         </span>
@@ -1651,7 +1652,6 @@ function MediaStage({
                   className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""}`}
                   key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
                 >
-                  <SpeakingBadge surface="tile" signal={signal} />
                   {isTrackReference(track) && !track.publication.isMuted ? (
                     <VideoTrack trackRef={track} manageSubscription={false} />
                   ) : (
@@ -1667,7 +1667,7 @@ function MediaStage({
                         ? " · Screen"
                         : ""}
                     </span>
-                    <SpeakingIndicator name={name} signal={signal} />
+                    <SpeakingBadge surface="tile" name={name} signal={signal} />
                   </div>
                 </div>
               );
@@ -1683,43 +1683,6 @@ function MediaStage({
         </>
       )}
     </>
-  );
-}
-
-function SpeakingIndicator({
-  name,
-  signal,
-}: {
-  name: string;
-  signal?: AudioSignal;
-}) {
-  const status = signal?.speaking
-    ? "Speaking"
-    : signal?.microphoneOn
-      ? "Microphone on"
-      : "Microphone off";
-  return (
-    <span
-      className={`tile-audio ${signal?.speaking ? "speaking" : ""}`}
-      role="img"
-      aria-label={`${name}: ${status}`}
-      title={status}
-    >
-      {signal?.speaking ? (
-        <>
-          <span className="audio-level" aria-hidden="true">
-            {[1, 2, 3, 4].map((bar) => (
-              <i key={bar} className={bar <= signal.bars ? "active" : ""} />
-            ))}
-          </span>
-          <span className="speaking-label" aria-hidden="true">
-            Speaking
-          </span>
-        </>
-      ) : (
-        <Icon name={signal?.microphoneOn ? "mic" : "mic-off"} size={17} />
-      )}
-    </span>
   );
 }
 
@@ -2110,6 +2073,7 @@ function Participants({
               </strong>
               <SpeakingBadge
                 surface="list"
+                name={p.name}
                 signal={signals.get(participantMediaIdentity(p))}
               />
               <small>

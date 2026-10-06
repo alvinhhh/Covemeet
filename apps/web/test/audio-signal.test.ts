@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { EventEmitter } from "node:events";
-import { RoomEvent } from "livekit-client";
+import {
+  RoomEvent,
+  Track,
+  type LocalTrack,
+  type createAudioAnalyser,
+} from "livekit-client";
 import { participantMediaIdentity } from "../src/api.ts";
 import {
   audioSignal,
@@ -177,4 +182,113 @@ test("speaking follows only the current physical identity and its logical host p
   assert.equal(signals.get("guest-current")!.speaking, false);
   assert.equal(signals.get("legacy")!.speaking, true);
   stop();
+});
+
+test("local microphone levels update without server events and release replaced or muted tracks", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  let amplitude = 0.04;
+  let stream = { enabled: true, readyState: "live" };
+  const track = {
+    kind: Track.Kind.Audio,
+    isUpstreamPaused: false,
+    get mediaStreamTrack() {
+      return stream;
+    },
+  };
+  const local = {
+    identity: "self",
+    isMicrophoneEnabled: true,
+    isSpeaking: false,
+    audioLevel: 0,
+    getTrackPublication: () => ({ track: track as unknown as LocalTrack }),
+  };
+  const remote = {
+    identity: "guest",
+    isMicrophoneEnabled: true,
+    isSpeaking: true,
+    audioLevel: 0.3,
+  };
+  const room = Object.assign(new EventEmitter(), {
+    state: "connected",
+    localParticipant: local,
+    remoteParticipants: new Map([[remote.identity, remote]]),
+  });
+  let created = 0,
+    cleaned = 0,
+    renders = 0;
+  const analyse = (() => {
+    created++;
+    return {
+      analyser: {
+        fftSize: 256,
+        context: { state: "running" },
+        getFloatTimeDomainData: (samples: Float32Array) =>
+          samples.fill(amplitude),
+      },
+      cleanup: async () => {
+        cleaned++;
+      },
+    };
+  }) as unknown as typeof createAudioAnalyser;
+  let signals = new Map<string, AudioSignal>();
+  const eligible = new Set(["self", "guest"]);
+  const stop = observeAudioSignals(
+    room,
+    eligible,
+    eligible,
+    (next) => {
+      renders++;
+      signals = next;
+    },
+    analyse,
+  );
+  t.after(stop);
+  const tick = () => {
+    now += 80;
+    t.mock.timers.tick(80);
+  };
+  assert.equal(signals.get("self")!.speaking, true);
+  assert.equal(created, 1);
+  const initialRenders = renders;
+  tick();
+  assert.equal(
+    renders,
+    initialRenders,
+    "steady levels do not rerender the meeting",
+  );
+  local.isSpeaking = true; // Delayed server state must not hold the local indicator on.
+  amplitude = 0;
+  tick();
+  tick();
+  assert.equal(signals.get("self")!.speaking, false);
+  assert.equal(signals.get("self")!.microphoneOn, true);
+  assert.equal(signals.get("guest")!.speaking, true);
+  stream.readyState = "ended";
+  tick();
+  assert.equal(signals.get("self")!.microphoneOn, false);
+  assert.equal(cleaned, 1);
+  stream = { enabled: true, readyState: "live" };
+  amplitude = 0.04;
+  tick();
+  assert.equal(created, 2);
+  assert.equal(cleaned, 1);
+  assert.equal(signals.get("self")!.speaking, true);
+  track.isUpstreamPaused = true;
+  tick();
+  assert.equal(signals.get("self")!.microphoneOn, false);
+  assert.equal(cleaned, 2);
+  track.isUpstreamPaused = false;
+  tick();
+  assert.equal(created, 3);
+  local.isMicrophoneEnabled = false;
+  room.emit(RoomEvent.TrackMuted);
+  assert.equal(signals.get("self")!.speaking, false);
+  assert.equal(cleaned, 3);
+  stop();
+  assert.equal(room.eventNames().length, 0);
+  const stoppedRenders = renders;
+  tick();
+  assert.equal(renders, stoppedRenders);
 });

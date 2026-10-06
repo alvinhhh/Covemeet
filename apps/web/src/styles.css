@@ -2762,41 +2762,41 @@ input[type="checkbox"] {
   isolation: isolate;
 }
 .conference .video-tile.is-speaking {
-  border-color: #ffffff;
-  box-shadow: 0 0 0 3px #ffffff;
+  border-color: #c5c5c5;
 }
 .conference .speaking-badge {
   display: inline-flex;
   align-items: center;
-  width: fit-content;
-  padding: 4px 7px;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
   border-radius: 6px;
-  background: #171717;
-  color: #ffffff;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.2;
+  color: inherit;
+  vertical-align: middle;
 }
 .conference .speaking-badge.tile {
-  position: absolute;
-  z-index: 2;
-  top: 12px;
-  right: 12px;
-  background: #ffffff;
-  color: #171717;
-  pointer-events: none;
+  width: 32px;
+  height: 32px;
+  background: #151515e6;
+  color: #eeeeee;
 }
-.conference .speaking-badge.dock {
-  margin-left: 9px;
-  background: #ffffff;
-  color: #171717;
+.conference .speaking-badge:not(.tile):not(.is-speaking) {
+  visibility: hidden;
 }
 .conference .participant-row.is-speaking {
-  box-shadow: inset 3px 0 #171717;
-  background: #f2f2f2;
+  background: #f5f5f5;
+  border-radius: 8px;
+}
+.conference .participant-name {
+  position: relative;
+  padding-right: 28px;
 }
 .conference .participant-row .speaking-badge.list {
-  margin-top: 4px;
+  position: absolute;
+  right: 0;
+  top: 0;
+  color: #222222;
 }
 .conference .video-tile video {
   position: absolute;
@@ -2840,22 +2840,6 @@ input[type="checkbox"] {
   font-weight: 500;
   line-height: 20px;
 }
-.conference .tile-audio {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-height: 32px;
-  flex-shrink: 0;
-  padding: 6px 8px;
-  border-radius: 7px;
-  background: #151515e6;
-  color: #eeeeee;
-  font-size: 12px;
-}
-.conference .tile-audio.speaking {
-  background: #ffffff;
-  color: #141414;
-}
 .conference .audio-level {
   display: flex;
   height: 17px;
@@ -2866,7 +2850,9 @@ input[type="checkbox"] {
   width: 3px;
   height: 5px;
   border-radius: 2px;
-  background: #d0d0d0;
+  background: currentColor;
+  opacity: 0.25;
+  transition: opacity 80ms linear;
 }
 .conference .audio-level i:nth-child(2) {
   height: 9px;
@@ -2878,7 +2864,7 @@ input[type="checkbox"] {
   height: 17px;
 }
 .conference .audio-level i.active {
-  background: #141414;
+  opacity: 1;
 }
 .conference .screen-tile {
   grid-column: 1 / -1;
@@ -2941,6 +2927,11 @@ input[type="checkbox"] {
 .conference .session-role > span {
   display: inline;
   color: #b3b3b3;
+}
+.conference .session-role > .speaking-badge {
+  display: inline-flex;
+  margin-left: 6px;
+  color: #eeeeee;
 }
 .conference .meeting-dock {
   display: flex;
@@ -3354,12 +3345,9 @@ input[type="checkbox"] {
     font-size: 12px;
     padding: 4px 6px;
   }
-  .conference .tile-audio {
-    padding: 4px 6px;
-    min-height: 28px;
-  }
-  .conference .speaking-label {
-    display: none;
+  .conference .speaking-badge.tile {
+    width: 28px;
+    height: 28px;
   }
   .conference .stage-footer {
     padding: 14px 4px 8px;
