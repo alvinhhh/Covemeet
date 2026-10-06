@@ -2570,6 +2570,129 @@ input[type="checkbox"] {
   gap: 16px;
   padding: 0 0 0 16px;
 }
+.conference .whiteboard {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #4a4a4a;
+  border-radius: 12px;
+  background: #fff;
+  color: #171717;
+}
+.whiteboard-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #dedede;
+}
+.whiteboard-toolbar strong {
+  margin-right: 8px;
+  font-size: 14px;
+}
+.whiteboard-tools,
+.whiteboard-view-controls,
+.whiteboard-host-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.whiteboard-view-controls {
+  margin-left: auto;
+}
+.whiteboard-toolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #242424;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.whiteboard-toolbar button:hover,
+.whiteboard-toolbar button.selected {
+  background: #e9e9e9;
+  border-color: #d4d4d4;
+}
+.whiteboard-toolbar button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.whiteboard-view-controls span {
+  min-width: 40px;
+  text-align: center;
+  font-size: 12px;
+}
+.whiteboard-text-icon {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1;
+}
+.whiteboard-canvas-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 180px;
+  overflow: hidden;
+}
+.whiteboard-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+}
+.whiteboard-canvas path,
+.whiteboard-canvas text {
+  pointer-events: stroke;
+}
+.whiteboard-canvas text {
+  pointer-events: visiblePainted;
+  user-select: none;
+}
+.whiteboard-text-entry {
+  position: absolute;
+  z-index: 2;
+}
+.whiteboard-text-entry input {
+  min-width: 180px;
+  max-width: min(320px, 70vw);
+  padding: 6px 8px;
+  border: 1px solid #171717;
+  border-radius: 4px;
+  background: #fff;
+  color: #171717;
+  font: inherit;
+  font-size: 16px;
+}
+.whiteboard-error {
+  margin: 0;
+  padding: 8px 12px;
+  color: #171717;
+  background: #eee;
+  font-size: 12px;
+}
+@media (max-width: 760px) {
+  .whiteboard-toolbar {
+    gap: 4px;
+  }
+  .whiteboard-toolbar strong {
+    width: 100%;
+  }
+  .whiteboard-tools button span:not(.whiteboard-text-icon) {
+    display: none;
+  }
+  .whiteboard-view-controls {
+    margin-left: 0;
+  }
+}
 .conference .stage-content {
   padding: 0;
   gap: 12px;

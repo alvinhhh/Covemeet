@@ -22,7 +22,8 @@ export type IconName =
   | "mail"
   | "shield"
   | "more"
-  | "camera-off";
+  | "camera-off"
+  | "pen";
 
 const paths: Record<IconName, ReactNode> = {
   video: (
@@ -129,6 +130,7 @@ const paths: Record<IconName, ReactNode> = {
       <path d="m3 3 18 18M10 5h3a2 2 0 0 1 2 2v2l6-3v12l-4-2M15 15v2a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 1-1.7" />
     </>
   ),
+  pen: <path d="m3 21 4-.8L20 7.2a2.1 2.1 0 0 0-3-3L4 17.2 3 21ZM14 7l3 3" />,
 };
 
 export function Icon({

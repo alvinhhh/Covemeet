@@ -45,6 +45,18 @@ import {
 export type { RecordingTimeObservation } from "./participant-meter.js";
 import { HttpError } from "./security.js";
 import {
+  authorizeWhiteboardWrite,
+  WHITEBOARD_BYTE_LIMIT,
+  WHITEBOARD_EVENT_LIMIT,
+  WHITEBOARD_PAGE_SIZE,
+  sameWhiteboardItem,
+  whiteboardEventSize,
+  type WhiteboardAccess,
+  type WhiteboardEvent,
+  type WhiteboardInput,
+  type WhiteboardPage,
+} from "./whiteboard.js";
+import {
   applyEntitlement,
   endMeeting,
   entitlementFor,
@@ -358,6 +370,17 @@ export interface Store {
   byRoom(room: string): Promise<Meeting | null>;
   all(): Promise<Meeting[]>;
   change<T>(code: string, fn: (m: Meeting) => Promise<T> | T): Promise<T>;
+  readWhiteboard(
+    code: string,
+    after: number,
+    authorize: (m: Meeting) => WhiteboardAccess,
+  ): Promise<WhiteboardPage>;
+  writeWhiteboard(
+    code: string,
+    input: WhiteboardInput,
+    authorize: (m: Meeting) => WhiteboardAccess,
+  ): Promise<WhiteboardEvent>;
+  purgeWhiteboard(code: string): Promise<void>;
   byPhoneLocator(locator: string): Promise<Meeting | null>;
   reservePhone<T>(
     code: string,
@@ -619,6 +642,24 @@ export class PgStore implements Store {
       CREATE TABLE IF NOT EXISTS hosted_usage(billing_owner_id uuid PRIMARY KEY, data jsonb NOT NULL);
       CREATE INDEX IF NOT EXISTS meetings_billing_owner ON meetings ((data->'hosted'->>'billingOwnerId'));
       CREATE INDEX IF NOT EXISTS meetings_hosted_account ON meetings ((data->'hosted'->>'accountId'));
+      CREATE TABLE IF NOT EXISTS whiteboards(
+        meeting_code text NOT NULL REFERENCES meetings(code),
+        scope text NOT NULL,
+        seq bigint NOT NULL DEFAULT 0,
+        epoch bigint NOT NULL DEFAULT 0,
+        read_only boolean NOT NULL DEFAULT false,
+        event_count integer NOT NULL DEFAULT 0,
+        bytes_used integer NOT NULL DEFAULT 0,
+        PRIMARY KEY(meeting_code,scope)
+      );
+      CREATE TABLE IF NOT EXISTS whiteboard_events(
+        meeting_code text NOT NULL,
+        scope text NOT NULL,
+        seq bigint NOT NULL,
+        event jsonb NOT NULL,
+        PRIMARY KEY(meeting_code,scope,seq),
+        FOREIGN KEY(meeting_code,scope) REFERENCES whiteboards(meeting_code,scope)
+      );
     `);
   }
   private async usageTransaction<T>(
@@ -1620,6 +1661,175 @@ export class PgStore implements Store {
       throw error;
     }
   }
+  async readWhiteboard(
+    code: string,
+    after: number,
+    authorize: (m: Meeting) => WhiteboardAccess,
+  ): Promise<WhiteboardPage> {
+    const c = await this.pool.connect();
+    try {
+      await c.query("BEGIN");
+      const m = (
+        await c.query("SELECT data FROM meetings WHERE code=$1 FOR SHARE", [
+          code,
+        ])
+      ).rows[0]?.data as Meeting | undefined;
+      if (!m) throw new HttpError(404, "Meeting unavailable");
+      const { scope } = authorize(m);
+      const board = (
+        await c.query(
+          "SELECT seq,epoch,read_only FROM whiteboards WHERE meeting_code=$1 AND scope=$2",
+          [code, scope],
+        )
+      ).rows[0];
+      const rows = (
+        await c.query(
+          "SELECT event FROM whiteboard_events WHERE meeting_code=$1 AND scope=$2 AND seq>$3 ORDER BY seq LIMIT $4",
+          [code, scope, after, WHITEBOARD_PAGE_SIZE + 1],
+        )
+      ).rows;
+      const hasMore = rows.length > WHITEBOARD_PAGE_SIZE;
+      const events = rows
+        .slice(0, WHITEBOARD_PAGE_SIZE)
+        .map((r) => r.event as WhiteboardEvent);
+      await c.query("COMMIT");
+      return {
+        events,
+        cursor: events.at(-1)?.seq ?? Number(board?.seq ?? 0),
+        hasMore,
+        readOnly: !!board?.read_only,
+        epoch: Number(board?.epoch ?? 0),
+      };
+    } catch (error) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      c.release();
+    }
+  }
+  async writeWhiteboard(
+    code: string,
+    input: WhiteboardInput,
+    authorize: (m: Meeting) => WhiteboardAccess,
+  ): Promise<WhiteboardEvent> {
+    const c = await this.pool.connect();
+    try {
+      await c.query("BEGIN");
+      const m = (
+        await c.query("SELECT data FROM meetings WHERE code=$1 FOR UPDATE", [
+          code,
+        ])
+      ).rows[0]?.data as Meeting | undefined;
+      if (!m) throw new HttpError(404, "Meeting unavailable");
+      const access = authorize(m);
+      await c.query(
+        "INSERT INTO whiteboards(meeting_code,scope) VALUES($1,$2) ON CONFLICT DO NOTHING",
+        [code, access.scope],
+      );
+      const board = (
+        await c.query(
+          "SELECT seq,epoch,read_only,event_count,bytes_used FROM whiteboards WHERE meeting_code=$1 AND scope=$2 FOR UPDATE",
+          [code, access.scope],
+        )
+      ).rows[0];
+      if (input.epoch !== Number(board.epoch))
+        throw new HttpError(409, "Whiteboard changed. Try again.");
+      authorizeWhiteboardWrite(!!board.read_only, access, input);
+      if (input.kind === "stroke" || input.kind === "text") {
+        const existing = (
+          await c.query(
+            "SELECT event FROM whiteboard_events WHERE meeting_code=$1 AND scope=$2 AND event->>'id'=$3 LIMIT 1",
+            [code, access.scope, input.id],
+          )
+        ).rows[0]?.event as WhiteboardEvent | undefined;
+        if (existing) {
+          if (!sameWhiteboardItem(existing, input, access.authorId))
+            throw new HttpError(409, "Whiteboard item ID is already used");
+          await c.query("COMMIT");
+          return existing;
+        }
+      }
+      const event = {
+        ...input,
+        seq: Number(board.seq) + 1,
+        epoch:
+          input.kind === "clear"
+            ? Number(board.epoch) + 1
+            : Number(board.epoch),
+        authorId: access.authorId,
+      } as WhiteboardEvent;
+      if (input.kind === "policy") {
+        await c.query(
+          "UPDATE whiteboards SET seq=$3,read_only=$4 WHERE meeting_code=$1 AND scope=$2",
+          [code, access.scope, event.seq, input.readOnly],
+        );
+        await c.query("COMMIT");
+        return event;
+      }
+      const bytes = whiteboardEventSize(event);
+      const count = input.kind === "clear" ? 1 : Number(board.event_count) + 1;
+      const used =
+        input.kind === "clear" ? bytes : Number(board.bytes_used) + bytes;
+      if (
+        input.kind !== "clear" &&
+        (count > WHITEBOARD_EVENT_LIMIT || used > WHITEBOARD_BYTE_LIMIT)
+      )
+        throw new HttpError(
+          409,
+          "Whiteboard is full. Ask the host to clear it.",
+        );
+      if (input.kind === "clear")
+        await c.query(
+          "DELETE FROM whiteboard_events WHERE meeting_code=$1 AND scope=$2",
+          [code, access.scope],
+        );
+      await c.query(
+        "UPDATE whiteboards SET seq=$3,epoch=$4,read_only=$5,event_count=$6,bytes_used=$7 WHERE meeting_code=$1 AND scope=$2",
+        [
+          code,
+          access.scope,
+          event.seq,
+          event.epoch,
+          board.read_only,
+          count,
+          used,
+        ],
+      );
+      await c.query(
+        "INSERT INTO whiteboard_events(meeting_code,scope,seq,event) VALUES($1,$2,$3,$4)",
+        [code, access.scope, event.seq, JSON.stringify(event)],
+      );
+      await c.query("COMMIT");
+      return event;
+    } catch (error) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      c.release();
+    }
+  }
+  async purgeWhiteboard(code: string): Promise<void> {
+    const c = await this.pool.connect();
+    try {
+      await c.query("BEGIN");
+      const m = (
+        await c.query("SELECT data FROM meetings WHERE code=$1 FOR UPDATE", [
+          code,
+        ])
+      ).rows[0]?.data as Meeting | undefined;
+      if (!m?.ended) throw new HttpError(409, "Meeting has not ended");
+      await c.query("DELETE FROM whiteboard_events WHERE meeting_code=$1", [
+        code,
+      ]);
+      await c.query("DELETE FROM whiteboards WHERE meeting_code=$1", [code]);
+      await c.query("COMMIT");
+    } catch (error) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      c.release();
+    }
+  }
   private async recordingUsage<T>(
     c: pg.PoolClient,
     code: string,
@@ -1738,6 +1948,16 @@ export class MemoryStore implements Store {
   hostedAuthorities = new Map<string, HostedAuthority>();
   hostedEntitlements = new Map<string, HostedEntitlement>();
   usageLedgers = new Map<string, UsageLedger>();
+  whiteboards = new Map<
+    string,
+    {
+      seq: number;
+      epoch: number;
+      readOnly: boolean;
+      bytesUsed: number;
+      events: WhiteboardEvent[];
+    }
+  >();
   private async usageTransaction<T>(
     owner: string,
     fn: (
@@ -2460,6 +2680,101 @@ export class MemoryStore implements Store {
       m.revision++;
       this.data.set(code, m);
       return r;
+    });
+  }
+  async readWhiteboard(
+    code: string,
+    after: number,
+    authorize: (m: Meeting) => WhiteboardAccess,
+  ): Promise<WhiteboardPage> {
+    return this.serialize(async () => {
+      const m = this.data.get(code);
+      if (!m) throw new HttpError(404, "Meeting unavailable");
+      const access = authorize(m);
+      const board = this.whiteboards.get(`${code}\0${access.scope}`);
+      const matching = (board?.events ?? []).filter(
+        (event) => event.seq > after,
+      );
+      const events = matching.slice(0, WHITEBOARD_PAGE_SIZE);
+      return structuredClone({
+        events,
+        cursor: events.at(-1)?.seq ?? board?.seq ?? 0,
+        hasMore: matching.length > WHITEBOARD_PAGE_SIZE,
+        readOnly: board?.readOnly ?? false,
+        epoch: board?.epoch ?? 0,
+      });
+    });
+  }
+  async writeWhiteboard(
+    code: string,
+    input: WhiteboardInput,
+    authorize: (m: Meeting) => WhiteboardAccess,
+  ): Promise<WhiteboardEvent> {
+    return this.serialize(async () => {
+      const m = this.data.get(code);
+      if (!m) throw new HttpError(404, "Meeting unavailable");
+      const access = authorize(m);
+      const key = `${code}\0${access.scope}`;
+      const board = this.whiteboards.get(key) ?? {
+        seq: 0,
+        epoch: 0,
+        readOnly: false,
+        bytesUsed: 0,
+        events: [] as WhiteboardEvent[],
+      };
+      if (input.epoch !== board.epoch)
+        throw new HttpError(409, "Whiteboard changed. Try again.");
+      authorizeWhiteboardWrite(board.readOnly, access, input);
+      if (input.kind === "stroke" || input.kind === "text") {
+        const existing = board.events.find(
+          (event) =>
+            (event.kind === "stroke" || event.kind === "text") &&
+            event.id === input.id,
+        );
+        if (existing) {
+          if (!sameWhiteboardItem(existing, input, access.authorId))
+            throw new HttpError(409, "Whiteboard item ID is already used");
+          return structuredClone(existing);
+        }
+      }
+      const event = {
+        ...input,
+        seq: board.seq + 1,
+        epoch: input.kind === "clear" ? board.epoch + 1 : board.epoch,
+        authorId: access.authorId,
+      } as WhiteboardEvent;
+      if (input.kind === "policy") {
+        board.seq = event.seq;
+        board.readOnly = input.readOnly;
+        this.whiteboards.set(key, board);
+        return structuredClone(event);
+      }
+      const bytes = whiteboardEventSize(event);
+      const count = input.kind === "clear" ? 1 : board.events.length + 1;
+      const used = input.kind === "clear" ? bytes : board.bytesUsed + bytes;
+      if (
+        input.kind !== "clear" &&
+        (count > WHITEBOARD_EVENT_LIMIT || used > WHITEBOARD_BYTE_LIMIT)
+      )
+        throw new HttpError(
+          409,
+          "Whiteboard is full. Ask the host to clear it.",
+        );
+      board.seq = event.seq;
+      board.epoch = event.epoch;
+      board.bytesUsed = used;
+      board.events =
+        input.kind === "clear" ? [event] : [...board.events, event];
+      this.whiteboards.set(key, board);
+      return structuredClone(event);
+    });
+  }
+  async purgeWhiteboard(code: string): Promise<void> {
+    return this.serialize(async () => {
+      if (!this.data.get(code)?.ended)
+        throw new HttpError(409, "Meeting has not ended");
+      for (const key of this.whiteboards.keys())
+        if (key.startsWith(`${code}\0`)) this.whiteboards.delete(key);
     });
   }
   private async serialize<T>(fn: () => Promise<T>): Promise<T> {

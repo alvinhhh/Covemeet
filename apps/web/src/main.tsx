@@ -46,6 +46,7 @@ import { observeAudioSignals, type AudioSignal } from "./audio-signal";
 import { DeviceCheck } from "./device-check";
 import { Chat } from "./chat";
 import { ChatUnread } from "./chat-state";
+import { Whiteboard } from "./whiteboard";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
 let initialHostToken = location.pathname.startsWith("/host/")
@@ -923,6 +924,7 @@ function Conference({
   const [panel, setPanel] = useState<
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
   >(null);
+  const [boardOpen, setBoardOpen] = useState(false);
   const chatButton = useRef<HTMLButtonElement>(null);
   const chatRead = useRef(new ChatUnread());
   const [unreadChat, setUnreadChat] = useState(0);
@@ -1049,6 +1051,20 @@ function Conference({
             me={state.me}
             participants={state.participants}
             mode={state.meeting.mode}
+            boardOpen={boardOpen}
+            board={
+              <Whiteboard
+                key={`${code}:${state.me.breakoutId ?? "main"}`}
+                code={code}
+                host={host}
+              />
+            }
+          />
+        ) : boardOpen ? (
+          <Whiteboard
+            key={`${code}:${state.me.breakoutId ?? "main"}`}
+            code={code}
+            host={host}
           />
         ) : (
           <div className="offline-stage">
@@ -1280,6 +1296,16 @@ function Conference({
           </div>
           <div className="panel-tabs">
             <button
+              className={boardOpen ? "selected" : ""}
+              aria-label={boardOpen ? "Close whiteboard" : "Open whiteboard"}
+              title={boardOpen ? "Close whiteboard" : "Open whiteboard"}
+              aria-pressed={boardOpen}
+              onClick={() => setBoardOpen((open) => !open)}
+            >
+              <Icon name="pen" />
+              <span>Whiteboard</span>
+            </button>
+            <button
               className={panel === "participants" ? "selected" : ""}
               aria-label="Participants"
               title="Participants"
@@ -1409,10 +1435,14 @@ function MediaStage({
   me,
   participants,
   mode,
+  boardOpen,
+  board,
 }: {
   me: Participant;
   participants: Participant[];
   mode: "meeting" | "webinar";
+  boardOpen: boolean;
+  board: ReactNode;
 }) {
   const room = useRoomContext();
   const [page, setPage] = useState(0);
@@ -1439,7 +1469,7 @@ function MediaStage({
     page,
   );
   const visible = selection.visible.map(({ track }) => track);
-  const selectedVideoIds = visible
+  const selectedVideoIds = (boardOpen ? [] : visible)
     .filter(isTrackReference)
     .map((track) => track.publication.trackSid)
     .sort()
@@ -1553,63 +1583,71 @@ function MediaStage({
           </nav>
         )}
       </div>
-      <div
-        className={`video-grid ${visible.some((track) => track.source === Track.Source.ScreenShare) ? "has-screen" : ""}`}
-        data-tile-count={visible.length}
-        style={
-          {
-            "--tile-columns":
-              visible.length <= 1
-                ? 1
-                : visible.length <= 4
-                  ? 2
-                  : visible.length <= 9
-                    ? 3
-                    : 4,
-          } as CSSProperties
-        }
-      >
-        {visible.map((track) => {
-          const signal = signals.get(track.participant.identity);
-          const name =
-            participants.find(
-              (participant) =>
-                participantMediaIdentity(participant) ===
-                track.participant.identity,
-            )?.name ||
-            track.participant.name ||
-            "Participant";
-          return (
-            <div
-              className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""}`}
-              data-speaking={signal?.speaking ? "true" : "false"}
-              key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
-            >
-              {isTrackReference(track) && !track.publication.isMuted ? (
-                <VideoTrack trackRef={track} manageSubscription={false} />
-              ) : (
-                <div className="tile-placeholder">
-                  <span className="stage-avatar">{initials(name)}</span>
+      {boardOpen ? (
+        board
+      ) : (
+        <>
+          <div
+            className={`video-grid ${visible.some((track) => track.source === Track.Source.ScreenShare) ? "has-screen" : ""}`}
+            data-tile-count={visible.length}
+            style={
+              {
+                "--tile-columns":
+                  visible.length <= 1
+                    ? 1
+                    : visible.length <= 4
+                      ? 2
+                      : visible.length <= 9
+                        ? 3
+                        : 4,
+              } as CSSProperties
+            }
+          >
+            {visible.map((track) => {
+              const signal = signals.get(track.participant.identity);
+              const name =
+                participants.find(
+                  (participant) =>
+                    participantMediaIdentity(participant) ===
+                    track.participant.identity,
+                )?.name ||
+                track.participant.name ||
+                "Participant";
+              return (
+                <div
+                  className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""}`}
+                  data-speaking={signal?.speaking ? "true" : "false"}
+                  key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
+                >
+                  {isTrackReference(track) && !track.publication.isMuted ? (
+                    <VideoTrack trackRef={track} manageSubscription={false} />
+                  ) : (
+                    <div className="tile-placeholder">
+                      <span className="stage-avatar">{initials(name)}</span>
+                    </div>
+                  )}
+                  <div className="tile-caption">
+                    <span className="tile-name" title={name}>
+                      {name}
+                      {track.participant.isLocal ? " (you)" : ""}
+                      {track.source === Track.Source.ScreenShare
+                        ? " · Screen"
+                        : ""}
+                    </span>
+                    <SpeakingIndicator name={name} signal={signal} />
+                  </div>
                 </div>
-              )}
-              <div className="tile-caption">
-                <span className="tile-name" title={name}>
-                  {name}
-                  {track.participant.isLocal ? " (you)" : ""}
-                  {track.source === Track.Source.ScreenShare ? " · Screen" : ""}
-                </span>
-                <SpeakingIndicator name={name} signal={signal} />
-              </div>
+              );
+            })}
+          </div>
+          {visible.length === 0 && (
+            <div className="empty-stage">
+              {mode === "webinar"
+                ? "Waiting for a presenter"
+                : "Waiting for participants"}
             </div>
-          );
-        })}
-      </div>
-      {visible.length === 0 && (
-        <div className="empty-stage">
-          {mode === "webinar"
-            ? "Waiting for a presenter"
-            : "Waiting for participants"}
-        </div>
+          )}
+        </>
       )}
     </>
   );

@@ -12,6 +12,7 @@ import { existsSync } from "node:fs";
 import { randomUUID, randomInt } from "node:crypto";
 import { createMailBudget, createMailTransport } from "@meeting-platform/mail";
 import { z } from "zod";
+import { whiteboardInput } from "./whiteboard.js";
 import type { Config } from "./config.js";
 import type { Meeting, Participant, Store } from "./store.js";
 import type { Media } from "./media.js";
@@ -272,6 +273,16 @@ export async function createApp(config: Config, store: Store, media: Media) {
   }
   function active(m: Meeting) {
     requireMeetingAccess(m);
+  }
+  function whiteboardAccess(req: FastifyRequest, m: Meeting) {
+    active(m);
+    const p = actor(req, m);
+    if (p.status !== "admitted") throw new HttpError(403, "Admission required");
+    return {
+      scope: p.breakoutId ?? "",
+      authorId: p.id,
+      host: p.role === "host",
+    };
   }
   const codeOf = (req: FastifyRequest) =>
     normalizeCode((req.params as any).code ?? "");
@@ -711,6 +722,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
   });
   async function cleanupMeeting(m: Meeting) {
     let failed = false;
+    try {
+      await store.purgeWhiteboard(m.code);
+    } catch {
+      failed = true;
+    }
     try {
       await recordings.stopAll(m);
     } catch {
@@ -1221,6 +1237,56 @@ export async function createApp(config: Config, store: Store, media: Media) {
         return { ok: true };
       },
     );
+  const whiteboardRateKey = (req: FastifyRequest) => {
+    return verifyDevice(config.secret, req.cookies.mp_device) ?? req.ip;
+  };
+  app.get(
+    "/api/meetings/:code/whiteboard",
+    {
+      config: {
+        rateLimit: {
+          max: 90,
+          timeWindow: "1 minute",
+          keyGenerator: whiteboardRateKey,
+        },
+      },
+    },
+    async (req) => {
+      const { after } = z
+        .object({
+          after: z.coerce
+            .number()
+            .int()
+            .min(0)
+            .max(Number.MAX_SAFE_INTEGER)
+            .default(0),
+        })
+        .parse(req.query);
+      return store.readWhiteboard(codeOf(req), after, (m) =>
+        whiteboardAccess(req, m),
+      );
+    },
+  );
+  app.post(
+    "/api/meetings/:code/whiteboard",
+    {
+      config: {
+        rateLimit: {
+          max: 120,
+          timeWindow: "1 minute",
+          keyGenerator: whiteboardRateKey,
+        },
+      },
+      bodyLimit: 8192,
+    },
+    async (req) => {
+      const input = whiteboardInput.parse(req.body);
+      const event = await store.writeWhiteboard(codeOf(req), input, (m) =>
+        whiteboardAccess(req, m),
+      );
+      return { event };
+    },
+  );
   app.post("/api/meetings/:code/breakouts", async (req) => {
     const { name: roomName } = z.object({ name }).parse(req.body);
     await store.change(codeOf(req), (m) => {

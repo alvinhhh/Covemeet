@@ -515,15 +515,19 @@ test("breakout moves rotate media authority and room chat stays scoped", async (
   );
   ok(breakoutState);
   assert.equal(
-    breakoutState.json().messages.find(
-      (message: { text: string }) => message.text === "Breakout-only message",
-    ).senderId,
+    breakoutState
+      .json()
+      .messages.find(
+        (message: { text: string }) => message.text === "Breakout-only message",
+      ).senderId,
     first.id,
   );
   assert.equal(
-    breakoutState.json().messages.find(
-      (message: { text: string }) => message.text === "Host announcement",
-    ).senderId,
+    breakoutState
+      .json()
+      .messages.find(
+        (message: { text: string }) => message.text === "Host announcement",
+      ).senderId,
     state.json().me.id,
   );
   assert.ok(
@@ -556,6 +560,102 @@ test("breakout moves rotate media authority and room chat stays scoped", async (
     await f.host.request("POST", `/api/meetings/${m.code}/close-breakouts`, {}),
   );
   assert.equal((await f.store.get(m.code))!.breakouts.length, 0);
+});
+
+test("whiteboard writes require admission, obey host policy, and replay by room", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code, "198.51.100.70");
+  const path = `/api/meetings/${m.code}/whiteboard`;
+  const stroke = {
+    kind: "stroke",
+    epoch: 0,
+    id: "00000000-0000-4000-8000-000000000001",
+    points: [
+      [0, 0],
+      [12, -8],
+    ],
+  };
+  rejected(await guest.client.request("GET", path));
+  rejected(await guest.client.request("POST", path, stroke));
+  await f.action(m.code, guest.id, "admit");
+  const written = await guest.client.request("POST", path, stroke);
+  ok(written);
+  assert.equal(written.json().event.seq, 1);
+  const repeated = await guest.client.request("POST", path, stroke);
+  ok(repeated);
+  assert.equal(repeated.json().event.seq, 1);
+  const main = await f.host.request("GET", path);
+  ok(main);
+  assert.equal(main.json().events.length, 1);
+  assert.equal(main.json().events[0].points[1][1], -8);
+  rejected(
+    await guest.client.request("POST", path, { kind: "clear", epoch: 0 }),
+  );
+  ok(
+    await f.host.request("POST", path, {
+      kind: "policy",
+      epoch: 0,
+      readOnly: true,
+    }),
+  );
+  assert.equal(f.store.whiteboards.get(`${m.code}\0`)?.events.length, 1);
+  rejected(
+    await guest.client.request("POST", path, {
+      kind: "text",
+      epoch: 0,
+      id: "00000000-0000-4000-8000-000000000002",
+      x: 1,
+      y: 2,
+      text: "blocked",
+    }),
+  );
+  ok(await f.host.request("POST", path, { kind: "clear", epoch: 0 }));
+  rejected(await guest.client.request("POST", path, stroke));
+  const afterClear = await f.host.request("GET", `${path}?after=1`);
+  ok(afterClear);
+  assert.deepEqual(
+    afterClear.json().events.map((event: any) => event.kind),
+    ["clear"],
+  );
+  assert.equal(afterClear.json().readOnly, true);
+  assert.equal(afterClear.json().epoch, 1);
+  ok(
+    await f.host.request("POST", `/api/meetings/${m.code}/breakouts`, {
+      name: "Side",
+    }),
+  );
+  const state = await f.host.request("GET", `/api/meetings/${m.code}/state`);
+  const breakoutId = state.json().meeting.breakouts[0].id;
+  ok(
+    await f.host.request("POST", `/api/meetings/${m.code}/move`, {
+      participantId: guest.id,
+      breakoutId,
+    }),
+  );
+  const side = await guest.client.request("GET", path);
+  ok(side);
+  assert.deepEqual(side.json().events, []);
+  assert.equal(side.json().readOnly, false);
+  ok(
+    await guest.client.request("POST", path, {
+      kind: "text",
+      epoch: 0,
+      id: "00000000-0000-4000-8000-000000000003",
+      x: 5,
+      y: 9,
+      text: "Side room",
+    }),
+  );
+  const stillMain = await f.host.request("GET", path);
+  assert.deepEqual(
+    stillMain.json().events.map((event: any) => event.kind),
+    ["clear"],
+  );
+  await f.action(m.code, guest.id, "kick");
+  rejected(await guest.client.request("GET", path));
+  ok(await f.host.request("POST", `/api/meetings/${m.code}/end`, {}));
+  assert.equal(f.store.whiteboards.size, 0);
 });
 
 test("webinar viewers cannot publish until the host grants presenter permissions", async (t) => {
