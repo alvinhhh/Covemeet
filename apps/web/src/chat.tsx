@@ -1,18 +1,28 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type FormEvent,
+  type SetStateAction,
+} from "react";
 import type { MeetingState } from "./api";
 import { Icon } from "./icons";
 import { sendsChatOnEnter } from "./chat-state";
 
 export function Chat({
   state,
+  text,
+  setText,
   send,
   busy,
 }: {
   state: MeetingState;
+  text: string;
+  setText: Dispatch<SetStateAction<string>>;
   send: (text: string) => Promise<boolean>;
   busy: boolean;
 }) {
-  const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [below, setBelow] = useState(false);
   const pending = useRef(false);

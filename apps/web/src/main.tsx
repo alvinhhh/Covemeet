@@ -937,6 +937,7 @@ function Conference({
   );
   const chatButton = useRef<HTMLButtonElement>(null);
   const chatRead = useRef(new ChatUnread());
+  const [chatDrafts, setChatDrafts] = useState<Record<string, string>>({});
   const [unreadChat, setUnreadChat] = useState(0);
   const chatRoom = `${state.meeting.code}:${state.me.id}:${state.me.breakoutId ?? "main"}`;
   useEffect(() => {
@@ -1228,6 +1229,16 @@ function Conference({
               <Chat
                 key={chatRoom}
                 state={state}
+                text={chatDrafts[chatRoom] ?? ""}
+                setText={(update) =>
+                  setChatDrafts((drafts) => ({
+                    ...drafts,
+                    [chatRoom]:
+                      typeof update === "function"
+                        ? update(drafts[chatRoom] ?? "")
+                        : update,
+                  }))
+                }
                 send={(text) => mutate("/messages", { text })}
                 busy={busy}
               />
