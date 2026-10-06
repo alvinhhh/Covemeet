@@ -17,7 +17,7 @@ const now = Date.UTC(2026, 9, 5, 12);
 const anchorAt = Date.UTC(2026, 0, 31, 12);
 async function fixture(
   t: TestContext,
-  allowance = 360000,
+  allowance: number | null = 360000,
   at = now,
   metering?: "meeting",
 ) {
@@ -159,6 +159,160 @@ test("legacy recording inventory cannot block meeting admission or ongoing media
     /Recording storage inventory is unavailable/,
   );
   assert.equal((await f.store.get(f.m.code))!.recordings.length, 0);
+});
+
+test("uncapped refresh preserves shared accounting across months and recording byte limits", async (t) => {
+  const boundary = Date.UTC(2026, 9, 31, 12);
+  const f = await fixture(t, 30, boundary - 15000, "meeting");
+  for (const p of [f.host, f.guest]) {
+    await f.act(p, p.id, "claim");
+    await f.act(p, p.id, "connected");
+  }
+  t.mock.timers.tick(10000);
+  for (const p of [f.host, f.guest]) await f.act(p, p.id, "heartbeat");
+  assert.equal((await f.usage()).participantSeconds.used, 10);
+  const grant = {
+    ...f.grant,
+    revision: 2,
+    quota: {
+      ...f.grant.quota!,
+      participantSecondsPerMonth: null,
+      recordingSecondsPerMonth: null,
+      storageBytes: 1000,
+      downloadBytesPerMonth: 100,
+    },
+  };
+  assert.equal(entitlementSchema.safeParse(grant).success, true);
+  await f.store.setHostedEntitlement(grant);
+  await f.store.setHostedEntitlement(f.grant); // stale numeric delivery cannot undo the refresh
+  for (let i = 0; i < 8; i++) {
+    t.mock.timers.tick(10000);
+    for (const p of [f.host, f.guest]) await f.act(p, p.id, "heartbeat");
+  }
+  const usage = await f.usage();
+  assert.equal(usage.participantSeconds.limit, null);
+  assert.equal(usage.participantSeconds.available, null);
+  assert.equal(usage.participantSeconds.used, 75);
+  assert(usage.participantSeconds.reserved > 0);
+  assert.equal(usage.blocked, false);
+  const ledger = f.store.usageLedgers.get(f.owner)!;
+  assert.equal(
+    ledger.windows.find((w) => w.end === boundary)!.meetingUsedMs,
+    15000,
+  );
+  assert.equal(
+    quotaOverdrawn(ledger, grant, [(await f.store.get(f.m.code))!], Date.now()),
+    false,
+  );
+  assert.equal((await f.store.get(f.m.code))!.ended, false);
+  await assert.rejects(
+    f.store.setHostedEntitlement({ ...grant, quota: f.grant.quota }),
+    /revision conflicts/,
+  );
+
+  await f.store.change(f.m.code, (m) => {
+    m.recordingAllowed = true;
+  });
+  const recording = {
+    id: randomUUID(),
+    status: "starting",
+    createdAt: Date.now(),
+  };
+  await f.store.withRecordingLock(f.m.code, recording.id, (lock) =>
+    lock.reserveRecording(recording, () => {}, { maxBytes: 1001, copies: 1 }),
+  );
+  assert.equal(
+    (await f.store.get(f.m.code))!.recordings[0]!.storage!.maxBytes,
+    1000,
+  );
+  await assert.rejects(
+    f.store.withRecordingLock(f.m.code, recording.id, (lock) =>
+      lock.reserveRecordingStorage("s3"),
+    ),
+    /Recording storage allowance is unavailable/,
+  );
+  await f.store.debitRecordingDownload(f.m.code, 100, () => {});
+  await assert.rejects(
+    f.store.debitRecordingDownload(f.m.code, 1, () => {}),
+    /download allowance/,
+  );
+  assert.equal((await f.usage()).recordingDownloadBytes.used, 100);
+  assert.equal((await f.usage()).recordingStorageBytes.available, 0);
+});
+
+test("uncapped grants retain session deadlines, paid expiry, cleanup and concurrency gates", async (t) => {
+  for (const reason of ["session", "paid", "cleanup", "revoked"] as const) {
+    await t.test(reason, async (t) => {
+      const f = await fixture(t, null, now, "meeting");
+      await f.act(f.host, "host", "claim");
+      await f.act(f.host, "host", "connected");
+      if (reason === "session")
+        await f.store.change(f.m.code, (m) => {
+          m.lifecycle!.deadlineAt = now + 10000;
+        });
+      if (reason === "paid")
+        await f.store.setHostedEntitlement({
+          ...f.grant,
+          revision: 2,
+          validUntil: now + 10000,
+        });
+      if (reason === "revoked")
+        await f.store.setHostedEntitlement({
+          ...f.grant,
+          revision: 2,
+          enabled: false,
+        });
+      t.mock.timers.tick(reason === "cleanup" ? 16000 : 10000);
+      await assert.rejects(f.act(f.host, "host", "heartbeat"));
+      const m = (await f.store.get(f.m.code))!;
+      assert.equal(m.participants[0]!.meter!.phase, "closing");
+      assert((await f.usage()).participantSeconds.reserved > 0);
+      assert.equal((await f.usage()).blocked, true);
+    });
+  }
+  await t.test("concurrency", async (t) => {
+    const f = await fixture(t, null, now, "meeting");
+    const next = structuredClone(f.m);
+    next.code = randomUUID();
+    next.id = randomUUID();
+    next.room = randomUUID();
+    delete next.lifecycle;
+    await f.store.create(next);
+    await assert.rejects(
+      f.store.startMeeting(next.code, () => {}),
+      /host already has a meeting/,
+    );
+    const otherHost = randomUUID();
+    await f.store.setHostedEntitlement({
+      ...f.grant,
+      revision: 2,
+      hostAccountIds: [f.owner, otherHost],
+    });
+    await f.store.change(next.code, (m) => {
+      m.hosted!.accountId = otherHost;
+    });
+    await assert.rejects(
+      f.store.startMeeting(next.code, () => {}),
+      /simultaneous meeting limit/,
+    );
+  });
+});
+
+test("uncapped grants require explicit meeting metering; legacy numeric grants remain valid", async (t) => {
+  const f = await fixture(t);
+  assert.equal(entitlementSchema.safeParse(f.grant).success, true);
+  const uncapped = {
+    ...f.grant,
+    quota: { ...f.grant.quota!, participantSecondsPerMonth: null },
+  };
+  assert.equal(entitlementSchema.safeParse(uncapped).success, false);
+  assert.equal(
+    entitlementSchema.safeParse({
+      ...uncapped,
+      quota: { ...uncapped.quota, metering: "meeting" },
+    }).success,
+    true,
+  );
 });
 
 test("UTC monthly windows clamp the original anniversary without February drift", () => {

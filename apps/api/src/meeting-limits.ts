@@ -11,7 +11,7 @@ export type HostedEntitlement = {
   quota: {
     anchorAt: number;
     metering?: "meeting";
-    participantSecondsPerMonth: number;
+    participantSecondsPerMonth: number | null;
     downloadBytesPerMonth?: number;
     recordingSecondsPerMonth?: number | null;
     storageBytes?: number;
@@ -44,7 +44,12 @@ export const entitlementSchema = z
       .object({
         anchorAt: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
         metering: z.literal("meeting").optional(),
-        participantSecondsPerMonth: z.number().int().positive().max(36000000),
+        participantSecondsPerMonth: z
+          .number()
+          .int()
+          .positive()
+          .max(36000000)
+          .nullable(),
         downloadBytesPerMonth: z
           .number()
           .int()
@@ -66,6 +71,12 @@ export const entitlementSchema = z
           .optional(),
       })
       .strict()
+      .refine(
+        (quota) =>
+          quota.participantSecondsPerMonth !== null ||
+          quota.metering === "meeting",
+        "Uncapped meeting time requires meeting metering",
+      )
       .nullable(),
     hostAccountIds: z
       .array(uuid)

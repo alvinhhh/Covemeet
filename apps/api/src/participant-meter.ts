@@ -245,7 +245,10 @@ export function usageView(
   const window = usageWindow(ledger.anchorAt, now);
   const used = usedTime(ledger, window.start);
   const reserved = held(ledger, meetings, window.start);
-  const limit = (grant?.quota?.participantSecondsPerMonth ?? 0) * 1000;
+  const limit =
+    grant?.quota?.participantSecondsPerMonth === null
+      ? null
+      : (grant?.quota?.participantSecondsPerMonth ?? 0) * 1000;
   const downloadLimit = grant?.quota?.downloadBytesPerMonth ?? 0;
   const downloadUsed =
     ledger.windows.find((w) => w.start === window.start)
@@ -255,10 +258,13 @@ export function usageView(
     metering: ledger.metering ?? "participant",
     window,
     participantSeconds: {
-      limit: limit / 1000,
+      limit: limit === null ? null : limit / 1000,
       used: Math.ceil(used / 1000),
       reserved: Math.ceil(reserved / 1000),
-      available: Math.floor(Math.max(0, limit - used - reserved) / 1000),
+      available:
+        limit === null
+          ? null
+          : Math.floor(Math.max(0, limit - used - reserved) / 1000),
     },
     recordingDownloadBytes: {
       limit: downloadLimit,
@@ -268,7 +274,9 @@ export function usageView(
     recordingSeconds: recordingTimeView(ledger, grant, meetings, now),
     recordingStorageBytes: recordingStorageView(grant, meetings),
     asOf: now,
-    blocked: usageBlocked(grant, meetings, now) || used + reserved > limit,
+    blocked:
+      usageBlocked(grant, meetings, now) ||
+      (limit !== null && used + reserved > limit),
   };
 }
 
@@ -303,6 +311,7 @@ export function quotaOverdrawn(
   meetings: Meeting[],
   now: number,
 ) {
+  if (grant.quota?.participantSecondsPerMonth === null) return false;
   const window = usageWindow(ledger.anchorAt, now);
   const used = usedTime(ledger, window.start);
   return (
@@ -323,9 +332,11 @@ export function requireUsage(
   // independently funded meeting or its existing media connections.
   const window = usageWindow(ledger.anchorAt, now);
   const available =
-    (grant?.quota?.participantSecondsPerMonth ?? 0) * 1000 -
-    usedTime(ledger, window.start) -
-    held(ledger, meetings, window.start);
+    grant?.quota?.participantSecondsPerMonth === null
+      ? null
+      : (grant?.quota?.participantSecondsPerMonth ?? 0) * 1000 -
+        usedTime(ledger, window.start) -
+        held(ledger, meetings, window.start);
   const meter =
     ledger.metering === "meeting" ? meeting?.meetingMeter : participant?.meter;
   const prepaid = meter && meter.phase !== "closing" && meter.fundedUntil > now;
@@ -336,7 +347,7 @@ export function requireUsage(
     grant.validUntil <= now ||
     quotaOverdrawn(ledger, grant, meetings, now) ||
     (usageBlocked(grant, meetings, now) && !continuing) ||
-    (!prepaid && available < 1000)
+    (!prepaid && available !== null && available < 1000)
   )
     throw new HttpError(
       409,
@@ -352,6 +363,11 @@ function fund(
   meter: MeetingMeter,
   to: number,
 ) {
+  if (grant.quota!.participantSecondsPerMonth === null) {
+    // Uncapped meeting time still needs a short paid/presence control lease.
+    meter.fundedUntil = Math.max(meter.fundedUntil, to);
+    return;
+  }
   const limit = grant.quota!.participantSecondsPerMonth * 1000;
   for (const part of intervals(ledger.anchorAt, meter.fundedUntil, to)) {
     const used = usedTime(ledger, part.start);

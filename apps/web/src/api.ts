@@ -78,10 +78,10 @@ export type MeetingState = {
     usage?: null | {
       window: { start: number; end: number };
       participantSeconds: {
-        limit: number;
+        limit: number | null;
         used: number;
         reserved: number;
-        available: number;
+        available: number | null;
       };
       recordingSeconds?: {
         limit: number;
@@ -99,7 +99,13 @@ export type MeetingState = {
   };
   me: Participant;
   participants: Participant[];
-  messages: { id: string; name: string; text: string; createdAt: string }[];
+  messages: {
+    id: string;
+    senderId?: string;
+    name: string;
+    text: string;
+    createdAt: string;
+  }[];
   recordings: {
     id: string;
     status: string;
