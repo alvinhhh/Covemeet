@@ -1565,52 +1565,56 @@ export async function createApp(config: Config, store: Store, media: Media) {
     if (controlPass || closing) return;
     controlPass = (async () => {
       for (let m of await store.all()) {
-        if (m.hosted?.billingOwnerId) {
-          await store.reconcileParticipantMeters(m.code).catch(() => {});
-          m = (await store.get(m.code))!;
-        }
-        if (!m.ended && !meetingAllowed(m)) {
-          m = await store.change(m.code, (state) => {
-            if (!meetingAllowed(state)) endMeeting(state);
-            return structuredClone(state);
-          });
-        }
-        if (
-          m.cleanupPending ||
-          (m.hosted?.revoked && !m.hosted.cleanupConfirmed)
-        ) {
-          await cleanupMeeting(m).catch(() => {});
-          continue;
-        }
-        if (
-          m.participants.some(
-            (p) =>
-              ["admitted", "waiting"].includes(p.status) &&
-              (p.expiresAt <= Date.now() ||
-                (p.phone && p.phone.leaseExpiresAt <= Date.now())),
-          )
-        )
-          m = await store.change(m.code, (state) => {
-            for (const p of state.participants)
-              if (
+        try {
+          if (m.hosted?.billingOwnerId) {
+            await store.reconcileParticipantMeters(m.code).catch(() => {});
+            m = (await store.get(m.code))!;
+          }
+          if (!m.ended && !meetingAllowed(m)) {
+            m = await store.change(m.code, (state) => {
+              if (!meetingAllowed(state)) endMeeting(state);
+              return structuredClone(state);
+            });
+          }
+          if (
+            m.cleanupPending ||
+            (m.hosted?.revoked && !m.hosted.cleanupConfirmed)
+          ) {
+            await cleanupMeeting(m);
+            continue;
+          }
+          if (
+            m.participants.some(
+              (p) =>
                 ["admitted", "waiting"].includes(p.status) &&
                 (p.expiresAt <= Date.now() ||
-                  (p.phone && p.phone.leaseExpiresAt <= Date.now()))
-              ) {
-                p.status = "left";
-                fenceParticipantMedia(state, p);
-              }
-            return structuredClone(state);
-          });
-        if (m.participants.some((p) => gatewayPresenceExpired(p)))
-          m = await store.change(m.code, (state) => {
-            for (const p of state.participants)
-              if (gatewayPresenceExpired(p)) fenceParticipantMedia(state, p);
-            return structuredClone(state);
-          });
-        for (const p of m.participants.filter((p) => p.enforcementPending))
-          await enforce(m, [p]).catch(() => {});
-        await recordings.reconcile(m, "capture");
+                  (p.phone && p.phone.leaseExpiresAt <= Date.now())),
+            )
+          )
+            m = await store.change(m.code, (state) => {
+              for (const p of state.participants)
+                if (
+                  ["admitted", "waiting"].includes(p.status) &&
+                  (p.expiresAt <= Date.now() ||
+                    (p.phone && p.phone.leaseExpiresAt <= Date.now()))
+                ) {
+                  p.status = "left";
+                  fenceParticipantMedia(state, p);
+                }
+              return structuredClone(state);
+            });
+          if (m.participants.some((p) => gatewayPresenceExpired(p)))
+            m = await store.change(m.code, (state) => {
+              for (const p of state.participants)
+                if (gatewayPresenceExpired(p)) fenceParticipantMedia(state, p);
+              return structuredClone(state);
+            });
+          for (const p of m.participants.filter((p) => p.enforcementPending))
+            await enforce(m, [p]).catch(() => {});
+          await recordings.reconcile(m, "capture");
+        } catch {
+          // Retry this room next pass without delaying other rooms.
+        }
       }
     })()
       .catch(() => {})
@@ -1621,7 +1625,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         if (!closing && !filesPass)
           filesPass = (async () => {
             for (const m of await store.all())
-              await recordings.reconcile(m, "files");
+              await recordings.reconcile(m, "files").catch(() => {});
           })()
             .catch(() => {})
             .finally(() => {

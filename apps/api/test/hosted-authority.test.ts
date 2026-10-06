@@ -149,6 +149,79 @@ async function fixture(
   };
 }
 
+test("background cleanup isolates room failures and retries them next pass", async (t) => {
+  for (const failure of ["read", "change", "capture"] as const)
+    await t.test(failure, async (t) => {
+      const f = await fixture(t);
+      const first = (await f.create()).json();
+      await f.exchange(first.code, first.hostToken);
+      const second = (
+        await f.create({
+          accountId: f.foreignAccountId,
+          operationId: randomUUID(),
+        })
+      ).json();
+      await f.exchange(second.code, second.hostToken);
+      for (const code of failure === "capture"
+        ? [second.code]
+        : [first.code, second.code])
+        await f.store.change(code, (m) => {
+          m.lifecycle!.deadlineAt = Date.now() - 1;
+        });
+
+      let failing = true;
+      const get = f.store.get.bind(f.store);
+      const change = f.store.change.bind(f.store);
+      t.mock.method(f.store, "get", async (code: string) => {
+        if (failing && code === first.code && failure === "read")
+          throw new Error("Room read unavailable");
+        return get(code);
+      });
+      t.mock.method(f.store, "change", async (code, callback) => {
+        if (failing && code === first.code && failure === "change")
+          throw new Error("Room update unavailable");
+        return change(code, callback);
+      });
+      const reconciled: string[] = [];
+      t.mock.method(
+        RecordingService.prototype,
+        "reconcile",
+        async (m, phase) => {
+          if (
+            failing &&
+            m.code === first.code &&
+            (phase === "files" || failure === "capture")
+          )
+            throw new Error("Recording reconciliation unavailable");
+          reconciled.push(`${m.code}:${phase}`);
+        },
+      );
+
+      for (let pass = 0; pass < 2; pass++) {
+        await f.tick();
+        const closed = (await get(second.code))!;
+        assert.equal(closed.ended, true);
+        assert.equal(closed.cleanupPending, false);
+        assert.equal(closed.lifecycle?.cleanupConfirmed, true);
+        assert(f.media.ended.includes(second.code));
+        assert(reconciled.includes(`${second.code}:files`));
+        assert.notEqual(
+          (await get(first.code))!.lifecycle?.cleanupConfirmed,
+          true,
+        );
+      }
+      failing = false;
+      await f.tick();
+      assert(reconciled.includes(`${first.code}:capture`));
+      assert(reconciled.includes(`${first.code}:files`));
+      if (failure !== "capture")
+        assert.equal(
+          (await get(first.code))!.lifecycle?.cleanupConfirmed,
+          true,
+        );
+    });
+});
+
 test("scheduled codes are machine-assigned and replay only their unchanged unused host bootstrap", async (t) => {
   const f = await fixture(t),
     scheduledCode = randomUUID().replaceAll("-", "").toUpperCase() + "AB";
