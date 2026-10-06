@@ -153,6 +153,6 @@ test("production uses verified TLS and driver errors do not expose connection se
       return true;
     },
   );
-  assert.deepEqual(ssl, { rejectUnauthorized: true });
+  assert.deepEqual(ssl, { rejectUnauthorized: true, minVersion: "TLSv1.2" });
   await budget.close();
 });

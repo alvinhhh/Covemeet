@@ -53,7 +53,9 @@ function poolOptions(
   url.search = "";
   return {
     connectionString: url.toString(),
-    ssl: tls ? { rejectUnauthorized: true, ...(ca ? { ca } : {}) } : false,
+    ssl: tls
+      ? { rejectUnauthorized: true, minVersion: "TLSv1.2" as const, ...(ca ? { ca } : {}) }
+      : false,
     max: 2,
     connectionTimeoutMillis: 5000,
     statement_timeout: 5000,
