@@ -92,6 +92,7 @@ export type MeetingState = {
       blocked: boolean;
     };
     recordingAllowed: boolean;
+    recordingAvailable?: boolean;
     recordingActive?: boolean;
     createdAt: string;
     hostEmailVerified?: boolean;

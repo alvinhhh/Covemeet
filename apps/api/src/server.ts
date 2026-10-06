@@ -34,9 +34,11 @@ import { RecordingService } from "./recordings.js";
 import { PhoneService, revokePhoneParticipants } from "./phone.js";
 import { PhoneDialogService } from "./phone-dialogs.js";
 import {
+  applyGroupDuration,
   endMeeting,
   entitlementSchema,
   meetingAllowed,
+  recordingIncluded,
   participantLimit,
   occupiesMeetingSeat,
   requireWebinarViewerSeat,
@@ -844,21 +846,25 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const { token } = z.object({ token: z.string().max(256) }).parse(req.body);
     await store.checkUsage(codeOf(req));
     const session = randomToken();
-    const id = await store.startMeeting(codeOf(req), (m) => {
-      active(m);
-      if (
-        !m.hostTokenHash ||
-        !safeEqual(m.hostTokenHash, digest(token)) ||
-        m.hostTokenExpiresAt < Date.now()
-      )
-        throw new HttpError(403, "Host link is invalid or already used");
-      delete m.hostTokenHash;
-      const p = m.participants.find((x) => x.role === "host")!;
-      p.status = "admitted";
-      p.tokenHash = digest(session);
-      Object.assign(p, identity(req, reply, m.code));
-      return p.id;
-    });
+    const id = await store.startMeeting(
+      codeOf(req),
+      (m) => {
+        active(m);
+        if (
+          !m.hostTokenHash ||
+          !safeEqual(m.hostTokenHash, digest(token)) ||
+          m.hostTokenExpiresAt < Date.now()
+        )
+          throw new HttpError(403, "Host link is invalid or already used");
+        delete m.hostTokenHash;
+        const p = m.participants.find((x) => x.role === "host")!;
+        p.status = "admitted";
+        p.tokenHash = digest(session);
+        Object.assign(p, identity(req, reply, m.code));
+        return p.id;
+      },
+      config.freeMaxActiveRooms,
+    );
     reply.setCookie(authCookie(codeOf(req)), session, cookieOpts);
     return { participantId: id };
   });
@@ -915,9 +921,29 @@ export async function createApp(config: Config, store: Store, media: Media) {
         },
       },
     },
-    async (req) => {
-      const m = await find(req),
+    async (req, reply) => {
+      let m = await find(req),
         p = actor(req, m);
+      if (
+        p.status === "admitted" &&
+        meetingAllowed(m) &&
+        p.expiresAt - Date.now() < 60 * 60 * 1000
+      ) {
+        m = await store.change(m.code, (current) => {
+          requireMeetingAccess(current);
+          const member = actor(req, current);
+          if (member.status !== "admitted")
+            throw new HttpError(403, "Participant session is inactive");
+          member.expiresAt = Date.now() + 43200000;
+          return structuredClone(current);
+        });
+        p = actor(req, m);
+        reply.setCookie(
+          authCookie(m.code),
+          req.cookies[authCookie(m.code)]!,
+          cookieOpts,
+        );
+      }
       const pub = (x: Participant) => ({
         transport: x.transport ?? "browser",
         ...(x.phone
@@ -974,6 +1000,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
           deadlineAt: m.lifecycle?.deadlineAt,
           usage,
           recordingAllowed: m.recordingAllowed,
+          recordingAvailable: recordingIncluded(m),
           createdAt: m.createdAt,
           hostEmailVerified:
             p.role === "host" ? !!m.hostEmailVerified : undefined,
@@ -1097,6 +1124,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         if (m.locked)
           throw new HttpError(403, "Unlock the meeting before admitting");
         p.status = "admitted";
+        applyGroupDuration(m);
         if (p.phone) {
           if (p.phone.leaseExpiresAt <= Date.now())
             throw new HttpError(409, "Phone call is no longer active");
@@ -1151,6 +1179,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
     const m = await store.change(codeOf(req), (m) => {
       active(m);
       actor(req, m, true);
+      if (body.recordingAllowed && !recordingIncluded(m))
+        throw new HttpError(403, "Recording is not available on this plan");
       Object.assign(m, body);
       if (body.recordingAllowed === false)
         for (const r of m.recordings)

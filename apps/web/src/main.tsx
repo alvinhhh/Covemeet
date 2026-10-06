@@ -2570,23 +2570,27 @@ function Recordings({
   }
   return (
     <div className="panel-scroll recordings-panel">
-      <label className="switch-row">
-        <span>
-          <strong>Allow recording</strong>
-          <small>Recording is off until started.</small>
-        </span>
-        <input
-          aria-label="Allow recording"
-          type="checkbox"
-          role="switch"
-          checked={state.meeting.recordingAllowed}
-          disabled={busy}
-          onChange={(e) =>
-            void request("", { recordingAllowed: e.target.checked }, "PATCH")
-          }
-        />
-      </label>
-      {!config.recordingAvailable ? (
+      {state.meeting.recordingAvailable !== false && (
+        <label className="switch-row">
+          <span>
+            <strong>Allow recording</strong>
+            <small>Recording is off until started.</small>
+          </span>
+          <input
+            aria-label="Allow recording"
+            type="checkbox"
+            role="switch"
+            checked={state.meeting.recordingAllowed}
+            disabled={busy}
+            onChange={(e) =>
+              void request("", { recordingAllowed: e.target.checked }, "PATCH")
+            }
+          />
+        </label>
+      )}
+      {state.meeting.recordingAvailable === false ? (
+        <Notice kind="info">Recording is available on paid plans.</Notice>
+      ) : !config.recordingAvailable ? (
         <Notice kind="info">
           Recording is not configured. An administrator must configure encrypted
           storage and email delivery before recordings can start.

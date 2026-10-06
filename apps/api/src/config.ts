@@ -179,10 +179,12 @@ export function loadConfig(env = process.env) {
     86400,
     0,
   );
+  const freeMaxActiveRooms = meetingLimit("FREE_MAX_ACTIVE_ROOMS", 1, 1000);
   return {
     meetingParticipantLimit,
     webinarParticipantLimit,
     meetingDurationSeconds,
+    freeMaxActiveRooms,
     secret,
     origin,
     portalOrigin,

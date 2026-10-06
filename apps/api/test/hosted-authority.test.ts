@@ -1369,6 +1369,314 @@ test("Teams grants preserve 100-person meetings, 1000 webinar viewers and an eig
   );
 });
 
+function freeGrant(f: Awaited<ReturnType<typeof fixture>>, revision = 2) {
+  return {
+    ...f.grant,
+    revision,
+    hostAccountIds: [f.accountId],
+    quota: {
+      anchorAt: f.grant.quota.anchorAt,
+      metering: "meeting" as const,
+      participantSecondsPerMonth: null,
+      recordingSecondsPerMonth: 0,
+      downloadBytesPerMonth: 0,
+      storageBytes: 0,
+    },
+    limits: {
+      participants: 100,
+      webinarParticipants: 100,
+      durationSeconds: 0,
+      groupDurationSeconds: 10800,
+      concurrentMeetings: 1,
+    },
+  };
+}
+
+test("Free meeting stays uncapped with two people, caps at the third admission, and renews active browser sessions", async (t) => {
+  const f = await fixture(t);
+  assert.equal(
+    (await f.internal("entitlements", freeGrant(f))).statusCode,
+    200,
+  );
+  const made = (await f.create()).json();
+  const host = await f.exchange(made.code, made.hostToken);
+  assert.equal(
+    (await f.browser(`/api/meetings/${made.code}/recordings`, {}, host))
+      .statusCode,
+    403,
+  );
+  assert.equal(
+    (
+      await f.app.inject({
+        method: "PATCH",
+        url: `/api/meetings/${made.code}`,
+        headers: {
+          origin,
+          "x-requested-with": "MeetingPlatform",
+          cookie: host,
+        },
+        payload: { recordingAllowed: true },
+      })
+    ).statusCode,
+    403,
+  );
+  const guest = await f.browser(`/api/meetings/${made.code}/join`, {
+    name: "One",
+    password: settings.password,
+  });
+  assert.equal(guest.statusCode, 200);
+  assert.equal(
+    (
+      await f.browser(
+        `/api/meetings/${made.code}/participants/${guest.json().participantId}/action`,
+        { action: "admit" },
+        host,
+      )
+    ).statusCode,
+    200,
+  );
+  assert.equal(
+    (await f.store.get(made.code))!.lifecycle?.deadlineAt,
+    undefined,
+  );
+  await f.store.change(made.code, (m) => {
+    m.participants.find((p) => p.role === "host")!.expiresAt =
+      Date.now() + 1000;
+  });
+  const renewed = await f.browser(
+    `/api/meetings/${made.code}/state`,
+    undefined,
+    host,
+  );
+  assert.equal(renewed.statusCode, 200);
+  assert(renewed.cookies.some((cookie) => cookie.name === `mp_${made.code}`));
+  assert(
+    (await f.store.get(made.code))!.participants.find((p) => p.role === "host")!
+      .expiresAt >
+      Date.now() + 11 * 3600000,
+  );
+  const extra = await f.browser(`/api/meetings/${made.code}/join`, {
+    name: "Two",
+    password: settings.password,
+  });
+  assert.equal(extra.statusCode, 200);
+  assert.equal(
+    (
+      await f.browser(
+        `/api/meetings/${made.code}/participants/${extra.json().participantId}/action`,
+        { action: "admit" },
+        host,
+      )
+    ).statusCode,
+    200,
+  );
+  const capped = (await f.store.get(made.code))!;
+  assert.equal(
+    capped.lifecycle!.deadlineAt! - capped.lifecycle!.startedAt,
+    10800000,
+  );
+  await f.browser(
+    `/api/meetings/${made.code}/participants/${extra.json().participantId}/action`,
+    { action: "kick" },
+    host,
+  );
+  assert.equal(
+    (await f.store.get(made.code))!.lifecycle!.deadlineAt,
+    capped.lifecycle!.deadlineAt,
+  );
+});
+
+test("Free two-person meeting remains open after three hours but refuses a third participant", async (t) => {
+  const f = await fixture(t);
+  assert.equal(
+    (await f.internal("entitlements", freeGrant(f))).statusCode,
+    200,
+  );
+  const made = (await f.create()).json();
+  const host = await f.exchange(made.code, made.hostToken);
+  await f.store.change(made.code, (m) => {
+    m.lifecycle!.startedAt = Date.now() - 10800001;
+  });
+  const guest = await f.browser(`/api/meetings/${made.code}/join`, {
+    name: "One",
+    password: settings.password,
+  });
+  assert.equal(guest.statusCode, 200);
+  assert.equal(
+    (
+      await f.browser(
+        `/api/meetings/${made.code}/participants/${guest.json().participantId}/action`,
+        { action: "admit" },
+        host,
+      )
+    ).statusCode,
+    200,
+  );
+  await f.tick();
+  assert.equal((await f.store.get(made.code))!.ended, false);
+  const third = await f.browser(`/api/meetings/${made.code}/join`, {
+    name: "Two",
+    password: settings.password,
+  });
+  assert.equal(third.statusCode, 200);
+  assert.equal(
+    (
+      await f.browser(
+        `/api/meetings/${made.code}/participants/${third.json().participantId}/action`,
+        { action: "admit" },
+        host,
+      )
+    ).statusCode,
+    409,
+  );
+  assert.equal(
+    (await f.store.get(made.code))!.lifecycle!.deadlineAt,
+    undefined,
+  );
+});
+
+test("a phone caller admitted as the third Free participant starts the sticky group deadline", async (t) => {
+  const f = await fixture(t);
+  assert.equal(
+    (await f.internal("entitlements", freeGrant(f))).statusCode,
+    200,
+  );
+  const made = (await f.create()).json();
+  const host = await f.exchange(made.code, made.hostToken);
+  const guest = await f.browser(`/api/meetings/${made.code}/join`, {
+    name: "Browser guest",
+    password: settings.password,
+  });
+  assert.equal(guest.statusCode, 200);
+  assert.equal(
+    (
+      await f.browser(
+        `/api/meetings/${made.code}/participants/${guest.json().participantId}/action`,
+        { action: "admit" },
+        host,
+      )
+    ).statusCode,
+    200,
+  );
+  const phone = (
+    await f.browser(`/api/meetings/${made.code}/phone`, {}, host)
+  ).json();
+  const caller = await f.gateway("calls", {
+    locator: phone.locator,
+    pin: phone.pin,
+    callId: randomUUID(),
+    trunkId: "fixture",
+  });
+  assert.equal(caller.statusCode, 200, caller.body);
+  assert.equal(
+    (
+      await f.browser(
+        `/api/meetings/${made.code}/participants/${caller.json().participantId}/action`,
+        { action: "admit" },
+        host,
+      )
+    ).statusCode,
+    200,
+  );
+  const room = (await f.store.get(made.code))!;
+  assert.equal(
+    room.lifecycle!.deadlineAt! - room.lifecycle!.startedAt,
+    10800000,
+  );
+});
+
+test("Free room capacity is enforced across independent owners and frees only after cleanup", async (t) => {
+  const f = await fixture(t);
+  f.config.freeMaxActiveRooms = 1;
+  assert.equal(
+    (await f.internal("entitlements", freeGrant(f))).statusCode,
+    200,
+  );
+  const first = (await f.create()).json();
+  const firstHost = await f.exchange(first.code, first.hostToken);
+  const accountId = randomUUID();
+  const billingOwnerId = randomUUID();
+  assert.equal(
+    (
+      await f.internal("entitlements", {
+        ...freeGrant(f),
+        billingOwnerId,
+        hostAccountIds: [accountId],
+      })
+    ).statusCode,
+    200,
+  );
+  const secondResponse = await f.create({
+    accountId,
+    billingOwnerId,
+    operationId: randomUUID(),
+  });
+  assert.equal(secondResponse.statusCode, 200);
+  const second = secondResponse.json();
+  const denied = await f.browser(`/api/meetings/${second.code}/host`, {
+    token: second.hostToken,
+  });
+  assert.equal(denied.statusCode, 503);
+  assert.equal((await f.store.get(second.code))!.lifecycle, undefined);
+  assert(
+    [200, 202].includes(
+      (await f.browser(`/api/meetings/${first.code}/end`, {}, firstHost))
+        .statusCode,
+    ),
+  );
+  await f.tick();
+  assert.equal(
+    (await f.store.get(first.code))!.lifecycle?.cleanupConfirmed,
+    true,
+  );
+  assert.equal(
+    (
+      await f.browser(`/api/meetings/${second.code}/host`, {
+        token: second.hostToken,
+      })
+    ).statusCode,
+    200,
+  );
+});
+
+test("paid meeting durations update to 24/30 hours and paid-to-Free downgrade ends the room", async (t) => {
+  const f = await fixture(t);
+  const personal = {
+    ...f.grant,
+    revision: 2,
+    limits: {
+      participants: 100,
+      durationSeconds: 86400,
+      concurrentMeetings: 1,
+    },
+  };
+  assert.equal((await f.internal("entitlements", personal)).statusCode, 200);
+  const made = (await f.create()).json();
+  await f.exchange(made.code, made.hostToken);
+  const started = (await f.store.get(made.code))!.lifecycle!;
+  assert.equal(started.deadlineAt! - started.startedAt, 86400000);
+  const teams = {
+    ...personal,
+    revision: 3,
+    limits: {
+      participants: 100,
+      webinarParticipants: 1010,
+      durationSeconds: 108000,
+      concurrentMeetings: 1,
+    },
+  };
+  assert.equal((await f.internal("entitlements", teams)).statusCode, 200);
+  assert.equal(
+    (await f.store.get(made.code))!.lifecycle!.deadlineAt! - started.startedAt,
+    108000000,
+  );
+  assert.equal(
+    (await f.internal("entitlements", freeGrant(f, 4))).statusCode,
+    200,
+  );
+  assert.equal((await f.store.get(made.code))!.ended, true);
+});
+
 test("ordinary completion retains finished recording credentials and cannot release a busy recorder slot", async (t) => {
   const f = await fixture(t);
   const made = (await f.create()).json();

@@ -15,26 +15,27 @@ npm run dev
 
 Do not change the dev bindings to `0.0.0.0` to invite remote users. The local raw-signaling shortcut would bypass the application admission gateway if it were exposed. Use a deployment with the private signaling boundary intact.
 
-| Configuration                            | Meaning                                                                                                            |
-| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `EDITION`                                | `self-hosted` permits custom meeting codes; `hosted` requires generated codes and the creation key.                |
-| `SITE_ORIGIN`                            | Exact browser origin; use `http://localhost:5173` for development and an HTTPS origin externally.                  |
-| `PORTAL_ORIGIN`                          | Optional separate self-hosted portal origin. Omit it for a single-origin installation.                             |
-| `SESSION_SECRET`                         | Random secret for session-related cryptography. Rotating it may invalidate active sessions.                        |
-| `CREATION_KEY`                           | Server-controlled creation credential in hosted mode. Never embed it in a browser bundle.                          |
-| `MEETING_PARTICIPANT_LIMIT`              | Self-hosted total meeting seats, including the host and waiting guests; defaults to 100, maximum 1,000.            |
-| `WEBINAR_PARTICIPANT_LIMIT`              | Self-hosted total webinar seats; defaults to 1,010, with at most 1,000 viewers and ten stage members.              |
-| `MEETING_DURATION_SECONDS`               | Self-hosted session length from first host entry; 0 is unlimited, otherwise up to 86,400 seconds.                  |
-| `LIVEKIT_URL`                            | Private API/signaling destination: localhost in development, `http://livekit:7880` inside Compose.                 |
-| `LIVEKIT_PUBLIC_URL`                     | Browser gateway origin, such as `ws://localhost:4100`; the SDK appends `/rtc`. It must never point at raw LiveKit. |
-| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Server-only credentials shared with LiveKit/Egress.                                                                |
-| `LIVEKIT_NODE_IP`                        | IP advertised for media candidates. Local setup uses `127.0.0.1`.                                                  |
-| `RECORDING_KEK`                          | Base64 encoding of a 32-byte operator-owned recording wrapping key.                                                |
-| `RECORDING_ENABLED`                      | Global opt-in; defaults to `false`. Each meeting also controls permission.                                         |
-| `RECORDING_DIR`                          | API-visible recording root, containing `raw/` and `encrypted/`.                                                    |
-| `EGRESS_FILE_ROOT`                       | Same directory as Egress sees it; `/recordings` in Compose.                                                        |
-| `SMTP_*`                                 | Test capture or real SMTP provider configuration.                                                                  |
-| `DATABASE_URL` / `DATABASE_CA_FILE`      | PostgreSQL connection and optional trusted CA file. Production verifies TLS and the server hostname.               |
+| Configuration                            | Meaning                                                                                                                              |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `EDITION`                                | `self-hosted` permits custom meeting codes; `hosted` requires generated codes and the creation key.                                  |
+| `SITE_ORIGIN`                            | Exact browser origin; use `http://localhost:5173` for development and an HTTPS origin externally.                                    |
+| `PORTAL_ORIGIN`                          | Optional separate self-hosted portal origin. Omit it for a single-origin installation.                                               |
+| `SESSION_SECRET`                         | Random secret for session-related cryptography. Rotating it may invalidate active sessions.                                          |
+| `CREATION_KEY`                           | Server-controlled creation credential in hosted mode. Never embed it in a browser bundle.                                            |
+| `MEETING_PARTICIPANT_LIMIT`              | Self-hosted total meeting seats, including the host and waiting guests; defaults to 100, maximum 1,000.                              |
+| `WEBINAR_PARTICIPANT_LIMIT`              | Self-hosted total webinar seats; defaults to 1,010, with at most 1,000 viewers and ten stage members.                                |
+| `MEETING_DURATION_SECONDS`               | Self-hosted session length from first host entry; 0 is unlimited, otherwise up to 86,400 seconds.                                    |
+| `FREE_MAX_ACTIVE_ROOMS`                  | Hosted Free rooms running or awaiting media cleanup across the installation; defaults to 1. Increase only after load and cost tests. |
+| `LIVEKIT_URL`                            | Private API/signaling destination: localhost in development, `http://livekit:7880` inside Compose.                                   |
+| `LIVEKIT_PUBLIC_URL`                     | Browser gateway origin, such as `ws://localhost:4100`; the SDK appends `/rtc`. It must never point at raw LiveKit.                   |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Server-only credentials shared with LiveKit/Egress.                                                                                  |
+| `LIVEKIT_NODE_IP`                        | IP advertised for media candidates. Local setup uses `127.0.0.1`.                                                                    |
+| `RECORDING_KEK`                          | Base64 encoding of a 32-byte operator-owned recording wrapping key.                                                                  |
+| `RECORDING_ENABLED`                      | Global opt-in; defaults to `false`. Each meeting also controls permission.                                                           |
+| `RECORDING_DIR`                          | API-visible recording root, containing `raw/` and `encrypted/`.                                                                      |
+| `EGRESS_FILE_ROOT`                       | Same directory as Egress sees it; `/recordings` in Compose.                                                                          |
+| `SMTP_*`                                 | Test capture or real SMTP provider configuration.                                                                                    |
+| `DATABASE_URL` / `DATABASE_CA_FILE`      | PostgreSQL connection and optional trusted CA file. Production verifies TLS and the server hostname.                                 |
 
 The script uses atomic exclusive creation for `.env`, generates secrets with the operating system random generator, and gives runtime directories mode `0700` and secret files mode `0600`. It never prints credentials. Existing `.env` values are preserved. Keep an encrypted backup of the recording key separately from database and recording backups; losing it makes existing recordings unrecoverable. The recording package now includes a local keyring, AWS KMS adapter, operator-driven metadata rewrap and private S3-compatible ciphertext storage. See [recording storage configuration and limitations](recording-storage.md); real cloud IAM/KMS behavior and key-loss/restore drills remain separate deployment gates.
 

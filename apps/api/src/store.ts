@@ -347,7 +347,11 @@ export interface Store {
   reconcileParticipantMeters(code: string): Promise<void>;
   createHosted(m: Meeting): Promise<Meeting>;
   setHostedEntitlement(input: HostedEntitlement): Promise<HostedEntitlement>;
-  startMeeting<T>(code: string, fn: (m: Meeting) => Promise<T> | T): Promise<T>;
+  startMeeting<T>(
+    code: string,
+    fn: (m: Meeting) => Promise<T> | T,
+    freeRoomLimit?: number,
+  ): Promise<T>;
   setHostedAuthority(
     input: HostedAuthority & { legacyCodes?: string[] },
   ): Promise<{
@@ -1030,6 +1034,7 @@ export class PgStore implements Store {
   async startMeeting<T>(
     code: string,
     fn: (m: Meeting) => Promise<T> | T,
+    freeRoomLimit = 1,
   ): Promise<T> {
     const snapshot = await this.get(code);
     if (!snapshot) throw new HttpError(404, "Meeting unavailable");
@@ -1051,13 +1056,28 @@ export class PgStore implements Store {
         if (!m || m.hosted?.billingOwnerId !== binding.billingOwnerId)
           throw new HttpError(409, "Meeting ownership changed");
         const result = await fn(m);
+        let freeRooms: Meeting[] = [];
+        if (
+          m.hosted?.entitlement?.limits.groupDurationSeconds &&
+          !m.lifecycle
+        ) {
+          // Serialize capacity reservations across billing owners and API replicas.
+          await c.query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('covemeet:free-room-capacity',0))",
+          );
+          freeRooms = (
+            await c.query(
+              "SELECT data FROM meetings WHERE data->'hosted'->'entitlement'->'limits'->>'groupDurationSeconds'='10800' AND data->'lifecycle' IS NOT NULL AND data->'lifecycle'->>'cleanupConfirmed' IS DISTINCT FROM 'true'",
+            )
+          ).rows.map((row) => row.data as Meeting);
+        }
         const others = (
           await c.query(
             "SELECT data FROM meetings WHERE data->'hosted'->>'billingOwnerId'=$1 OR data->'hosted'->>'accountId'=$2",
             [binding.billingOwnerId, binding.accountId],
           )
         ).rows.map((row) => row.data as Meeting);
-        startMeetingReservation(m, others);
+        startMeetingReservation(m, others, freeRoomLimit, freeRooms);
         m.revision++;
         await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
           code,
@@ -2183,10 +2203,11 @@ export class MemoryStore implements Store {
   async startMeeting<T>(
     code: string,
     fn: (m: Meeting) => Promise<T> | T,
+    freeRoomLimit = 1,
   ): Promise<T> {
     return this.change(code, async (m) => {
       const result = await fn(m);
-      startMeetingReservation(m, [...this.data.values()]);
+      startMeetingReservation(m, [...this.data.values()], freeRoomLimit);
       return result;
     });
   }

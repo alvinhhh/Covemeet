@@ -21,6 +21,7 @@ export type HostedEntitlement = {
     participants: number;
     webinarParticipants?: number;
     durationSeconds: number;
+    groupDurationSeconds?: number;
     concurrentMeetings: number;
   };
 };
@@ -92,7 +93,14 @@ export const entitlementSchema = z
         webinarParticipants: z
           .union([z.literal(100), z.literal(1010)])
           .optional(),
-        durationSeconds: z.union([z.literal(7200), z.literal(28800)]),
+        durationSeconds: z.union([
+          z.literal(0),
+          z.literal(7200),
+          z.literal(28800),
+          z.literal(86400),
+          z.literal(108000),
+        ]),
+        groupDurationSeconds: z.literal(10800).optional(),
         concurrentMeetings: z.number().int().min(1).max(100),
       })
       .strict(),
@@ -111,6 +119,12 @@ export const entitlementSchema = z
   .refine(
     (grant) => !grant.enabled || grant.validUntil <= Date.now() + 360000,
     "Hosting grant exceeds its maximum lifetime",
+  )
+  .refine(
+    (grant) =>
+      (grant.limits.durationSeconds === 0) ===
+      (grant.limits.groupDurationSeconds === 10800),
+    "Conditional group duration requires an uncapped two-person meeting",
   );
 
 export function nextEntitlement(
@@ -135,6 +149,7 @@ export function nextEntitlement(
       grant.limits.participants,
       grant.limits.webinarParticipants ?? grant.limits.participants,
       grant.limits.durationSeconds,
+      grant.limits.groupDurationSeconds ?? null,
       grant.limits.concurrentMeetings,
     ]);
   if (
@@ -158,7 +173,25 @@ export function applyEntitlement(
   for (const m of affected) {
     if (m.ended) continue;
     const expired = !!m.lifecycle && !meetingAllowed(m);
+    const previous = m.hosted!.entitlement?.limits;
+    if (
+      m.lifecycle &&
+      previous &&
+      !previous.groupDurationSeconds &&
+      grant.limits.groupDurationSeconds
+    ) {
+      // A paid room cannot inherit its old deadline after losing paid access.
+      endMeeting(m);
+      continue;
+    }
     m.hosted!.entitlement = entitlementFor(grant, m.hosted!.accountId);
+    if (
+      m.lifecycle &&
+      !grant.limits.groupDurationSeconds &&
+      previous?.durationSeconds !== grant.limits.durationSeconds
+    )
+      m.lifecycle.deadlineAt =
+        m.lifecycle.startedAt + grant.limits.durationSeconds * 1000;
     if (expired || !meetingAllowed(m) || (overCapacity && m.lifecycle))
       endMeeting(m);
   }
@@ -254,6 +287,29 @@ export function requireMeetingSeat(m: Meeting) {
   if (m.mode === "webinar") requireWebinarViewerSeat(m);
 }
 
+export function applyGroupDuration(m: Meeting, now = Date.now()) {
+  const seconds = m.hosted?.entitlement?.limits.groupDurationSeconds;
+  if (!seconds || !m.lifecycle || m.lifecycle.deadlineAt) return;
+  if (m.participants.filter((p) => p.status === "admitted").length < 3) return;
+  const deadline = m.lifecycle.startedAt + seconds * 1000;
+  if (deadline <= now)
+    throw new HttpError(
+      409,
+      "This free meeting cannot add a third person after three hours",
+    );
+  m.lifecycle.deadlineAt = deadline;
+}
+
+export function recordingIncluded(m: Meeting) {
+  if (!m.hosted?.billingOwnerId) return true;
+  const quota = m.hosted.entitlement?.quota;
+  return !!(
+    quota?.storageBytes &&
+    (quota.recordingSecondsPerMonth === null ||
+      (quota.recordingSecondsPerMonth ?? 0) > 0)
+  );
+}
+
 export function holdsMeetingReservation(m: Meeting) {
   return (
     !!m.hosted?.billingOwnerId && !!m.lifecycle && !m.lifecycle.cleanupConfirmed
@@ -277,9 +333,27 @@ export function endMeeting(m: Meeting) {
   return true;
 }
 
-export function startMeetingReservation(m: Meeting, meetings: Meeting[]) {
+export function startMeetingReservation(
+  m: Meeting,
+  meetings: Meeting[],
+  freeMeetingLimit = 1,
+  freeMeetings = meetings,
+) {
   requireMeetingAccess(m);
   if (m.lifecycle) return;
+  if (m.hosted?.entitlement?.limits.groupDurationSeconds) {
+    const activeFree = freeMeetings.filter(
+      (other) =>
+        other.code !== m.code &&
+        other.hosted?.entitlement?.limits.groupDurationSeconds &&
+        holdsMeetingReservation(other),
+    );
+    if (activeFree.length >= freeMeetingLimit)
+      throw new HttpError(
+        503,
+        "Free meeting capacity is full; try again later",
+      );
+  }
   if (m.hosted?.billingOwnerId) {
     const held = meetings.filter(holdsMeetingReservation);
     if (held.some((x) => x.hosted?.accountId === m.hosted!.accountId))

@@ -1,4 +1,4 @@
-import { meetingAllowed } from "./meeting-limits.js";
+import { meetingAllowed, recordingIncluded } from "./meeting-limits.js";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -685,6 +685,8 @@ export class RecordingService {
     return info;
   }
   async start(meeting: Meeting) {
+    if (!recordingIncluded(meeting))
+      throw new HttpError(403, "Recording is not available on this plan");
     if (!this.available)
       throw new HttpError(503, "Recording is not configured");
     await this.directories();
@@ -697,6 +699,8 @@ export class RecordingService {
       await lock.reserveRecording(
         r,
         (m) => {
+          if (!recordingIncluded(m))
+            throw new HttpError(403, "Recording is not available on this plan");
           if (m.participants.some(activePhone))
             throw new HttpError(
               409,
