@@ -163,6 +163,7 @@ export type Meeting = {
   breakouts: { id: string; name: string; room: string }[];
   messages: {
     id: string;
+    senderId?: string;
     name: string;
     text: string;
     createdAt: number;

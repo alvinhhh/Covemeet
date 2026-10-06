@@ -463,6 +463,7 @@ test("breakout moves rotate media authority and room chat stays scoped", async (
   ok(
     await first.client.request("POST", `/api/meetings/${m.code}/messages`, {
       text: "Breakout-only message",
+      senderId: second.id,
     }),
   );
   const mainState = await second.client.request(
@@ -499,6 +500,18 @@ test("breakout moves rotate media authority and room chat stays scoped", async (
     `/api/meetings/${m.code}/state`,
   );
   ok(breakoutState);
+  assert.equal(
+    breakoutState.json().messages.find(
+      (message: { text: string }) => message.text === "Breakout-only message",
+    ).senderId,
+    first.id,
+  );
+  assert.equal(
+    breakoutState.json().messages.find(
+      (message: { text: string }) => message.text === "Host announcement",
+    ).senderId,
+    state.json().me.id,
+  );
   assert.ok(
     breakoutState
       .json()

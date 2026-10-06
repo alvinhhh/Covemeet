@@ -44,6 +44,8 @@ import { BrandingEditor } from "./branding";
 import { selectStage } from "./stage-policy";
 import { observeAudioSignals, type AudioSignal } from "./audio-signal";
 import { DeviceCheck } from "./device-check";
+import { Chat } from "./chat";
+import { ChatUnread } from "./chat-state";
 
 // A host capability is exchanged once, held only in memory, and removed before rendering.
 let initialHostToken = location.pathname.startsWith("/host/")
@@ -60,9 +62,15 @@ const connectionOptions = { autoSubscribe: false };
 const BrandingContext = createContext<Branding | undefined>(undefined);
 let controlPanelOrigin = location.origin;
 
+function homeHref() {
+  return new URL(
+    controlPanelOrigin === location.origin ? "/" : "/meetings",
+    controlPanelOrigin,
+  ).href;
+}
 function navigate(path: string) {
   if (path === "/" && controlPanelOrigin !== location.origin) {
-    location.assign(new URL("/", controlPanelOrigin).href);
+    location.assign(homeHref());
     return;
   }
   const target = new URL(path, location.origin);
@@ -72,6 +80,9 @@ function navigate(path: string) {
   }
   history.pushState(null, "", target.pathname + target.search + target.hash);
   window.dispatchEvent(new PopStateEvent("popstate"));
+}
+function homeLabel() {
+  return controlPanelOrigin === location.origin ? "Control panel" : "Meetings";
 }
 function initials(name: string) {
   return (
@@ -132,7 +143,7 @@ function Logo({ name, small = false }: { name: string; small?: boolean }) {
   const logo = brandLogo(branding?.brandName || name, branding?.logoUrl);
   return (
     <a
-      href="/"
+      href={homeHref()}
       onClick={(e) => {
         e.preventDefault();
         navigate("/");
@@ -264,7 +275,7 @@ function App() {
     view = (
       <Center>
         <h1>Page not found</h1>
-        <Button onClick={() => navigate("/")}>Control panel</Button>
+        <Button onClick={() => navigate("/")}>{homeLabel()}</Button>
       </Center>
     );
   else view = <Home config={config} />;
@@ -684,7 +695,7 @@ function Meeting({
           <>
             <Notice>{error}</Notice>
             <Button onClick={() => setRefresh((v) => v + 1)}>Try again</Button>
-            <Button onClick={() => navigate("/")}>Control panel</Button>
+            <Button onClick={() => navigate("/")}>{homeLabel()}</Button>
           </>
         ) : (
           <>
@@ -731,7 +742,7 @@ function Meeting({
           <Button onClick={() => setNeedsJoin(true)}>Request admission</Button>
         )}
         <Button className="primary" onClick={() => navigate("/")}>
-          Control panel
+          {homeLabel()}
         </Button>
       </Center>
     );
@@ -810,13 +821,13 @@ function Prejoin({
       <header>
         <Logo name={config.brandName} />
         <a
-          href="/"
+          href={homeHref()}
           onClick={(e) => {
             e.preventDefault();
             navigate("/");
           }}
         >
-          Control panel
+          {homeLabel()}
         </a>
       </header>
       <div className="prejoin-grid">
@@ -874,6 +885,24 @@ function Conference({
   const [panel, setPanel] = useState<
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
   >(null);
+  const chatButton = useRef<HTMLButtonElement>(null);
+  const chatRead = useRef(new ChatUnread());
+  const [unreadChat, setUnreadChat] = useState(0);
+  const chatRoom = `${state.meeting.code}:${state.me.id}:${state.me.breakoutId ?? "main"}`;
+  useEffect(() => {
+    setUnreadChat(
+      chatRead.current.update(
+        chatRoom,
+        state.messages,
+        state.me.id,
+        panel === "chat",
+      ),
+    );
+  }, [chatRoom, state.messages, state.me.id, panel]);
+  function closePanel() {
+    if (panel === "chat") chatButton.current?.focus();
+    setPanel(null);
+  }
   const [mediaControlsTarget, setMediaControlsTarget] =
     useState<HTMLDivElement | null>(null);
   const [error, setError] = useState("");
@@ -899,9 +928,10 @@ function Conference({
       : usage?.blocked
         ? "New connections are paused. Check usage in the portal."
         : usage &&
+            usage.participantSeconds.limit !== null &&
             usage.participantSeconds.used >=
               usage.participantSeconds.limit * 0.8
-          ? `At least 80% of the monthly allowance has been used. ${(usage.participantSeconds.available / 60).toLocaleString(undefined, { maximumFractionDigits: 1 })} participant-minutes available. Resets ${new Date(usage.window.end).toLocaleDateString()}.`
+          ? "Monthly time allowance is nearly used."
           : "";
   const code = state.meeting.code;
   const admitted = state.participants.filter((p) => p.status === "admitted");
@@ -1079,9 +1109,18 @@ function Conference({
           )}
         </main>
         {panel && (
-          <aside className="meeting-panel">
+          <aside
+            className="meeting-panel"
+            aria-labelledby="meeting-panel-title"
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.stopPropagation();
+                closePanel();
+              }
+            }}
+          >
             <div className="panel-header">
-              <h2>
+              <h2 id="meeting-panel-title">
                 {panel === "participants"
                   ? "Participants"
                   : panel === "chat"
@@ -1097,7 +1136,7 @@ function Conference({
               </h2>
               <button
                 className="icon-button"
-                onClick={() => setPanel(null)}
+                onClick={closePanel}
                 aria-label="Close panel"
               >
                 <Icon name="close" size={18} />
@@ -1118,6 +1157,7 @@ function Conference({
               />
             ) : panel === "chat" ? (
               <Chat
+                key={chatRoom}
                 state={state}
                 send={(text) => mutate("/messages", { text })}
                 busy={busy}
@@ -1130,6 +1170,15 @@ function Conference({
               <Recordings state={state} config={config} refresh={refresh} />
             )}
           </aside>
+        )}
+        {panel === null && unreadChat > 0 && (
+          <button className="chat-alert" onClick={() => setPanel("chat")}>
+            <Icon name="chat" size={18} />
+            <span>
+              {unreadChat} new {unreadChat === 1 ? "message" : "messages"}
+            </span>
+            <span className="chat-alert-action">Open chat</span>
+          </button>
         )}
       </div>
       <footer className="meeting-bottom">
@@ -1199,15 +1248,28 @@ function Conference({
               {host && waiting.length > 0 && <b>{waiting.length}</b>}
             </button>
             <button
+              ref={chatButton}
               className={panel === "chat" ? "selected" : ""}
-              aria-label="Chat"
+              aria-label={
+                unreadChat
+                  ? `Chat, ${unreadChat} unread ${unreadChat === 1 ? "message" : "messages"}`
+                  : "Chat"
+              }
               title="Chat"
               aria-pressed={panel === "chat"}
               onClick={() => setPanel(panel === "chat" ? null : "chat")}
             >
               <Icon name="chat" />
               <span>Chat</span>
+              {unreadChat > 0 && (
+                <b aria-hidden="true">{unreadChat > 99 ? "99+" : unreadChat}</b>
+              )}
             </button>
+            <span className="sr-only" role="status">
+              {panel !== "chat" && unreadChat > 0
+                ? `${unreadChat} unread chat ${unreadChat === 1 ? "message" : "messages"}`
+                : ""}
+            </span>
             {host && (
               <button
                 className={panel === "breakouts" ? "selected" : ""}
@@ -1605,54 +1667,57 @@ function MediaControls({ me }: { me: Participant }) {
           {error}
         </span>
       )}
-      <TrackToggle
-        className="button media-toggle"
-        source={Track.Source.Microphone}
-        disabled={!audioAllowed}
-        showIcon={false}
-        onDeviceError={(e) => setError(e.message)}
-        title={microphoneAction}
-        aria-label={microphoneAction}
-      >
-        <Icon name={audioAllowed && isMicrophoneEnabled ? "mic" : "mic-off"} />
-        <span>
-          {!audioAllowed
-            ? "Mic blocked"
-            : isMicrophoneEnabled
-              ? "Mute"
-              : "Unmute"}
-        </span>
-      </TrackToggle>
-      <TrackToggle
-        className="button media-toggle"
-        source={Track.Source.Camera}
-        disabled={!videoAllowed}
-        showIcon={false}
-        onDeviceError={(e) => setError(e.message)}
-        title={cameraAction}
-        aria-label={cameraAction}
-      >
-        <Icon name={videoAllowed && isCameraEnabled ? "video" : "camera-off"} />
-        <span>
-          {!videoAllowed
-            ? "Camera blocked"
-            : isCameraEnabled
-              ? "Stop video"
-              : "Start video"}
-        </span>
-      </TrackToggle>
-      <TrackToggle
-        className="button media-toggle"
-        source={Track.Source.ScreenShare}
-        disabled={!videoAllowed || me.role === "viewer"}
-        showIcon={false}
-        onDeviceError={(e) => setError(e.message)}
-        title={shareAction}
-        aria-label={shareAction}
-      >
-        <Icon name="screen" />
-        <span>{isScreenShareEnabled ? "Stop sharing" : "Share screen"}</span>
-      </TrackToggle>
+      <fieldset className="media-control-guard" disabled={!audioAllowed}>
+        <TrackToggle
+          className="button media-toggle"
+          source={Track.Source.Microphone}
+          showIcon={false}
+          onDeviceError={(e) => setError(e.message)}
+          title={microphoneAction}
+          aria-label={microphoneAction}
+        >
+          <Icon name={audioAllowed && isMicrophoneEnabled ? "mic" : "mic-off"} />
+          <span>
+            {!audioAllowed
+              ? "Mic blocked"
+              : isMicrophoneEnabled
+                ? "Mute"
+                : "Unmute"}
+          </span>
+        </TrackToggle>
+      </fieldset>
+      <fieldset className="media-control-guard" disabled={!videoAllowed}>
+        <TrackToggle
+          className="button media-toggle"
+          source={Track.Source.Camera}
+          showIcon={false}
+          onDeviceError={(e) => setError(e.message)}
+          title={cameraAction}
+          aria-label={cameraAction}
+        >
+          <Icon name={videoAllowed && isCameraEnabled ? "video" : "camera-off"} />
+          <span>
+            {!videoAllowed
+              ? "Camera blocked"
+              : isCameraEnabled
+                ? "Stop video"
+                : "Start video"}
+          </span>
+        </TrackToggle>
+      </fieldset>
+      <fieldset className="media-control-guard" disabled={!videoAllowed}>
+        <TrackToggle
+          className="button media-toggle"
+          source={Track.Source.ScreenShare}
+          showIcon={false}
+          onDeviceError={(e) => setError(e.message)}
+          title={shareAction}
+          aria-label={shareAction}
+        >
+          <Icon name="screen" />
+          <span>{isScreenShareEnabled ? "Stop sharing" : "Share screen"}</span>
+        </TrackToggle>
+      </fieldset>
     </>
   );
 }
@@ -2354,79 +2419,6 @@ function Breakouts({
   );
 }
 
-function Chat({
-  state,
-  send,
-  busy,
-}: {
-  state: MeetingState;
-  send: (text: string) => Promise<boolean>;
-  busy: boolean;
-}) {
-  const [text, setText] = useState("");
-  const bottom = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth" });
-  }, [state.messages.length]);
-  return (
-    <div className="chat-panel">
-      <div className="chat-messages">
-        {state.messages.length === 0 && (
-          <div className="empty-panel">
-            <Icon name="chat" size={30} />
-            <h3>No messages</h3>
-            <p>Messages are visible to participants in this room.</p>
-          </div>
-        )}
-        {state.messages.map((m) => (
-          <article className="chat-message" key={m.id}>
-            <header>
-              <strong>{m.name}</strong>
-              <time>
-                {new Date(m.createdAt).toLocaleTimeString([], {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                })}
-              </time>
-            </header>
-            <p>{m.text}</p>
-          </article>
-        ))}
-        <div ref={bottom} />
-      </div>
-      <form
-        className="chat-compose"
-        onSubmit={async (e) => {
-          e.preventDefault();
-          if (text.trim()) {
-            if (await send(text.trim())) setText("");
-          }
-        }}
-      >
-        <label className="sr-only" htmlFor="chat-text">
-          Message
-        </label>
-        <textarea
-          id="chat-text"
-          placeholder="Message this room"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          maxLength={2000}
-          rows={2}
-        />
-        <Button
-          className="primary small"
-          type="submit"
-          disabled={busy || !text.trim()}
-        >
-          Send
-          <Icon name="arrow" size={16} />
-        </Button>
-      </form>
-    </div>
-  );
-}
-
 function Recordings({
   state,
   config,
@@ -2736,7 +2728,7 @@ function Download({ code, config }: { code: string; config: Config }) {
           This tab no longer contains the download key. Reopen the original
           24-hour link from the meeting.
         </p>
-        <Button onClick={() => navigate("/")}>Control panel</Button>
+        <Button onClick={() => navigate("/")}>{homeLabel()}</Button>
       </Center>
     );
   return (

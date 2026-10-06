@@ -1145,6 +1145,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
             throw new HttpError(403, "Admission required");
           m.messages.push({
             id: randomUUID(),
+            senderId: p.id,
             name: p.name,
             text,
             createdAt: Date.now(),
