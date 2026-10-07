@@ -7,6 +7,8 @@ Meeting content retention is disabled by default. Operators choose the period be
 
 Start in `preview`. Using the existing administrator authentication, send `POST /api/admin/retention/preview` with an empty JSON object. The response reports `scanned`, `eligible`, `blocked`, `missingEndedAt`, `notExpired`, and `nextAfter`. Each request examines at most four ended meetings; repeat with `{"after":"<nextAfter>"}` until `nextAfter` is null. Preview does not change content or timestamps. Production operators use their existing private administrative access; do not expose an admin route to enable retention.
 
+The production Compose template reads these settings from its existing `.env` file; the local HTTPS template forwards them with `0`/`disabled` defaults. For the hosted pilot, set them in its private `pilot.env`. Recreate only the API/core service when changing the settings; do not regenerate deployment secrets.
+
 After reviewing the policy and preview, set the mode to `delete` and restart the API. It examines four meetings per minute, continuing past blocked rooms. A failed pass logs a fixed error message and retries the same page the next minute. Set the mode to `disabled` to stop future passes; removed content can only be recovered from a separately retained backup.
 
 The period starts at the recorded `endedAt`, not meeting creation. Ended meetings from older versions without that timestamp are reported as `missingEndedAt` and excluded; this feature does not guess their age or backdate them.
