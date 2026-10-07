@@ -81,7 +81,7 @@ const occupiesSeat = (p: Participant) =>
   (p.status === "admitted" || p.status === "waiting") &&
   p.expiresAt > Date.now();
 const expiredUnauditedGuest = (p: Participant, now: number) =>
-  // ponytail: retain legacy/audited history; separate history storage if it grows.
+  // Retain legacy/audited history; separate history storage if it grows.
   p.auditReferenced === false &&
   p.role !== "host" &&
   p.transport !== "phone" &&

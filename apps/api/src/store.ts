@@ -843,7 +843,7 @@ export class PgStore implements Store {
         ).rows[0]?.data as UsageLedger | undefined;
         if (!ledger && !missingLedger)
           throw new HttpError(404, "Usage unavailable", "USAGE_UNAVAILABLE");
-        // ponytail: scan retained owner meetings under one pool lock. Large meeting
+        // Scan retained owner meetings under one pool lock. Large meeting
         // histories will need an unsettled-meter index; do not prune recovery state.
         const meetings = (
           await c.query(
