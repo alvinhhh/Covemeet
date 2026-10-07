@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { parseEnv } from "node:util";
 import {
+  EgressClient,
+  EgressStatus,
   RoomServiceClient,
   TrackSource as ServerSource,
 } from "livekit-server-sdk";
@@ -32,6 +34,14 @@ const {
 } = await import("@livekit/rtc-node");
 const envPath = process.env.VALIDATION_ENV_FILE || ".env";
 const env = { ...parseEnv(await readFile(envPath, "utf8")), ...process.env };
+const webinarRecording = env.VALIDATION_WEBINAR_RECORDING === "true";
+assert(!webinarRecording || env.VALIDATION_RECORDING !== "true",
+  "Run webinar recording separately from the ordinary recording cycle");
+const runAbort = new AbortController();
+let cleaningUp = false;
+const requestSignal = (ms) => cleaningUp ? AbortSignal.timeout(ms) :
+  AbortSignal.any([runAbort.signal, AbortSignal.timeout(ms)]);
+const checkRun = () => { if (!cleaningUp) runAbort.signal.throwIfAborted(); };
 const forcedRelay = env.VALIDATION_TURN_TRANSPORT;
 assert(
   !forcedRelay || ["udp", "tls"].includes(forcedRelay),
@@ -59,6 +69,9 @@ const sfu = new RoomServiceClient(
   env.LIVEKIT_API_KEY,
   env.LIVEKIT_API_SECRET || env.LIVEKIT_SECRET,
 );
+const egress = new EgressClient(sfuUrl, env.LIVEKIT_API_KEY,
+  env.LIVEKIT_API_SECRET || env.LIVEKIT_SECRET);
+let recordingOwner;
 const runId = randomUUID();
 const reportPath = path.resolve(
   env.VALIDATION_REPORT || `test-results/media-controls-${runId}.json`,
@@ -86,6 +99,13 @@ const report = {
   checks: [],
   cleanup: {},
 };
+for (const signal of ["SIGTERM", "SIGINT"])
+  process.on(signal, () => {
+    runAbort.abort(new Error("Fixture interrupted"));
+    report.failure ??= { stage: "interrupted", message: "Fixture interrupted" };
+    report.result = "failed";
+    process.exitCode = 1;
+  });
 async function checkpoint(name, evidence = {}) {
   report.checks.push({
     name,
@@ -104,6 +124,7 @@ async function save() {
 async function until(name, work, timeout = 12_000, interval = 150) {
   const deadline = Date.now() + timeout;
   do {
+    checkRun();
     const value = await work();
     if (value) return value;
     await delay(interval);
@@ -112,8 +133,9 @@ async function until(name, work, timeout = 12_000, interval = 150) {
 }
 async function bounded(promise, label, timeout = 15_000) {
   let timer;
+  checkRun();
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       promise,
       new Promise((_, reject) => {
         timer = setTimeout(
@@ -122,6 +144,8 @@ async function bounded(promise, label, timeout = 15_000) {
         );
       }),
     ]);
+    checkRun();
+    return result;
   } finally {
     clearTimeout(timer);
   }
@@ -142,7 +166,7 @@ class Client {
     const response = await fetch(`${apiOrigin}/api${route}`, {
       method,
       redirect: "error",
-      signal: AbortSignal.timeout(15_000),
+      signal: requestSignal(15_000),
       headers: {
         Origin: browserOrigin,
         Cookie: this.header(),
@@ -194,7 +218,7 @@ async function relay(gatewayUrl, cookies, token) {
     try {
       const response = await fetch(target, {
         headers: { Origin: browserOrigin, Cookie: cookies },
-        signal: AbortSignal.timeout(8000),
+        signal: requestSignal(8000),
       });
       res.writeHead(response.status).end(await response.text());
     } catch {
@@ -359,7 +383,7 @@ async function member(peer) {
     throw error;
   }
 }
-async function publish(peer, screenShare = false) {
+async function publish(peer, screenShare = false, marker) {
   const source = new VideoSource(160, 90);
   peer.track = LocalVideoTrack.createVideoTrack(
     "Silent validation video",
@@ -378,9 +402,9 @@ async function publish(peer, screenShare = false) {
     while (!peer.stop) {
       const data = new Uint8Array(160 * 90 * 4);
       for (let i = 0; i < data.length; i += 4) {
-        data[i] = (peer.frames * 13) % 255;
-        data[i + 1] = 120;
-        data[i + 2] = 70;
+        data[i] = marker?.[0] ?? (peer.frames * 13) % 255;
+        data[i + 1] = marker?.[1] ?? 120;
+        data[i + 2] = marker?.[2] ?? 70;
         data[i + 3] = 255;
       }
       source.captureFrame(new VideoFrame(data, 160, 90, VideoBufferType.RGBA));
@@ -626,7 +650,63 @@ async function deniedGateway(
   await checkpoint(label, { gatewayStatuses });
 }
 
-async function recordingCycle(client, code) {
+// Match only this run's exact composite output before observing/stopping Egress.
+async function ownedEgress(owner, cleanup = false) {
+  const rooms = cleanup ? [owner.stageRoom, owner.backstageRoom] : [owner.stageRoom];
+  const jobs = (await Promise.all(rooms.map((roomName) =>
+    bounded(egress.listEgress({ roomName }), "recording jobs")))).flat();
+  assert(jobs.length <= 4, "Unexpected recorder count");
+  const expected = `${env.EGRESS_FILE_ROOT || "/recordings"}/raw/${owner.id}.mp4`;
+  const matches = jobs.filter((job) => {
+    if (!rooms.includes(job.roomName) || (!cleanup && job.roomName === owner.backstageRoom)) return false;
+    const request = job.request;
+    return (request.case === "roomComposite" &&
+      (request.value.fileOutputs.some((output) => output.filepath === expected) ||
+       (request.value.output.case === "file" && request.value.output.value.filepath === expected))) ||
+      (request.case === "egress" && request.value.outputs.some((output) =>
+        output.config.case === "file" && output.config.value.filepath === expected)) ||
+      job.fileResults.some((output) => output.filename === expected || output.location === expected);
+  });
+  if (!cleanup) assert.equal(matches.length, jobs.length, "Unowned recorder in fixture room");
+  return matches;
+}
+const egressTerminal = (job) => [EgressStatus.EGRESS_COMPLETE, EgressStatus.EGRESS_FAILED,
+  EgressStatus.EGRESS_ABORTED, EgressStatus.EGRESS_LIMIT_REACHED].includes(job.status);
+async function cleanupWebinarRecording() {
+  const owner = recordingOwner;
+  if (!owner) return;
+  const route = (suffix = "") => `/meetings/${owner.code}${suffix}`;
+  if (!owner.id) {
+    const rows = (await owner.client.call(route("/state"))).recordings;
+    assert(rows.length <= 1, "Unexpected fixture recording");
+    owner.id = rows[0]?.id;
+    assert(!owner.id || /^[a-f0-9-]{36}$/.test(owner.id), "Invalid fixture recording ID");
+  }
+  if (owner.id) {
+    let failure;
+    try {
+      // Stop through the application first; exact-job fallback handles a lost API reply.
+      await owner.client.call(route(`/recordings/${owner.id}/stop`), {}).catch(() => {});
+      for (const job of await ownedEgress(owner, true))
+        if (!egressTerminal(job))
+          await bounded(egress.stopEgress(job.egressId), "stop fixture recorder").catch(() => {});
+      await until("fixture recorder terminal", async () => {
+        const jobs = await ownedEgress(owner, true);
+        const row = (await owner.client.call(route("/state"))).recordings.find((r) => r.id === owner.id);
+        return !!row && ["ready", "failed", "deleted"].includes(row.status) &&
+          jobs.length > 0 && jobs.every(egressTerminal) &&
+          (!owner.egressId || jobs.some((job) => job.egressId === owner.egressId));
+      }, 60_000, 1000);
+    } catch (error) { failure = error; }
+    try { await owner.client.call(route(`/recordings/${owner.id}/revoke`), {}); }
+    catch (error) { failure ??= error; }
+    if (failure) throw failure;
+  }
+  report.webinarRecording.cleanup = { exactEgressTerminal: true, linkRevoked: true,
+    encryptedFixtureRetainedForNormalRetention: !!owner.id };
+}
+
+async function recordingCycle(client, code, webinar) {
   const mailpit = env.VALIDATION_MAILPIT_URL || "http://mailpit:8025";
   assert(
     ["mailpit", "localhost", "127.0.0.1", "[::1]"].includes(
@@ -647,13 +727,13 @@ async function recordingCycle(client, code) {
       "local Mailpit message",
       async () => {
         const inbox = await fetch(`${mailpit}/api/v1/messages`, {
-          signal: AbortSignal.timeout(8000),
+          signal: requestSignal(8000),
         }).then((r) => r.json());
         for (const message of inbox.messages || []) {
           if (!message.To?.some((to) => to.Address === email)) continue;
           const full = await fetch(
             `${mailpit}/api/v1/message/${encodeURIComponent(message.ID)}`,
-            { signal: AbortSignal.timeout(8000) },
+            { signal: requestSignal(8000) },
           ).then((r) => r.json());
           const found = pattern.exec(full.Text || "");
           if (found) return found[1];
@@ -663,15 +743,38 @@ async function recordingCycle(client, code) {
       30_000,
       1000,
     );
+  if (!webinar || webinar.prepareOnly) {
   await client.call(path("/recordings"), {}, "POST", 403);
   await client.call(path("/host-email"), { email });
   await client.call(path("/verify-email"), {
     otp: await mailText(/Verification code: (\d{6})/),
   });
   await client.call(path(), { recordingAllowed: true }, "PATCH");
+  }
+  if (webinar?.prepareOnly) {
+    await client.call(path("/recordings"), {}, "POST", 409);
+    assert.equal((await client.call(path("/state"))).recordings.length, 0);
+    await checkpoint("webinar recording is rejected backstage after normal host verification and opt-in");
+    return;
+  }
+  if (webinar) {
+    assert.equal((await client.call(path("/state"))).recordings.length, 0);
+    const ownerClient = new Client();
+    ownerClient.cookies = new Map(client.cookies);
+    recordingOwner = { client: ownerClient, code, stageRoom: webinar.stage.roomName,
+      backstageRoom: webinar.backstage.roomName };
+    report.webinarRecording = { code, stageRoom: recordingOwner.stageRoom,
+      backstageRoom: recordingOwner.backstageRoom, contentVerification: "pending" };
+    await save();
+  }
   await client.call(path("/recordings"), {});
   const row = (await client.call(path("/state"))).recordings.at(-1);
-  assert(row?.id, "Recording start returned no recording state");
+  assert(/^[a-f0-9-]{36}$/.test(row?.id || ""), "Recording start returned no valid recording state");
+  if (webinar) {
+    recordingOwner.id = row.id;
+    report.webinarRecording.recordingId = row.id;
+    await save();
+  }
   await checkpoint(
     "optional recording starts only after host email verification and opt-in",
     { recordingId: row.id },
@@ -693,7 +796,33 @@ async function recordingCycle(client, code) {
   await checkpoint(
     "recorder is active before the thirty-second silent capture",
   );
-  await delay(30_000);
+  if (webinar) {
+    const jobs = await ownedEgress(recordingOwner);
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0].status, EgressStatus.EGRESS_ACTIVE);
+    recordingOwner.egressId = jobs[0].egressId;
+    report.webinarRecording.egressId = jobs[0].egressId;
+    let sent = await videoBytes(webinar.backstage);
+    let decoded = webinar.audience.decoded.get(webinar.stage.id) ?? 0;
+    const before = { backstageBytes: sent, stageFrames: decoded };
+    for (let sample = 0; sample < 15; sample++) {
+      await delay(2000);
+      checkRun();
+      const nextSent = await videoBytes(webinar.backstage);
+      const nextDecoded = webinar.audience.decoded.get(webinar.stage.id) ?? 0;
+      assert(nextSent > sent && nextDecoded > decoded, "Media stalled during recording");
+      assert.equal(webinar.audience.decoded.get(webinar.backstage.id) ?? 0, 0);
+      const current = await ownedEgress(recordingOwner);
+      assert.equal(current.length, 1);
+      assert.equal(current[0].egressId, jobs[0].egressId);
+      assert.equal(current[0].status, EgressStatus.EGRESS_ACTIVE);
+      sent = nextSent; decoded = nextDecoded;
+    }
+    await checkpoint("actual webinar recorder targets only stage while backstage RTP and stage reception continue", {
+      egressId: jobs[0].egressId, samples: 15, intervalMilliseconds: 2000, before,
+      after: { backstageBytes: sent, stageFrames: decoded },
+    });
+  } else await delay(30_000);
   await client.call(path(`/recordings/${row.id}/stop`), {});
   await until(
     "encrypted recording ready",
@@ -715,7 +844,7 @@ async function recordingCycle(client, code) {
   let password = await mailText(/Password: (.+)/);
   const response = await fetch(`${apiOrigin}/api${path("/download")}`, {
     method: "POST",
-    signal: AbortSignal.timeout(90_000),
+    signal: requestSignal(90_000),
     headers: {
       Origin: browserOrigin,
       Cookie: client.header(),
@@ -731,12 +860,25 @@ async function recordingCycle(client, code) {
   let bytes = 0,
     prefix = Buffer.alloc(0);
   const hash = createHash("sha256");
-  for await (const chunk of response.body) {
-    bytes += chunk.length;
-    hash.update(chunk);
-    if (prefix.length < 64)
-      prefix = Buffer.concat([prefix, chunk]).subarray(0, 64);
+  let artifact;
+  if (webinar) {
+    const filename = pathForRecordingArtifact();
+    artifact = await open(filename, "wx", 0o600);
+    recordingOwner.plaintext = filename;
+    const info = await artifact.stat();
+    recordingOwner.plaintextIdentity = { dev: info.dev, ino: info.ino };
   }
+  try {
+    for await (const chunk of response.body) {
+      checkRun();
+      bytes += chunk.length;
+      assert(bytes <= 64 * 1024 * 1024, "Recording exceeded fixture download limit");
+      hash.update(chunk);
+      if (artifact) await artifact.writeFile(chunk);
+      if (prefix.length < 64)
+        prefix = Buffer.concat([prefix, chunk]).subarray(0, 64);
+    }
+  } finally { await artifact?.close(); }
   assert(
     bytes > 1024 && prefix.includes(Buffer.from("ftyp")),
     "Download was not a nonempty MP4",
@@ -750,6 +892,11 @@ async function recordingCycle(client, code) {
   await client.call(path(`/recordings/${row.id}/revoke`), {});
   await client.call(path("/download"), { token, password }, "POST", 403);
   password = "";
+  if (webinar) {
+    report.webinarRecording.artifact = { name: `webinar-${runId}.mp4`, bytes,
+      sha256: hash.copy().digest("hex") };
+    await save();
+  }
   await client.call(path(), { recordingAllowed: false }, "PATCH");
   await client.call(path("/recordings"), {}, "POST", 403);
   await checkpoint(
@@ -762,6 +909,10 @@ async function recordingCycle(client, code) {
       passwordDeliveredToLocalMailpit: true,
     },
   );
+}
+
+function pathForRecordingArtifact() {
+  return path.join(path.dirname(reportPath), `webinar-${runId}.mp4`);
 }
 
 const host = new Client(),
@@ -1165,6 +1316,10 @@ try {
     },
   );
 
+  if (webinarRecording) {
+    stage = "webinar recording backstage guard";
+    await recordingCycle(host, code, { prepareOnly: true });
+  }
   stage = "webinar go live";
   await host.call(route("/webinar/start"), {
     expectedRevision: backstageState.meeting.webinar.revision,
@@ -1190,10 +1345,10 @@ try {
   );
   const webinarHostGrant = await media(host);
   webinarHost = await connect(host, webinarHostGrant, true);
-  await publish(webinarHost);
+  await publish(webinarHost, false, webinarRecording ? [32, 64, 224] : undefined);
   let presenterGrant = await media(presenter);
   webinarPresenter = await connect(presenter, presenterGrant, true);
-  await publish(webinarPresenter);
+  await publish(webinarPresenter, false, webinarRecording ? [224, 32, 32] : undefined);
   assert.equal(webinarPresenter.roomName, backstageRoom);
   assert.notEqual(webinarHost.roomName, backstageRoom);
   grant = await media(viewer);
@@ -1207,6 +1362,10 @@ try {
     webinarHost,
     "audience receives live stage frames while backstage RTP remains private",
   );
+  if (webinarRecording) {
+    stage = "webinar recording stage isolation";
+    await recordingCycle(host, code, { stage: webinarHost, backstage: webinarPresenter, audience: peer });
+  }
   let viewerPublishRejected = false;
   try {
     await publish(peer);
@@ -1447,7 +1606,7 @@ try {
     successorGrant,
     "ended handoff room rejects old co-host token",
   );
-  report.result = "passed";
+  report.result = webinarRecording ? "capture-ready" : "passed";
 } catch (error) {
   report.result = "failed";
   report.failure = {
@@ -1460,6 +1619,14 @@ try {
   console.error(`FAIL ${stage}: ${report.failure.message}`);
   process.exitCode = 1;
 } finally {
+  cleaningUp = true;
+  try { await cleanupWebinarRecording(); }
+  catch (error) {
+    report.recordingCleanupFailure = String(error.message || error);
+    report.failure ??= { stage: "webinar recording cleanup", message: report.recordingCleanupFailure };
+    report.result = "failed";
+    process.exitCode = 1;
+  }
   for (const peer of peers) await close(peer).catch(() => {});
   if (code && !ended) {
     for (const client of new Set([endingClient, host])) {
@@ -1490,6 +1657,22 @@ try {
   if (!ended || !roomsRemoved || peers.size) {
     report.result = "failed";
     process.exitCode = 1;
+  }
+  if (recordingOwner?.plaintext && report.result !== "capture-ready") {
+    try {
+      const info = await lstat(recordingOwner.plaintext);
+      assert(info.isFile() && !info.isSymbolicLink());
+      assert.equal(info.dev, recordingOwner.plaintextIdentity.dev);
+      assert.equal(info.ino, recordingOwner.plaintextIdentity.ino);
+      await unlink(recordingOwner.plaintext);
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        report.plaintextCleanupFailed = true;
+        report.failure ??= { stage: "plaintext cleanup", message: "Recording plaintext cleanup failed" };
+        report.result = "failed";
+        process.exitCode = 1;
+      }
+    }
   }
   report.finishedAt = new Date().toISOString();
   await save();

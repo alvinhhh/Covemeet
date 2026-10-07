@@ -82,6 +82,50 @@ Run the container with permission to read only the mounted test secrets and writ
 
 Set `VALIDATION_RECORDING=true` to include the real recorder workflow, after enabling recording on the isolated stack. It verifies default-off behavior, a host OTP delivered only to local Mailpit, an active recorder, 30 seconds of silent video, encrypted-ready status, a 24-hour fragment link, the emailed password download, wrong-password denial, revocation, and recording disabled again. `VALIDATION_MAILPIT_URL` defaults to `http://mailpit:8025` and only accepts the local Mailpit service or a loopback host. The script never prints OTPs, recording passwords, or download capabilities. This check adds several minutes and does not inspect physical storage directly; correlate the recording ID with a separate ciphertext/raw-spool inspection when required.
 
+## Webinar recording privacy
+
+After deploying the matching webinar lifecycle source, run the TLS fixture once with
+`VALIDATION_RECORDING=false` and `VALIDATION_WEBINAR_RECORDING=true`. Keep TURN
+forcing unset. The existing recorder and local Mailpit must already be enabled;
+this fixture does not change infrastructure. Use a fresh private host directory
+(mode 0700) for `/results`, a unique container name, 512 MiB memory and one CPU.
+The first ordinary meeting is not recorded. The webinar uses normal host email
+verification/opt-in, rejects recording backstage, then captures 30 seconds after
+Go live. Stage video is blue; private backstage video is red. No audio, physical
+devices or playback are used.
+
+The fixture checks the actual Egress room/output, ongoing backstage RTP and stage
+reception every two seconds. It downloads one encrypted-ready recording through
+the normal password flow and leaves its plaintext MP4 at mode 0600 beside the
+report. A successful container exits with `result: "capture-ready"`, **not passed**.
+Then run the decoder on the host with its existing `ffmpeg` on PATH (no installation):
+
+```sh
+node scripts/validation/verify-webinar-recording.mjs /absolute/private/results/media-controls.json
+```
+
+This verifies the exact downloaded hash, decodes every video frame with one CPU
+thread and no audio, requires the stage marker in at least 80% of frames, and
+rejects any frame with a backstage marker covering 0.5% or more of its scaled
+160×90 pixels. It writes `passed` only after that check and plaintext removal.
+This is a bounded synthetic recording-content check; smaller/shorter leaks
+outside its measured content are not established by the result.
+
+Allow 12 minutes for capture and 90 seconds for decoding. On timeout, send TERM
+with a 120-second cleanup grace before killing the exact fixture container.
+Retain failures; do not retry automatically. Cleanup attempts the exact recorder
+output in both run-owned rooms, requires terminal Egress evidence plus terminal
+application recording state, revokes the link, and ends the fixture's meetings.
+The encrypted recording and ended audit rows remain under normal retention.
+Verify raw-spool absence and zero active work independently with the existing
+local preservation check. A forced kill still requires scoped cleanup from the
+report. The host decoder removes plaintext even after a verification failure;
+it refuses to unlink a replaced file.
+
+`node scripts/validation/verify-webinar-recording.mjs --self-check` exercises
+marker detection, fragmented decoder output, missing stage and leaked private
+frames without a server or recorder.
+
 ## Native UDP relay diagnostic
 
 The current local native run failed at connection setup: authenticated TURN grants and SFU candidates arrived, but the native client sent no relay candidate before timeout. This is not a passing UDP check; the cause remains unresolved. Use the browser variant below to test the route independently. Retain this command for diagnosis in an approved local environment, separately from other media runs.
