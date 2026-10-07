@@ -278,9 +278,10 @@ async function sendTwilioEmail(
     ],
     content: {
       // Keep user content out of the provider's Liquid template source.
-      subject: "{{ subject }}",
-      text: "{{ text }}",
-      html: "{{ html }}",
+      // Twilio rejects templates when any variable lacks a default filter.
+      subject: "{{ subject | default: 'Covemeet message' }}",
+      text: "{{ text | default: 'Message unavailable.' }}",
+      html: "{{ html | default: 'Message unavailable.' }}",
       ...(mail.messageId ? { headers: { "Message-ID": mail.messageId } } : {}),
       ...(event
         ? {
