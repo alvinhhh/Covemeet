@@ -43,6 +43,7 @@ export type Participant = {
   webinarBackstage?: boolean;
   mediaAllowed?: boolean;
   enforcementPending?: boolean;
+  handRaised?: boolean;
   transport: "browser" | "phone";
   phone?: {
     muted: boolean;

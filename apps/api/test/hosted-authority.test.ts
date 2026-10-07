@@ -666,6 +666,18 @@ test("revocation invalidates exchanged host/guest cookies, signed media and reco
   );
   assert.equal((await f.authority(2, false)).statusCode, 200);
   for (const cookie of [host, guest]) {
+    for (const raised of [true, false])
+      assert.equal(
+        (
+          await f.app.inject({
+            method: "PUT",
+            url: `/api/meetings/${created.code}/participants/${guestId}/hand`,
+            payload: { raised },
+            headers: { origin, "x-requested-with": "MeetingPlatform", cookie },
+          })
+        ).statusCode,
+        410,
+      );
     assert.equal(
       (
         await f.browser(

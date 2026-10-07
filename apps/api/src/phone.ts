@@ -258,7 +258,11 @@ export class PhoneService {
           p.phone.muted = !p.phone.muted;
           fenceParticipantMedia(m, p);
         }
-        if (body.action === "toggle-hand")
+        if (
+          body.action === "toggle-hand" &&
+          p.status === "admitted" &&
+          !p.enforcementPending
+        )
           p.phone.handRaised = !p.phone.handRaised;
       }
       return {

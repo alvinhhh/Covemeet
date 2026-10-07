@@ -381,6 +381,74 @@ test("gateway authentication, exact trunk and call-session binding cannot be byp
   );
 });
 
+test("phone hands share browser state and host lowering without changing media grants", async (t) => {
+  const f = await fixture(t),
+    h = await f.host(),
+    c = await f.call(h);
+  const path = `/api/meetings/${h.code}`;
+  const hand = `${path}/participants/${c.participantId}/hand`;
+  assert.equal((await c.update("toggle-hand")).json().handRaised, false);
+  assert.equal((await h.action(c.participantId, "admit")).statusCode, 200);
+  const before = (await c.update()).json();
+  const raised = (await c.update("toggle-hand")).json();
+  assert.equal(raised.handRaised, true);
+  assert.equal(raised.mediaVersion, before.mediaVersion);
+  assert.equal(raised.mediaIdentity, before.mediaIdentity);
+  assert.equal(raised.muted, before.muted);
+  const participant = (await f.browser("GET", `${path}/state`, {}, h.cookie))
+    .json()
+    .participants.find((p: any) => p.id === c.participantId);
+  assert.equal(participant.handRaised, true);
+  assert.equal(participant.phone.handRaised, true);
+  assert.equal(
+    (await f.browser("PUT", hand, { raised: true }, h.cookie)).statusCode,
+    403,
+  );
+  assert.equal(
+    (
+      await f.browser(
+        "PUT",
+        hand,
+        { raised: false },
+        `mp_${h.code}=${c.sessionToken}`,
+      )
+    ).statusCode,
+    403,
+  );
+  assert.equal(
+    (await f.browser("PUT", hand, { raised: false }, h.cookie)).statusCode,
+    200,
+  );
+  assert.equal((await c.update()).json().handRaised, false);
+  assert.equal((await c.update("toggle-hand")).json().handRaised, true);
+  const stored = (await f.store.get(h.code))!.participants.find(
+    (p) => p.id === c.participantId,
+  )!;
+  assert.equal(stored.handRaised, undefined);
+  assert.equal(stored.mediaVersion, before.mediaVersion);
+  assert.deepEqual(f.media.removed, []);
+  await f.store.change(h.code, (m) =>
+    fenceParticipantMedia(
+      m,
+      m.participants.find((p) => p.id === c.participantId)!,
+    ),
+  );
+  assert.equal(
+    (await c.update("toggle-hand")).json().handRaised,
+    true,
+    "A pending fence cannot toggle a hand before cleanup",
+  );
+  assert.equal(
+    (await f.browser("PUT", hand, { raised: false }, h.cookie)).statusCode,
+    200,
+  );
+  assert.equal(
+    (await f.browser("POST", `${path}/end`, {}, h.cookie)).statusCode,
+    202,
+  );
+  assert.equal((await c.update("toggle-hand")).json().handRaised, false);
+});
+
 test("admission, mute and host permission changes bind real media grants to current lease and version", async (t) => {
   const f = await fixture(t),
     h = await f.host(),

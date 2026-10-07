@@ -2711,6 +2711,19 @@ input[type="radio"] {
 .conference .video-tile.is-speaking {
   border-color: #c5c5c5;
 }
+.conference .tile-hand {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  background: #151515e6;
+  color: #ffffff;
+}
 .conference .speaking-badge {
   display: inline-flex;
   align-items: center;
@@ -2944,6 +2957,7 @@ input[type="radio"] {
   background: transparent;
 }
 .conference .stage-controls .button.media-toggle[data-lk-enabled="true"],
+.conference .stage-controls .button.hand-control.selected,
 .conference .panel-tabs button.selected {
   background: #f4f4f4;
   color: #151515;
@@ -3058,6 +3072,12 @@ input[type="radio"] {
   font-size: 12px;
   color: #666666;
   margin-top: 4px;
+}
+.conference .participant-name .hand-raised {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: #222222;
 }
 .conference .permission-icon {
   color: #555555;

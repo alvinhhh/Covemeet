@@ -57,6 +57,14 @@ import { Whiteboard } from "./whiteboard";
 import { type Viewport } from "./whiteboard-state";
 import { SpeakingBadge } from "./speaking-badge";
 import {
+  admittedWithHandsFirst,
+  applyHandUpdate,
+  HandControl,
+  handRaised,
+  newestMeetingState,
+  type HandUpdate,
+} from "./hand-controls";
+import {
   participantMediaAllowed,
   participantRoomScope,
 } from "./webinar-state";
@@ -828,7 +836,7 @@ function Meeting({
         );
         if (controller.signal.aborted) return;
         onAvailable();
-        setState(data);
+        setState((current) => newestMeetingState(current, data));
         setNeedsJoin(false);
         setError("");
       } catch (e) {
@@ -1013,6 +1021,11 @@ function Meeting({
       state={state}
       networkError={error}
       refresh={() => setRefresh((v) => v + 1)}
+      handChanged={(id, update) =>
+        setState(
+          (current) => current && applyHandUpdate(current, state, id, update),
+        )
+      }
     />
   );
 }
@@ -1105,11 +1118,13 @@ function Conference({
   state,
   networkError,
   refresh,
+  handChanged,
 }: {
   config: Config;
   state: MeetingState;
   networkError: string;
   refresh: () => void;
+  handChanged: (id: string, update: HandUpdate) => void;
 }) {
   const [panel, setPanel] = useState<
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
@@ -1149,6 +1164,8 @@ function Conference({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [handPending, setHandPending] = useState<string | null>(null);
+  const handRequest = useRef(false);
   const leaveDialog = useRef<HTMLDialogElement>(null);
   const [successorId, setSuccessorId] = useState("");
   const handoffAttempt = useRef<
@@ -1263,11 +1280,17 @@ function Conference({
     roomScope,
     mediaAllowed,
   ]);
-  async function mutate(path: string, body: unknown = {}, method?: string) {
+  async function mutate<T = unknown>(
+    path: string,
+    body: unknown = {},
+    method?: string,
+    onSuccess?: (result: T) => void,
+  ) {
     setError("");
     setBusy(true);
     try {
-      await api(meetingPath(code, path), body, method);
+      const result = await api<T>(meetingPath(code, path), body, method);
+      onSuccess?.(result);
       refresh();
       return true;
     } catch (e) {
@@ -1291,6 +1314,22 @@ function Conference({
       setNotice(
         `Meeting link: ${config.meetingOrigin || location.origin}/join/${encodeURIComponent(code)}`,
       );
+    }
+  }
+  async function changeHand(id: string, raised: boolean) {
+    if (busy || handRequest.current) return;
+    handRequest.current = true;
+    setHandPending(id);
+    try {
+      return await mutate<HandUpdate>(
+        `/participants/${encodeURIComponent(id)}/hand`,
+        { raised },
+        "PUT",
+        (result) => handChanged(id, result),
+      );
+    } finally {
+      handRequest.current = false;
+      setHandPending(null);
     }
   }
   const boardScope = `${code}:${roomScope}`;
@@ -1474,6 +1513,8 @@ function Conference({
                 state={state}
                 signals={visibleAudioSignals}
                 busy={busy}
+                handPending={handPending}
+                lowerHand={(id) => changeHand(id, false)}
                 openPhone={
                   host && config.phoneAvailable
                     ? () => setPanel("phone")
@@ -1601,6 +1642,13 @@ function Conference({
                 </>
               )}
             </div>
+            <HandControl
+              me={state.me}
+              ended={state.meeting.ended || webinar?.phase === "ended"}
+              busy={busy}
+              pending={handPending === state.me.id}
+              onChange={(raised) => void changeHand(state.me.id, raised)}
+            />
             <Button
               className="leave-button"
               aria-label="Leave meeting"
@@ -2040,14 +2088,13 @@ function MediaStage({
           >
             {visible.map((track) => {
               const signal = signals.get(track.participant.identity);
+              const participant = participants.find(
+                (participant) =>
+                  participantMediaIdentity(participant) ===
+                  track.participant.identity,
+              );
               const name =
-                participants.find(
-                  (participant) =>
-                    participantMediaIdentity(participant) ===
-                    track.participant.identity,
-                )?.name ||
-                track.participant.name ||
-                "Participant";
+                participant?.name || track.participant.name || "Participant";
               return (
                 <div
                   className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""}`}
@@ -2060,6 +2107,18 @@ function MediaStage({
                       <span className="stage-avatar">{initials(name)}</span>
                     </div>
                   )}
+                  {track.source === Track.Source.Camera &&
+                    participant &&
+                    handRaised(participant) && (
+                      <span
+                        className="tile-hand"
+                        role="img"
+                        aria-label={`${name}: Hand raised`}
+                        title="Hand raised"
+                      >
+                        <Icon name="hand" size={18} />
+                      </span>
+                    )}
                   <div className="tile-caption">
                     <span className="tile-name" title={name}>
                       {name}
@@ -2375,6 +2434,8 @@ function Participants({
   state,
   signals,
   busy,
+  handPending,
+  lowerHand,
   action,
   grant,
   stage,
@@ -2383,6 +2444,8 @@ function Participants({
   state: MeetingState;
   signals: Map<string, AudioSignal>;
   busy: boolean;
+  handPending: string | null;
+  lowerHand: (id: string) => Promise<boolean | undefined>;
   action: (id: string, data: object) => Promise<boolean>;
   grant: (id: string, enabled: boolean) => Promise<boolean>;
   stage: (id: string, location: "backstage" | "stage") => Promise<boolean>;
@@ -2410,7 +2473,7 @@ function Participants({
   const stageFull = !!webinar && webinar.presenters >= webinar.presenterLimit;
   const audienceFull = !!webinar && webinar.viewers >= webinar.viewerLimit;
   const waiting = state.participants.filter((p) => p.status === "waiting");
-  const admitted = state.participants.filter((p) => p.status === "admitted");
+  const admitted = admittedWithHandsFirst(state.participants);
   return (
     <div className="panel-scroll">
       {openPhone && (
@@ -2530,7 +2593,11 @@ function Participants({
                       : "Speaking allowed"}
                 </small>
               )}
-              {p.phone?.handRaised && <small>Hand raised</small>}
+              {handRaised(p) && (
+                <small className="hand-raised">
+                  <Icon name="hand" size={14} /> Hand raised
+                </small>
+              )}
             </div>
             <span
               className={`permission-icon ${p.audioAllowed ? "" : "blocked"}`}
@@ -2588,6 +2655,23 @@ function Participants({
           )}
           {canControl(p) && expanded === p.id && (
             <div className="participant-actions">
+              {handRaised(p) && (
+                <button
+                  disabled={
+                    busy ||
+                    !!handPending ||
+                    !!p.enforcementPending ||
+                    !!state.me.enforcementPending ||
+                    state.meeting.ended ||
+                    webinar?.phase === "ended"
+                  }
+                  aria-label={`Lower ${p.name}'s hand`}
+                  aria-busy={handPending === p.id}
+                  onClick={() => void lowerHand(p.id)}
+                >
+                  {handPending === p.id ? "Lowering…" : "Lower hand"}
+                </button>
+              )}
               <button
                 disabled={busy || p.role === "viewer"}
                 title={

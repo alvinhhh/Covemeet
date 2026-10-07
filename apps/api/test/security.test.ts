@@ -168,6 +168,210 @@ async function fixture(
   return { app, store, media, host, create, meeting, join, action };
 }
 
+test("hands require admission, accept explicit state, and preserve webinar media restrictions", async (t) => {
+  const f = await fixture(t);
+  const room = await f.meeting({ mode: "webinar" });
+  const viewer = await f.join(room.code);
+  const path = `/api/meetings/${room.code}`;
+  const hand = `${path}/participants/${viewer.id}/hand`;
+  for (const raised of [true, false])
+    assert.equal(
+      (await viewer.client.request("PUT", hand, { raised })).statusCode,
+      403,
+    );
+  await f.action(room.code, viewer.id, "admit");
+  const before = (await f.store.get(room.code))!.participants.find(
+    (p) => p.id === viewer.id,
+  )!;
+  const initial = (await viewer.client.request("GET", `${path}/state`)).json();
+  assert.equal(initial.me.handRaised, false);
+  assert.equal(initial.me.mediaAllowed, false);
+  assert.equal(initial.me.audioAllowed, false);
+  assert.equal(initial.me.videoAllowed, false);
+  for (const body of [{}, { raised: "true" }, { raised: true, role: "host" }])
+    assert.equal(
+      (await viewer.client.request("PUT", hand, body)).statusCode,
+      400,
+    );
+  assert.equal(
+    (
+      await viewer.client.request(
+        "PUT",
+        hand,
+        { raised: true },
+        { origin: "https://foreign.example" },
+      )
+    ).statusCode,
+    403,
+  );
+  for (const raised of [true, true, false, false]) {
+    const response = await viewer.client.request("PUT", hand, { raised });
+    ok(response);
+    assert.deepEqual(response.json(), {
+      ok: true,
+      handRaised: raised,
+      revision: (await f.store.get(room.code))!.revision,
+    });
+    const state = (await viewer.client.request("GET", `${path}/state`)).json();
+    assert.equal(state.me.handRaised, raised);
+    const hostState = (await f.host.request("GET", `${path}/state`)).json();
+    assert.equal(
+      hostState.participants.find((p: any) => p.id === viewer.id).handRaised,
+      raised,
+    );
+  }
+  const { handRaised, ...after } = (await f.store.get(
+    room.code,
+  ))!.participants.find((p) => p.id === viewer.id)!;
+  assert.equal(handRaised, false);
+  assert.deepEqual(after, before);
+  assert.deepEqual(f.media.removed, []);
+  assert.deepEqual(f.media.issued, []);
+});
+
+test("hand moderation uses current authority and rejects inactive or stale actors", async (t) => {
+  const f = await fixture(t);
+  const room = await f.meeting();
+  const path = `/api/meetings/${room.code}`;
+  const cohost = await f.join(room.code);
+  const peer = await f.join(room.code, "198.51.100.21");
+  const guest = await f.join(room.code, "198.51.100.22");
+  const hand = (client: Client, id: string, raised: boolean) =>
+    client.request("PUT", `${path}/participants/${id}/hand`, { raised });
+  for (const p of [cohost, peer, guest]) {
+    await f.action(room.code, p.id, "admit");
+    ok(await hand(p.client, p.id, true));
+  }
+  for (const p of [cohost, peer])
+    ok(
+      await f.host.request("PUT", `${path}/participants/${p.id}/moderator`, {
+        enabled: true,
+      }),
+    );
+  ok(await hand(f.host, room.hostId, true));
+  for (const raised of [true, false]) {
+    assert.equal((await hand(guest.client, cohost.id, raised)).statusCode, 403);
+    assert.equal((await hand(cohost.client, peer.id, raised)).statusCode, 403);
+    assert.equal(
+      (await hand(cohost.client, room.hostId, raised)).statusCode,
+      403,
+    );
+  }
+  assert.equal((await hand(f.host, guest.id, true)).statusCode, 403);
+  ok(await hand(f.host, room.hostId, false));
+  ok(await hand(f.host, peer.id, false));
+  ok(await hand(cohost.client, guest.id, false));
+  ok(
+    await f.host.request("PUT", `${path}/participants/${cohost.id}/moderator`, {
+      enabled: false,
+    }),
+  );
+  ok(await hand(guest.client, guest.id, true));
+  assert.equal((await hand(cohost.client, guest.id, false)).statusCode, 403);
+  const original = (await f.store.get(room.code))!.participants.find(
+    (p) => p.id === guest.id,
+  )!;
+  const inactive: Partial<Participant>[] = [
+    { status: "waiting" },
+    { status: "kicked" },
+    { status: "banned" },
+    { status: "left" },
+    { enforcementPending: true },
+    { expiresAt: Date.now() - 1 },
+    { tokenHash: "replaced-session" },
+  ];
+  for (const patch of inactive) {
+    await f.store.change(room.code, (m) =>
+      Object.assign(
+        m.participants.find((p) => p.id === guest.id)!,
+        original,
+        { enforcementPending: false },
+        patch,
+      ),
+    );
+    for (const raised of [true, false])
+      rejected(await hand(guest.client, guest.id, raised));
+    assert.equal(
+      (await f.store.get(room.code))!.participants.find(
+        (p) => p.id === guest.id,
+      )!.handRaised,
+      true,
+    );
+  }
+  await f.store.change(room.code, (m) => {
+    Object.assign(m.participants.find((p) => p.id === guest.id)!, original, {
+      enforcementPending: false,
+    });
+    m.participants.find((p) => p.id === room.hostId)!.enforcementPending = true;
+  });
+  assert.equal((await hand(f.host, guest.id, false)).statusCode, 403);
+  await f.store.change(room.code, (m) => {
+    m.participants.find((p) => p.id === room.hostId)!.enforcementPending =
+      false;
+  });
+  ok(await f.host.request("POST", `${path}/end`, {}));
+  for (const client of [f.host, guest.client])
+    assert.equal((await hand(client, guest.id, false)).statusCode, 410);
+});
+
+test("raised hands follow breakout and webinar roster visibility for guests and co-hosts", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting({ mode: "webinar" });
+  const path = `/api/meetings/${room.code}`;
+  const presenter = await f.join(room.code);
+  const viewer = await f.join(room.code, "198.51.100.21");
+  const cohost = await f.join(room.code, "198.51.100.22");
+  for (const p of [presenter, viewer, cohost])
+    await f.action(room.code, p.id, "admit");
+  await f.action(room.code, presenter.id, "promote");
+  ok(
+    await f.host.request("PUT", `${path}/participants/${cohost.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  const hand = (client: Client, id: string, raised: boolean) =>
+    client.request("PUT", `${path}/participants/${id}/hand`, { raised });
+  ok(await hand(presenter.client, presenter.id, true));
+  ok(await hand(viewer.client, viewer.id, true));
+  for (const client of [viewer.client, cohost.client]) {
+    const state = (await client.request("GET", `${path}/state`)).json();
+    assert.ok(!state.participants.some((p: any) => p.id === presenter.id));
+    assert.equal(
+      state.participants.find((p: any) => p.id === viewer.id).handRaised,
+      true,
+    );
+  }
+  assert.equal(
+    (await hand(cohost.client, presenter.id, false)).statusCode,
+    404,
+  );
+  ok(await hand(f.host, presenter.id, false));
+  ok(await hand(presenter.client, presenter.id, true));
+  ok(await f.host.request("POST", `${path}/breakouts`, { name: "Discussion" }));
+  const breakoutId = (await f.store.get(room.code))!.breakouts[0]!.id;
+  ok(
+    await f.host.request("POST", `${path}/move`, {
+      participantId: presenter.id,
+      breakoutId,
+    }),
+  );
+  const audience = (await viewer.client.request("GET", `${path}/state`)).json();
+  assert.ok(!audience.participants.some((p: any) => p.id === presenter.id));
+  const moderator = (
+    await cohost.client.request("GET", `${path}/state`)
+  ).json();
+  assert.equal(
+    moderator.participants.find((p: any) => p.id === presenter.id).handRaised,
+    true,
+  );
+  ok(await hand(cohost.client, presenter.id, false));
+  const ownRoom = (
+    await presenter.client.request("GET", `${path}/state`)
+  ).json();
+  assert.equal(ownRoom.me.handRaised, false);
+  assert.ok(!ownRoom.participants.some((p: any) => p.id === viewer.id));
+});
+
 test("terminal browser history prunes only expired unaudited guests after cleanup", async (t) => {
   t.mock.timers.enable({ apis: ["setInterval"] });
   const f = await fixture(t);
@@ -1601,6 +1805,53 @@ test("six admitted participants behind one NAT can each poll meeting state norma
         `Shared-NAT state polling failed: ${response.body}`,
       );
   }
+});
+
+test("hand rate limits keep admitted participants behind one NAT independent", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guests = [];
+  for (let i = 0; i < 5; i++) {
+    const guest = await f.join(m.code, "198.51.100.120");
+    await f.action(m.code, guest.id, "admit");
+    guests.push(guest);
+  }
+  for (let round = 0; round < 25; round++)
+    for (const guest of guests)
+      ok(
+        await guest.client.request(
+          "PUT",
+          `/api/meetings/${m.code}/participants/${guest.id}/hand`,
+          { raised: round % 2 === 0 },
+        ),
+      );
+  const first = guests[0]!;
+  for (let i = 0; i < 5; i++)
+    ok(
+      await first.client.request(
+        "PUT",
+        `/api/meetings/${m.code}/participants/${first.id}/hand`,
+        { raised: false },
+      ),
+    );
+  assert.equal(
+    (
+      await first.client.request(
+        "PUT",
+        `/api/meetings/${m.code}/participants/${first.id}/hand`,
+        { raised: true },
+      )
+    ).statusCode,
+    429,
+  );
+  const second = guests[1]!;
+  ok(
+    await second.client.request(
+      "PUT",
+      `/api/meetings/${m.code}/participants/${second.id}/hand`,
+      { raised: false },
+    ),
+  );
 });
 
 test("poll limits reject forged cookie and code rotation before further store reads", async (t) => {

@@ -333,6 +333,17 @@ export async function createApp(config: Config, store: Store, media: Media) {
         (!!p.moderator && meetingController(m)?.id === p.id))
     );
   }
+  function canSeeParticipant(m: Meeting, self: Participant, p: Participant) {
+    return (
+      p.id === self.id ||
+      self.role === "host" ||
+      canManageWebinar(m, self) ||
+      (canModerate(m, self) && !webinarBackstage(m, p)) ||
+      (self.status === "admitted" &&
+        p.status === "admitted" &&
+        participantDataScope(m, p) === participantDataScope(m, self))
+    );
+  }
   function webinarActor(
     req: FastifyRequest,
     m: Meeting,
@@ -1396,6 +1407,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         moderator: canModerate(m, x),
         moderatorRevision: x.moderator?.revision,
         status: x.status,
+        handRaised: x.phone?.handRaised ?? x.handRaised ?? false,
         audioAllowed: x.audioAllowed,
         videoAllowed: x.videoAllowed,
         screenShareAllowed: canShareScreen(x),
@@ -1465,16 +1477,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         },
         me: pub(p),
         participants: m.participants
-          .filter(
-            (x) =>
-              x.id === p.id ||
-              p.role === "host" ||
-              canManageWebinar(m, p) ||
-              (canModerate(m, p) && !webinarBackstage(m, x)) ||
-              (canSee &&
-                x.status === "admitted" &&
-                participantDataScope(m, x) === participantDataScope(m, p)),
-          )
+          .filter((x) => canSeeParticipant(m, p, x))
           .map(pub),
         messages: canSee
           ? [
@@ -1508,6 +1511,53 @@ export async function createApp(config: Config, store: Store, media: Media) {
             : [],
         revision: m.revision,
       };
+    },
+  );
+  app.put(
+    "/api/meetings/:code/participants/:id/hand",
+    {
+      config: {
+        rateLimit: {
+          max: 30,
+          timeWindow: "1 minute",
+          keyGenerator: browserRateKey,
+        },
+      },
+    },
+    async (req) => {
+      const { raised } = z
+        .object({ raised: z.boolean() })
+        .strict()
+        .parse(req.body);
+      const target = (req.params as any).id;
+      return store.change(codeOf(req), (m) => {
+        active(m);
+        const self = actor(req, m);
+        if (self.status !== "admitted" || self.enforcementPending)
+          throw new HttpError(403, "Participant session is inactive");
+        if (target !== self.id) {
+          if (raised) throw new HttpError(403, "Raise only your own hand");
+          moderationActor(req, m);
+        }
+        const p = m.participants.find((x) => x.id === target);
+        if (!p || !canSeeParticipant(m, self, p))
+          throw new HttpError(404, "Participant unavailable");
+        if (
+          target !== self.id &&
+          self.role !== "host" &&
+          (p.role === "host" || !!p.moderator)
+        )
+          throw new HttpError(403, "Another moderator cannot be changed");
+        if (
+          p.status !== "admitted" ||
+          p.expiresAt <= Date.now() ||
+          (p.phone && p.phone.leaseExpiresAt <= Date.now())
+        )
+          throw new HttpError(409, "Participant session is inactive");
+        if (p.phone) p.phone.handRaised = raised;
+        else p.handRaised = raised;
+        return { ok: true, handRaised: raised, revision: m.revision + 1 };
+      });
     },
   );
   app.put("/api/meetings/:code/participants/:id/moderator", async (req) => {

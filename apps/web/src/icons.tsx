@@ -21,6 +21,7 @@ export type IconName =
   | "download"
   | "more"
   | "camera-off"
+  | "hand"
   | "pen";
 
 const paths: Record<IconName, ReactNode> = {
@@ -122,6 +123,9 @@ const paths: Record<IconName, ReactNode> = {
     </>
   ),
   pen: <path d="m3 21 4-.8L20 7.2a2.1 2.1 0 0 0-3-3L4 17.2 3 21ZM14 7l3 3" />,
+  hand: (
+    <path d="M8 13V6a1.5 1.5 0 0 1 3 0v5M11 11V4a1.5 1.5 0 0 1 3 0v7M14 11V5a1.5 1.5 0 0 1 3 0v7M17 12V8a1.5 1.5 0 0 1 3 0v7a7 7 0 0 1-7 7h-1a6 6 0 0 1-5-3l-4-6a1.5 1.5 0 0 1 2.4-1.8L8 15" />
+  ),
 };
 
 export function Icon({
