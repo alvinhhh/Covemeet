@@ -40,7 +40,7 @@ Paid grants have no cumulative monthly meeting-time or recording-time cap. Hoste
 | Deployment | Container setup, persistent volumes, local HTTPS and health/network checks | Fresh-machine installation, signed/provenanced images, separate staging secrets and production rollback |
 | Capacity and cost | Logical participant/stage/concurrency limits and bounded subscriptions | Representative 25/50/100-person meetings, 1,000-viewer webinars, TURN/recording load, node loss, draining and measured cost |
 | Recovery and monitoring | Health checks, selected audit events and scoped failure tests | Off-host backups, restore/reopen drills, RPO/RTO, bounded telemetry and incident exercises |
-| Security operations | Dependency locks and automated source/integration checks | SBOM, image/dependency scanning, provenance, access/secrets rotation and vulnerability response |
+| Security operations | Dependency locks, pinned CI actions, production npm SBOM/audit artifacts and automated source/integration checks | OS/native image scanning, deployed-image provenance, access/secrets rotation and vulnerability response |
 | Private/E2EE mode | Standard media currently trusts the SFU and recorder | Authenticated group keys, rekeying, encrypted collaboration and browser support; phone/recording compatibility must follow the chosen trust model |
 | Organizational controls | Technical control register and documented boundaries | Defined scope, owners, policies, contracts, privacy rights, operating evidence and any required external assessment |
 

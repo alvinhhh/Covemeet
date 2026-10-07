@@ -1,5 +1,16 @@
 # Local verification — 4 October 2026
 
+## Dependency checks
+
+The Checks workflow generates a CycloneDX inventory from the lockfile and audits
+production npm dependencies before installation. Known moderate, high or critical
+vulnerabilities fail the check. The `dependency-security-<commit>` artifact retains
+the inventory, audit result, commit and lockfile hash for 14 days, including failed
+audits. Registry errors also fail the check. OS packages, native libraries and
+deployed-image provenance require separate checks.
+
+## Initial functional checks
+
 Verified against the first Covemeet implementation on the local development stack:
 
 - Browser: host bootstrap and fragment removal; connected WebRTC session; lock/unlock; breakout create, move and return; scoped chat; desktop and mobile layout.

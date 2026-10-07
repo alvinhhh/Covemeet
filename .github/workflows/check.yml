@@ -23,11 +23,30 @@ jobs:
           --health-timeout 3s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           cache: npm
+      - name: Runtime dependency inventory and audit
+        run: |
+          mkdir -p security-results
+          git rev-parse HEAD > security-results/commit.txt
+          sha256sum package-lock.json > security-results/package-lock.sha256
+          npm sbom --package-lock-only --omit=dev --sbom-format=cyclonedx --sbom-type=application > security-results/sbom.cdx.json
+          npm audit --package-lock-only --omit=dev --audit-level=moderate --json > security-results/audit.json
+      - name: Dependency security evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-security-${{ github.sha }}
+          path: |
+            security-results/commit.txt
+            security-results/package-lock.sha256
+            security-results/sbom.cdx.json
+            security-results/audit.json
+          retention-days: 14
+          if-no-files-found: error
       - run: npm ci
       - run: npm run check
       - run: npm test
@@ -50,7 +69,7 @@ jobs:
             node scripts/media-generation-test.mjs --execute-reviewed-fixture
       - name: Media cleanup evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: media-generation-validation
           path: test-results/media-generation/*.json
@@ -59,7 +78,7 @@ jobs:
         run: node scripts/phone-test.mjs
       - name: Phone validation evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: phone-validation
           path: test-results/phone/*.json
