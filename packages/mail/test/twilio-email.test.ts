@@ -57,9 +57,9 @@ test("Twilio Email sends bounded JSON with scoped budget, Basic API key auth and
         },
       ],
       content: {
-        subject: "{{ subject }}",
-        text: "{{ text }}",
-        html: "{{ html }}",
+        subject: "{{ subject | default: 'Covemeet message' }}",
+        text: "{{ text | default: 'Message unavailable.' }}",
+        html: "{{ html | default: 'Message unavailable.' }}",
       },
     });
     return Response.json({ operationId }, { status: 202 });
@@ -93,7 +93,7 @@ test("Twilio Email preserves supplied HTML, Message-ID and calendar request/canc
       icalEvent: { filename: "meeting.ics", method, content },
     });
     const sent = bodies.at(-1).content;
-    assert.equal(sent.html, "{{ html }}");
+    assert.equal(sent.html, "{{ html | default: 'Message unavailable.' }}");
     assert.equal(bodies.at(-1).to[0].variables.html, "<p>Meeting</p>");
     assert.deepEqual(sent.headers, { "Message-ID": messageId });
     assert.equal(sent.attachments.length, 1);
@@ -106,7 +106,7 @@ test("Twilio Email preserves supplied HTML, Message-ID and calendar request/canc
   await mail.close();
 });
 
-test("Twilio Email keeps literal template syntax in recipient variables and cancels oversized responses", async (t) => {
+test("Twilio Email defaults every template variable, keeps user content literal and cancels oversized responses", async (t) => {
   const input = {
     ...message,
     subject: "{{ missing }} {% invalid %}",
@@ -127,9 +127,9 @@ test("Twilio Email keeps literal template syntax in recipient variables and canc
         html: input.html,
       });
       assert.deepEqual(body.content, {
-        subject: "{{ subject }}",
-        text: "{{ text }}",
-        html: "{{ html }}",
+        subject: "{{ subject | default: 'Covemeet message' }}",
+        text: "{{ text | default: 'Message unavailable.' }}",
+        html: "{{ html | default: 'Message unavailable.' }}",
       });
       return new Response(
         new ReadableStream({
