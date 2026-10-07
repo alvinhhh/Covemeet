@@ -32,6 +32,21 @@ export interface SupervisorConfig {
   credentialTimeoutMs?: number;
   maxCallMs?: number;
 }
+type SetupStage =
+  | "endpoint"
+  | "reserve"
+  | "media"
+  | "answer"
+  | "security"
+  | "prompt"
+  | "channel-ended";
+type SecurityFlag = "0" | "1" | "unavailable";
+export interface SetupDiagnostic {
+  stage: SetupStage;
+  signaling: SecurityFlag;
+  media: SecurityFlag;
+  ended: boolean;
+}
 interface Playback {
   id: string;
   finish(error?: Error): void;
@@ -56,6 +71,10 @@ interface Call {
   journal: CallJournal;
   journalStopping?: Promise<void>;
   stopping?: Promise<void>;
+  setupStage: SetupStage;
+  signaling: SecurityFlag;
+  mediaSecurity: SecurityFlag;
+  diagnosticSent: boolean;
 }
 const error = () => new Error("Phone call control unavailable");
 const names = new Set([
@@ -88,6 +107,7 @@ export class SipSupervisor {
       journal: CallJournal,
     ) => SupervisedMedia,
     private journals: Pick<JournalRegistry, "forCall">,
+    private onDiagnostic?: (diagnostic: SetupDiagnostic) => void,
   ) {
     for (const value of [
       config.inboundContext,
@@ -125,6 +145,20 @@ export class SipSupervisor {
   private isClosed(call: Call) {
     return call.phase === "closed";
   }
+  private diagnose(call: Call, stage: SetupStage, ended = this.isClosed(call)) {
+    if (call.diagnosticSent) return;
+    call.diagnosticSent = true;
+    try {
+      this.onDiagnostic?.({
+        stage,
+        signaling: call.signaling,
+        media: call.mediaSecurity,
+        ended,
+      });
+    } catch {
+      // Diagnostics cannot change call control or cleanup.
+    }
+  }
   onEvent(event: AriEvent): void {
     if (event.type === "PlaybackFinished") {
       for (const call of this.calls.values())
@@ -159,6 +193,11 @@ export class SipSupervisor {
           event.type,
         )
       ) {
+        if (
+          event.channel.id === call.channel.id &&
+          ["checking", "code", "pin"].includes(call.phase)
+        )
+          this.diagnose(call, "channel-ended", true);
         void this.stopCall(call).catch(() => {});
       } else if (
         event.type === "ChannelDtmfReceived" &&
@@ -218,6 +257,10 @@ export class SipSupervisor {
       queued: 0,
       queue: Promise.resolve(),
       journal,
+      setupStage: "endpoint",
+      signaling: "unavailable",
+      mediaSecurity: "unavailable",
+      diagnosticSent: false,
       timer: setTimeout(() => {
         void this.stopCall(call).catch(() => {});
       }, this.credentialMs),
@@ -233,30 +276,52 @@ export class SipSupervisor {
       )
         throw error();
       if (this.isClosed(call)) return;
+      call.setupStage = "reserve";
       await call.journal.reserve();
       if (this.isClosed(call)) return;
+      call.setupStage = "media";
       try {
         call.media = this.createMedia(id, channel.id, call.journal);
       } catch {
         await call.journal.uncertain().catch(() => {});
         throw error();
       }
+      call.setupStage = "answer";
       await call.journal.mutate("answer", () => {
         // A journal round trip may finish after local termination. No ARI
         // request has been issued, so this cancellation is definitive.
         if (this.isClosed(call)) throw new AriRequestError("rejected");
         return this.ari.answer(channel.id);
       });
+      call.setupStage = "security";
       const [signaling, media] = await Promise.all([
-        this.ari.getChannelVariable(channel.id, "CHANNEL(pjsip,secure)"),
-        this.ari.getChannelVariable(channel.id, "CHANNEL(rtp,secure)"),
+        this.ari
+          .getChannelVariable(channel.id, "CHANNEL(pjsip,secure)")
+          .then((value) => {
+            call.signaling =
+              value === "1" ? "1" : value === "0" ? "0" : "unavailable";
+            return value;
+          }),
+        this.ari
+          .getChannelVariable(channel.id, "CHANNEL(rtp,secure)")
+          .then((value) => {
+            call.mediaSecurity =
+              value === "1" ? "1" : value === "0" ? "0" : "unavailable";
+            return value;
+          }),
       ]);
       if (signaling !== "1" || media !== "1") throw error();
       if (this.isClosed(call)) return;
       call.phase = "code";
+      call.setupStage = "prompt";
       await this.prompt(call, "code", false);
     })();
-    void call.setup.catch(() => this.stopCall(call)).catch(() => {});
+    void call.setup
+      .catch(() => {
+        this.diagnose(call, call.setupStage);
+        return this.stopCall(call);
+      })
+      .catch(() => {});
   }
   private async digit(call: Call, digit: string) {
     if (

@@ -7,6 +7,7 @@ import {
   type SupervisorAri,
   type SupervisorConfig,
   type SupervisedMedia,
+  type SetupDiagnostic,
 } from "../src/supervisor.js";
 import type { AriChannel } from "../src/ari.js";
 import type {
@@ -42,6 +43,7 @@ const configuration: SupervisorConfig = {
 };
 function fixture(t: TestContext, config: Partial<SupervisorConfig> = {}) {
   const log: string[] = [];
+  const diagnostics: SetupDiagnostic[] = [];
   const joins: JoinInput[] = [];
   const live = new Map<string, AriChannel>();
   const plays: { channelId: string; id: string; sound: string }[] = [];
@@ -167,6 +169,7 @@ function fixture(t: TestContext, config: Partial<SupervisorConfig> = {}) {
       return media;
     },
     { forCall: () => journal },
+    (diagnostic) => diagnostics.push(diagnostic),
   );
   t.after(async () => {
     await supervisor.stop().catch(() => {});
@@ -227,6 +230,7 @@ function fixture(t: TestContext, config: Partial<SupervisorConfig> = {}) {
     media,
     bridge,
     log,
+    diagnostics,
     plays,
     joins,
     pendingPrompts,
@@ -274,6 +278,41 @@ for (const variable of [
     if (variable === "CHANNEL(endpoint)")
       assert.equal(f.log.includes(`answer:${c.id}`), false);
   });
+
+test("failed SRTP check emits only redacted setup state and closes the call", async (t) => {
+  const f = fixture(t);
+  const original = f.ari.getChannelVariable;
+  f.ari.getChannelVariable = (id, name) =>
+    name === "CHANNEL(rtp,secure)" ? Promise.resolve("0") : original(id, name);
+  const c = f.start();
+  await until(() => f.supervisor.status.calls === 0);
+  assert.deepEqual(f.diagnostics, [
+    { stage: "security", signaling: "1", media: "0", ended: false },
+  ]);
+  assert(f.log.includes(`hangup:${c.id}`));
+  assert.equal(f.plays.length, 0);
+  assert.equal(f.joins.length, 0);
+  assert(f.log.includes("journal:finish"));
+});
+
+test("early channel end reports closure without setup values or credentials", async (t) => {
+  const f = fixture(t);
+  const pending = deferred<string>();
+  f.ari.getChannelVariable = () => pending.promise;
+  const c = f.start();
+  f.supervisor.onEvent({ type: "ChannelDestroyed", channel: c });
+  pending.resolve(configuration.inboundEndpoint);
+  await until(() => f.supervisor.status.calls === 0);
+  assert.deepEqual(f.diagnostics, [
+    {
+      stage: "channel-ended",
+      signaling: "unavailable",
+      media: "unavailable",
+      ended: true,
+    },
+  ]);
+  assert.equal(f.plays.length, 0);
+});
 
 test("supervisor accepts exact string credentials, preserves leading zeros, and fixes trunk identity", async (t) => {
   const f = fixture(t),

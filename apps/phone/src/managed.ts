@@ -194,6 +194,11 @@ export async function runManagedPhone(
         journal,
       ),
     registry,
+    (diagnostic) => {
+      console.warn(
+        `Phone setup stage=${diagnostic.stage} signaling=${diagnostic.signaling} media=${diagnostic.media} ended=${diagnostic.ended}`,
+      );
+    },
   );
   signal.addEventListener("abort", stop, { once: true });
   try {
