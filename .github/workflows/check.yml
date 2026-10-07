@@ -28,13 +28,13 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-      - name: Runtime dependency inventory and audit
+      - name: Dependency inventory and audit
         run: |
           mkdir -p security-results
           git rev-parse HEAD > security-results/commit.txt
           sha256sum package-lock.json > security-results/package-lock.sha256
-          npm sbom --package-lock-only --omit=dev --sbom-format=cyclonedx --sbom-type=application > security-results/sbom.cdx.json
-          npm audit --package-lock-only --omit=dev --audit-level=moderate --json > security-results/audit.json
+          npm sbom --package-lock-only --sbom-format=cyclonedx --sbom-type=application > security-results/sbom.cdx.json
+          npm audit --package-lock-only --audit-level=moderate --json > security-results/audit.json
       - name: Dependency security evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

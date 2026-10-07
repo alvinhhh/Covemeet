@@ -3,7 +3,7 @@
 ## Dependency checks
 
 The Checks workflow generates a CycloneDX inventory from the lockfile and audits
-production npm dependencies before installation. Known moderate, high or critical
+all npm dependencies, including build tools, before installation. Known moderate, high or critical
 vulnerabilities fail the check. The `dependency-security-<commit>` artifact retains
 the inventory, audit result, commit and lockfile hash for 14 days, including failed
 audits. Registry errors also fail the check. OS packages, native libraries and

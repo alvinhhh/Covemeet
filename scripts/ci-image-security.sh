@@ -33,6 +33,14 @@ for target in "$@"; do
     > "$output/$name.grype.json" || result=$?
   printf '{"reference":"%s","imageId":"%s","scannerExitCode":%s}\n' \
     "$reference" "$image" "$result" > "$output/$name.image.json"
+  node - "$name" "$output/$name.grype.json" <<'NODE' || status=1
+try {
+  const report = JSON.parse(require("node:fs").readFileSync(process.argv[3], "utf8"));
+  for (const { vulnerability: v, artifact: a } of report.matches ?? [])
+    if (["High", "Critical"].includes(v.severity))
+      console.log(JSON.stringify({ image: process.argv[2], id: v.id, severity: v.severity, artifact: { name: a.name, version: a.version }, fix: { versions: v.fix?.versions ?? [] } }));
+} catch { console.error(`${process.argv[2]}: scan report unavailable`); process.exitCode = 1; }
+NODE
   if [[ $result -ne 0 ]]; then status=1; fi
 done
 exit "$status"
