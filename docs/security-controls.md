@@ -71,3 +71,11 @@ Applicable WebRTC transport references include [RFC 8827](https://www.rfc-editor
 Control alignment is an operating obligation as well as a code obligation. SOC 2 requires defined controls and evidence over the relevant scope; ISO/IEC 27001 includes a maintained information security management system; FedRAMP adds deployment-boundary, assessment, monitoring, and cryptographic requirements. GDPR and HIPAA applicability also depends on data use, roles, contracts, and operating practice. No certification is required to start implementing strong controls, and skipping certification does not establish that all requirements are met.
 
 The first milestone lacks a complete control register, documented owner/evidence for every applicable requirement, validated FIPS cryptographic boundary, independent penetration test, operational recovery evidence, and privacy/legal process validation. Those gaps remain open even when every automated test passes. See the full plan for the control mapping and implementation sequence.
+
+## Hosted account erasure
+
+`POST /api/internal/hosted/accounts/:accountId/erase` accepts `{version}` through the existing machine-authenticated hosted boundary. The account authority must already be disabled at that exact version. An immutable tombstone rejects later creation or authority changes; retries at the same version are idempotent.
+
+Each call works on at most four owned meetings. Recording cleanup uses the existing ownership locks and storage fences. The final transaction requires confirmed media termination, closed phone reservations, settled usage and recording holds, and no active recording writer before removing meeting content, whiteboards, audit entries and closed phone records. `202` means cleanup is still pending; only `200` with `erased:true` confirms completion of this operation. Legacy recording copies without verified attempt inventory require recovery before completion.
+
+Opaque account tombstones and shared billing usage/configuration remain to prevent revival and preserve other hosts' pooled accounting. Provider-retained records, backup copies and deletion-ledger replay on disaster recovery are separate controls. Deploy this core endpoint before enabling the hosted deletion flow.

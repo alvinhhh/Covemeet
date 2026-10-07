@@ -97,6 +97,10 @@ async function fixture(t: TestContext) {
         [accounts],
       );
       await cleanup.query(
+        "DELETE FROM hosted_erasures WHERE account_id=ANY($1::uuid[])",
+        [accounts],
+      );
+      await cleanup.query(
         "DELETE FROM hosted_authorities WHERE account_id=ANY($1::uuid[])",
         [accounts],
       );
@@ -1855,5 +1859,104 @@ test(
       409,
       "Go live retains the original concurrent host reservation",
     );
+  },
+);
+
+test(
+  "PostgreSQL account erasure fences recorder owners and late audit writes across stores",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t);
+    const account = f.account(),
+      foreignAccount = f.account();
+    const made = (await f.create(0, account, randomUUID())).json();
+    const foreign = (await f.create(1, foreignAccount, randomUUID())).json();
+    const id = randomUUID();
+    await f.authority(0, account, 2, false);
+    await f.stores[0].requestHostedErasure(account, 2);
+    await f.stores[0].change(made.code, (m) => {
+      m.hosted!.cleanupConfirmed = true;
+      m.cleanupPending = false;
+      for (const p of m.participants) delete p.enforcementPending;
+      m.recordings.push({
+        id,
+        status: "deleted",
+        createdAt: Date.now(),
+        storage: {
+          billingOwnerId: account,
+          maxBytes: 1000,
+          attempts: [
+            {
+              id: randomUUID(),
+              kind: "local",
+              maxBytes: 1000,
+              state: "released",
+              release: { kind: "unused" },
+            },
+          ],
+        },
+      });
+    });
+    await f.stores[0].withRecordingLock(made.code, id, async () => {
+      assert.equal(await f.stores[1].finishHostedErasure(account, 2), false);
+    });
+    const audit = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+    t.after(() => audit.end());
+    const c = await audit.connect();
+    try {
+      await c.query("BEGIN");
+      await c.query("SELECT code FROM meetings WHERE code=$1 FOR KEY SHARE", [
+        made.code,
+      ]);
+      const deletion = f.stores[1].finishHostedErasure(account, 2);
+      await c.query(
+        "INSERT INTO audit_events(meeting_code,actor,action) VALUES($1,'late-owner','before-delete')",
+        [made.code],
+      );
+      await c.query("COMMIT");
+      assert.equal(await deletion, true);
+    } finally {
+      await c.query("ROLLBACK");
+      c.release();
+    }
+    await f.stores[0].audit(made.code, "late", "after-delete");
+    await f.stores[0].audit(
+      "installation",
+      "operator",
+      "branding.update",
+      account,
+    );
+    try {
+      assert.equal(
+        (
+          await audit.query(
+            "SELECT 1 FROM audit_events WHERE meeting_code='installation' AND actor='operator' AND action='branding.update' AND target=$1",
+            [account],
+          )
+        ).rowCount,
+        1,
+      );
+    } finally {
+      await audit.query(
+        "DELETE FROM audit_events WHERE meeting_code='installation' AND actor='operator' AND action='branding.update' AND target=$1",
+        [account],
+      );
+    }
+    assert.equal(
+      (
+        await audit.query("SELECT 1 FROM audit_events WHERE meeting_code=$1", [
+          made.code,
+        ])
+      ).rowCount,
+      0,
+    );
+    assert.equal(await f.stores[0].get(made.code), null);
+    assert.ok(await f.stores[1].get(foreign.code));
+    assert.equal(
+      (await f.stores[1].requestHostedErasure(account, 2)).erased,
+      true,
+    );
+    assert.equal((await f.authority(1, account, 3, true)).statusCode, 409);
+    assert.equal((await f.create(1, account, randomUUID(), 3)).statusCode, 409);
   },
 );

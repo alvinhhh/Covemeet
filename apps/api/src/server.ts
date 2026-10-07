@@ -1159,6 +1159,35 @@ export async function createApp(config: Config, store: Store, media: Media) {
     });
   });
   app.post(
+    "/api/internal/hosted/accounts/:accountId/erase",
+    async (req, reply) => {
+      const { accountId } = z
+        .object({ accountId: hostedUuid })
+        .strict()
+        .parse(req.params);
+      const { version } = z
+        .object({ version: hostedVersion })
+        .strict()
+        .parse(req.body);
+      const requested = await store.requestHostedErasure(accountId, version);
+      if (!requested.erased) {
+        // Existing control reconciliation stops media and capture; erasure uses
+        // the same owned file cleanup before removing the durable meeting rows.
+        for (const meeting of requested.meetings)
+          await recordings.reconcile(meeting, "files", 4);
+      }
+      const erased =
+        requested.erased ||
+        (await store.finishHostedErasure(accountId, version));
+      return reply.code(erased ? 200 : 202).send({
+        ok: true,
+        version,
+        erased,
+        ...(!erased ? { cleanupPending: true } : {}),
+      });
+    },
+  );
+  app.post(
     "/api/meetings",
     { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
     async (req) => {

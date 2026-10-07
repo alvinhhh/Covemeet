@@ -22,6 +22,7 @@ import nodemailer, { type Transporter } from "nodemailer";
 import {
   LocalKeyProvider,
   encryptRecording,
+  readEncryptionReceipt,
   verifyEncryptedRecording,
   type RecordingObjectStorage,
   type RecordingObjectReference,
@@ -2910,4 +2911,72 @@ test("recording recovery has a fixed 24-hour lifetime even when links are renewe
     ),
     "The separately valid link still exists for the next recovered session",
   );
+});
+
+test("account erasure physically removes owned recordings and closes their storage holds", async (t) => {
+  const f = await fixture(t);
+  await downloadAllowance(f);
+  const owner = (await f.store.get(f.meeting.code))!.hosted!.billingOwnerId!;
+  const attemptId = randomUUID();
+  const ownedFile = path.join(f.config.recordingDir, "encrypted", `${f.recording.id}.${attemptId}.mprec`);
+  await unlink(f.encrypted);
+  await writeFile(f.raw, f.plaintext, { mode: 0o600 });
+  await f.store.change(f.meeting.code, (m) => {
+    const r = m.recordings[0]!;
+    delete r.metadata;
+    r.storage = { billingOwnerId: owner, maxBytes: 1_000_000, attempts: [{ id: attemptId, kind: "local", maxBytes: 1_000_000, state: "reserved" }] };
+  });
+  const provider = new LocalKeyProvider({ keyId: "operator-kek-v1", key: Buffer.from(f.config.recordingKek, "base64") });
+  t.after(() => provider.destroy());
+  await f.store.withRecordingLock(f.meeting.code, f.recording.id, async (lock) => {
+    const context = { tenantId: "installation", meetingId: f.meeting.id, recordingId: f.recording.id };
+    const metadata = await encryptRecording(f.raw, ownedFile, context, provider, {
+      maxEncryptedBytes: 1_000_000,
+      onPrepared: async (prepared) => { await lock.prepareRecordingStorage(attemptId, { kind: "local", metadata: prepared }); },
+    });
+    const receipt = await readEncryptionReceipt(ownedFile, metadata, context);
+    assert.ok(receipt?.published);
+    await lock.retainRecordingStorage(attemptId, { kind: "local", metadata, receipt });
+    await lock.change((m) => {
+      m.recordings[0]!.metadata = metadata;
+      m.recordings[0]!.ciphertextId = attemptId;
+      m.ended = true;
+      m.hosted!.revoked = true;
+      m.hosted!.erasureRequested = true;
+    });
+  });
+  await access(ownedFile);
+  await access(f.raw);
+  await f.service.reconcile((await f.store.get(f.meeting.code))!, "files", 4);
+  const r = (await f.store.get(f.meeting.code))!.recordings[0]!;
+  assert.equal(r.status, "deleted");
+  assert.equal(r.metadata, undefined);
+  assert.equal(r.storage!.attempts[0]!.state, "released");
+  assert.equal(r.storage!.attempts[0]!.release!.kind, "local");
+  await assert.rejects(access(ownedFile), { code: "ENOENT" });
+  await assert.rejects(access(f.raw), { code: "ENOENT" });
+  // The closed-writer marker remains as a fence against reopening the attempt.
+  await access(`${ownedFile}.closed`);
+});
+
+test("account erasure refuses legacy recordings without an owned attempt inventory", async (t) => {
+  const f = await fixture(t);
+  const accountId = randomUUID();
+  await f.store.change(f.meeting.code, (m) => {
+    m.hosted = { accountId, version: 1 };
+  });
+  await f.store.setHostedAuthority({ accountId, version: 2, enabled: false });
+  await f.store.requestHostedErasure(accountId, 2);
+  await f.store.change(f.meeting.code, (m) => {
+    m.cleanupPending = false;
+    m.hosted!.cleanupConfirmed = true;
+    for (const p of m.participants) delete p.enforcementPending;
+  });
+  await f.service.reconcile((await f.store.get(f.meeting.code))!, "files", 4);
+  assert.equal((await f.store.get(f.meeting.code))!.recordings[0]!.status, "ready");
+  await access(f.encrypted);
+  assert.equal(await f.store.finishHostedErasure(accountId, 2), false);
+  // Even a legacy row whose referenced file was deleted is not orphan-copy proof.
+  await f.store.change(f.meeting.code, (m) => { m.recordings[0]!.status = "deleted"; delete m.recordings[0]!.metadata; });
+  assert.equal(await f.store.finishHostedErasure(accountId, 2), false);
 });

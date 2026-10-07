@@ -2589,3 +2589,156 @@ test(
     );
   },
 );
+
+test("account erasure requires the disabled version, removes only its creator data and cannot be revived", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const foreign = (
+    await f.create({ accountId: f.foreignAccountId, operationId: randomUUID() })
+  ).json();
+  const erase = (version = 2, headers = machineHeaders) =>
+    f.internal(`accounts/${f.accountId}/erase`, { version }, headers);
+  assert.equal((await erase()).statusCode, 409);
+  assert.equal((await erase(2, {})).statusCode, 403);
+  await f.store.change(made.code, (m) => {
+    m.hostEmail = "host@example.test";
+    m.messages.push({
+      id: randomUUID(),
+      senderId: m.participants[0]!.id,
+      name: "Host",
+      text: "Private message",
+      createdAt: Date.now(),
+      breakoutId: null,
+    });
+  });
+  f.store.whiteboards.set(`${made.code}\0main`, {
+    seq: 1,
+    epoch: 0,
+    readOnly: false,
+    bytesUsed: 1,
+    events: [],
+  });
+  const foreignBefore = await f.store.get(foreign.code);
+  await f.authority(2, false);
+  assert.equal((await erase(1)).statusCode, 409);
+  const result = await erase();
+  assert.equal(result.statusCode, 200, result.body);
+  assert.deepEqual(result.json(), { ok: true, version: 2, erased: true });
+  assert.equal(await f.store.get(made.code), null);
+  assert.equal(f.store.whiteboards.size, 0);
+  assert.equal(
+    f.store.auditEvents.some((e) => e.code === made.code),
+    false,
+  );
+  await f.store.audit(made.code, "late", "late.callback");
+  await f.store.audit("installation", "operator", "branding.update");
+  assert.ok(
+    f.store.auditEvents.some(
+      (e) => e.code === "installation" && e.action === "branding.update",
+    ),
+  );
+  assert.equal(
+    f.store.auditEvents.some((e) => e.code === made.code),
+    false,
+  );
+  assert.deepEqual(await f.store.get(foreign.code), foreignBefore);
+  assert.ok(f.store.usageLedgers.has(f.billingOwnerId));
+  assert.equal((await erase()).statusCode, 200);
+  assert.equal((await f.authority(3, true)).statusCode, 409);
+  assert.equal((await f.authority(3, false)).statusCode, 409);
+  assert.equal(
+    (await f.create({ version: 3, operationId: randomUUID() })).statusCode,
+    409,
+  );
+});
+
+test("account erasure keeps unknown capture and phone, meter, storage or writer holds pending", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const id = randomUUID(),
+    callId = randomUUID();
+  await f.store.change(made.code, (m) => {
+    m.recordings.push({
+      id,
+      status: "stopping",
+      createdAt: Date.now(),
+      egressId: "unknown-job",
+    });
+  });
+  await f.internal("authority", {
+    accountId: f.accountId,
+    version: 2,
+    enabled: false,
+  });
+  const erase = () =>
+    f.internal(`accounts/${f.accountId}/erase`, { version: 2 });
+  assert.equal((await erase()).statusCode, 202);
+  assert.equal(
+    (await f.store.get(made.code))!.recordings[0]!.status,
+    "stopping",
+  );
+  // This store-level fixture supplies terminal proof separately from the recorder file tests.
+  await f.store.change(made.code, (m) => {
+    m.cleanupPending = false;
+    m.hosted!.cleanupConfirmed = true;
+    for (const p of m.participants) delete p.enforcementPending;
+    m.recordings[0]!.status = "deleted";
+    m.recordings[0]!.timeReservation = {
+      billingOwnerId: f.billingOwnerId,
+      reservedFrom: 1,
+      fundedUntil: 2,
+    };
+  });
+  assert.equal(await f.store.finishHostedErasure(f.accountId, 2), false);
+  await f.store.change(made.code, (m) => {
+    m.recordings[0]!.timeReservation!.settled = { startedAt: 1, endedAt: 2 };
+    m.recordings[0]!.storage = {
+      billingOwnerId: f.billingOwnerId,
+      maxBytes: 1,
+      attempts: [
+        { id: randomUUID(), kind: "local", maxBytes: 1, state: "pending" },
+      ],
+    };
+  });
+  assert.equal(await f.store.finishHostedErasure(f.accountId, 2), false);
+  await f.store.change(made.code, (m) => {
+    m.recordings[0]!.storage!.attempts[0]!.state = "released";
+    m.recordings[0]!.storage!.attempts[0]!.release = { kind: "unused" };
+    m.meetingMeter = { phase: "closing", accountedAt: 1, fundedUntil: 2 };
+  });
+  assert.equal(await f.store.finishHostedErasure(f.accountId, 2), false);
+  await f.store.change(made.code, (m) => {
+    delete m.meetingMeter;
+  });
+  f.store.phoneCalls.set(callId, {
+    code: made.code,
+    participantId: "phone",
+    released: false,
+  });
+  assert.equal(await f.store.finishHostedErasure(f.accountId, 2), false);
+  f.store.phoneCalls.get(callId)!.released = true;
+  await f.store.withRecordingLock(made.code, id, async () => {
+    assert.equal(await f.store.finishHostedErasure(f.accountId, 2), false);
+  });
+  assert.equal(await f.store.finishHostedErasure(f.accountId, 2), true);
+  assert.equal(f.store.phoneCalls.has(callId), false);
+});
+
+test("account erasure advances in four-meeting batches", async (t) => {
+  const f = await fixture(t);
+  for (let i = 0; i < 5; i++)
+    assert.equal(
+      (await f.create({ operationId: randomUUID() })).statusCode,
+      200,
+    );
+  await f.authority(2, false);
+  const first = await f.internal(`accounts/${f.accountId}/erase`, {
+    version: 2,
+  });
+  assert.equal(first.statusCode, 202, first.body);
+  assert.equal((await f.store.hostedMeetings(f.accountId)).length, 1);
+  const second = await f.internal(`accounts/${f.accountId}/erase`, {
+    version: 2,
+  });
+  assert.equal(second.statusCode, 200, second.body);
+});

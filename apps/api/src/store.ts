@@ -222,6 +222,7 @@ export type Meeting = {
     requestHash?: string;
     revoked?: boolean;
     cleanupConfirmed?: boolean;
+    erasureRequested?: boolean;
   };
   limits?: { participants: number; durationSeconds: number };
   lifecycle?: {
@@ -446,6 +447,15 @@ export interface Store {
     authority: HostedAuthority;
     meetings: Meeting[];
   }>;
+  requestHostedErasure(
+    accountId: string,
+    version: number,
+  ): Promise<{
+    version: number;
+    erased: boolean;
+    meetings: Meeting[];
+  }>;
+  finishHostedErasure(accountId: string, version: number): Promise<boolean>;
   hasPhoneReservations(code: string): Promise<boolean>;
   withRecordingLock<T>(
     code: string,
@@ -531,6 +541,40 @@ export type HostedAuthority = {
   version: number;
   enabled: boolean;
 };
+
+function requireErasureVersion(
+  row: { version: number } | undefined,
+  version: number,
+) {
+  if (!row || Number(row.version) !== version)
+    throw new HttpError(409, "Account erasure version conflicts");
+}
+
+function erasureSettled(m: Meeting) {
+  return (
+    m.ended &&
+    m.hosted?.erasureRequested &&
+    m.hosted.revoked &&
+    m.hosted.cleanupConfirmed &&
+    !m.cleanupPending &&
+    !m.meetingMeter &&
+    m.participants.every(
+      (p) => !p.meter && !p.enforcementPending && (!p.phone || p.phone.closed),
+    ) &&
+    m.recordings.every(
+      (r) =>
+        r.status === "deleted" &&
+        !r.rawCleanupPending &&
+        !r.metadata &&
+        !r.delivery &&
+        !r.tokenHash &&
+        !r.passwordHash &&
+        (!r.timeReservation || !!r.timeReservation.settled) &&
+        !!r.storage &&
+        r.storage.attempts.every((a) => a.state === "released" && !!a.release),
+    )
+  );
+}
 
 function requireCurrentHostedRecordingAccess(
   m: Meeting,
@@ -784,6 +828,7 @@ export class PgStore implements Store {
       CREATE INDEX IF NOT EXISTS phone_attempts_bucket ON phone_attempts(bucket);`);
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS hosted_authorities(account_id uuid PRIMARY KEY, version bigint NOT NULL CHECK(version > 0), enabled boolean NOT NULL);
+      CREATE TABLE IF NOT EXISTS hosted_erasures(account_id uuid PRIMARY KEY, version bigint NOT NULL CHECK(version > 0), erased boolean NOT NULL DEFAULT false);
       CREATE UNIQUE INDEX IF NOT EXISTS meetings_hosted_operation ON meetings ((data->'hosted'->>'accountId'), (data->'hosted'->>'operationId')) WHERE data->'hosted'->>'operationId' IS NOT NULL;
       ALTER TABLE hosted_authorities ADD COLUMN IF NOT EXISTS billing_owner_id uuid;
       CREATE TABLE IF NOT EXISTS hosted_entitlements(billing_owner_id uuid PRIMARY KEY, data jsonb NOT NULL);
@@ -1122,6 +1167,14 @@ export class PgStore implements Store {
     return this.hostedTransaction(
       binding.accountId,
       async (c) => {
+        if (
+          (
+            await c.query("SELECT 1 FROM hosted_erasures WHERE account_id=$1", [
+              binding.accountId,
+            ])
+          ).rowCount
+        )
+          throw new HttpError(409, "Account has been deleted");
         await c.query(
           "INSERT INTO hosted_authorities(account_id,version,enabled,billing_owner_id) VALUES($1,$2,true,$3) ON CONFLICT DO NOTHING",
           [binding.accountId, binding.version, binding.billingOwnerId],
@@ -1307,6 +1360,19 @@ export class PgStore implements Store {
         : {}),
     };
     return this.hostedTransaction(input.accountId, async (c) => {
+      const erasure = (
+        await c.query(
+          "SELECT version FROM hosted_erasures WHERE account_id=$1",
+          [input.accountId],
+        )
+      ).rows[0];
+      if (
+        erasure &&
+        (input.enabled ||
+          Number(erasure.version) !== input.version ||
+          input.legacyCodes?.length)
+      )
+        throw new HttpError(409, "Account has been deleted");
       const row = (
         await c.query(
           "SELECT version,enabled,billing_owner_id FROM hosted_authorities WHERE account_id=$1",
@@ -1364,6 +1430,133 @@ export class PgStore implements Store {
         if (m.hosted.revoked && !m.hosted.cleanupConfirmed) meetings.push(m);
       }
       return { authority, meetings };
+    });
+  }
+  async requestHostedErasure(accountId: string, version: number) {
+    accountId = accountId.toLowerCase();
+    return this.hostedTransaction(accountId, async (c) => {
+      let row = (
+        await c.query(
+          "SELECT version,erased FROM hosted_erasures WHERE account_id=$1",
+          [accountId],
+        )
+      ).rows[0];
+      if (!row) {
+        const authority = (
+          await c.query(
+            "SELECT version,enabled FROM hosted_authorities WHERE account_id=$1",
+            [accountId],
+          )
+        ).rows[0];
+        requireErasureVersion(authority, version);
+        if (authority.enabled)
+          throw new HttpError(
+            409,
+            "Disable hosting before deleting an account",
+          );
+        await c.query(
+          "INSERT INTO hosted_erasures(account_id,version) VALUES($1,$2)",
+          [accountId, version],
+        );
+        row = { version, erased: false };
+      }
+      requireErasureVersion(row, version);
+      const meetings = (
+        await c.query(
+          "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1 ORDER BY code LIMIT 4 FOR UPDATE",
+          [accountId],
+        )
+      ).rows.map((r) => r.data as Meeting);
+      for (const m of meetings) {
+        m.hosted!.erasureRequested = true;
+        revokeHostedMeeting(m);
+        m.revision++;
+        await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+          m.code,
+          JSON.stringify(m),
+        ]);
+      }
+      return { version, erased: row.erased as boolean, meetings };
+    });
+  }
+  async finishHostedErasure(accountId: string, version: number) {
+    accountId = accountId.toLowerCase();
+    return this.hostedTransaction(accountId, async (c) => {
+      const row = (
+        await c.query(
+          "SELECT version,erased FROM hosted_erasures WHERE account_id=$1",
+          [accountId],
+        )
+      ).rows[0];
+      requireErasureVersion(row, version);
+      if (row.erased) return true;
+      // Phone mutations take this lock before meeting rows too.
+      await c.query("SELECT pg_advisory_xact_lock(704621938)");
+      const meetings = (
+        await c.query(
+          "SELECT data FROM meetings WHERE data->'hosted'->>'accountId'=$1 ORDER BY code LIMIT 4 FOR UPDATE",
+          [accountId],
+        )
+      ).rows.map((r) => r.data as Meeting);
+      for (const m of meetings) {
+        if (!erasureSettled(m)) continue;
+        let busy = false;
+        for (const r of m.recordings) {
+          const key = JSON.stringify(["recording", m.code, r.id]);
+          if (
+            !(
+              await c.query(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired",
+                [key],
+              )
+            ).rows[0].acquired
+          ) {
+            busy = true;
+            break;
+          }
+        }
+        if (
+          busy ||
+          (
+            await c.query(
+              "SELECT 1 FROM phone_calls WHERE meeting_code=$1 AND released=false UNION ALL SELECT 1 FROM phone_dialogs WHERE data->'binding'->>'code'=$1 AND data->>'state'<>'closed' LIMIT 1",
+              [m.code],
+            )
+          ).rowCount
+        )
+          continue;
+        await c.query("DELETE FROM whiteboard_events WHERE meeting_code=$1", [
+          m.code,
+        ]);
+        await c.query("DELETE FROM whiteboards WHERE meeting_code=$1", [
+          m.code,
+        ]);
+        await c.query("DELETE FROM phone_calls WHERE meeting_code=$1", [
+          m.code,
+        ]);
+        await c.query(
+          "DELETE FROM phone_dialogs WHERE data->'binding'->>'code'=$1",
+          [m.code],
+        );
+        await c.query("DELETE FROM audit_events WHERE meeting_code=$1", [
+          m.code,
+        ]);
+        await c.query("DELETE FROM meetings WHERE code=$1", [m.code]);
+      }
+      if (
+        (
+          await c.query(
+            "SELECT 1 FROM meetings WHERE data->'hosted'->>'accountId'=$1 LIMIT 1",
+            [accountId],
+          )
+        ).rowCount
+      )
+        return false;
+      await c.query(
+        "UPDATE hosted_erasures SET erased=true WHERE account_id=$1",
+        [accountId],
+      );
+      return true;
     });
   }
   async hasPhoneReservations(code: string) {
@@ -2146,7 +2339,7 @@ export class PgStore implements Store {
         audit: async (actor, action, target) => {
           await check();
           await c.query(
-            "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,$3,$4)",
+            "INSERT INTO audit_events(meeting_code,actor,action,target) SELECT code,$2,$3,$4 FROM meetings WHERE code=$1 FOR KEY SHARE",
             [code, actor, action, target],
           );
         },
@@ -2171,7 +2364,9 @@ export class PgStore implements Store {
   }
   async audit(code: string, actor: string, action: string, target?: string) {
     await this.pool.query(
-      "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,$3,$4)",
+      code === "installation"
+        ? "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,$3,$4)"
+        : "INSERT INTO audit_events(meeting_code,actor,action,target) SELECT code,$2,$3,$4 FROM meetings WHERE code=$1 FOR KEY SHARE",
       [code, actor, action, target],
     );
   }
@@ -2182,6 +2377,7 @@ export class PgStore implements Store {
 // Test adapter only; production always uses PostgreSQL transactions.
 export class MemoryStore implements Store {
   hostedAuthorities = new Map<string, HostedAuthority>();
+  hostedErasures = new Map<string, { version: number; erased: boolean }>();
   hostedEntitlements = new Map<string, HostedEntitlement>();
   usageLedgers = new Map<string, UsageLedger>();
   whiteboards = new Map<
@@ -2433,6 +2629,8 @@ export class MemoryStore implements Store {
     m.hosted!.operationId = m.hosted!.operationId?.toLowerCase();
     m.hosted!.billingOwnerId = m.hosted!.billingOwnerId?.toLowerCase();
     return this.serialize(async () => {
+      if (this.hostedErasures.has(m.hosted!.accountId.toLowerCase()))
+        throw new HttpError(409, "Account has been deleted");
       const binding = m.hosted!;
       const authority = this.hostedAuthorities.get(binding.accountId);
       if (
@@ -2515,6 +2713,14 @@ export class MemoryStore implements Store {
         : {}),
     };
     return this.serialize(async () => {
+      const erasure = this.hostedErasures.get(input.accountId);
+      if (
+        erasure &&
+        (input.enabled ||
+          erasure.version !== input.version ||
+          input.legacyCodes?.length)
+      )
+        throw new HttpError(409, "Account has been deleted");
       const authority = nextHostedAuthority(
         this.hostedAuthorities.get(input.accountId),
         input,
@@ -2547,6 +2753,73 @@ export class MemoryStore implements Store {
       }
       this.hostedAuthorities.set(input.accountId, structuredClone(authority));
       return { authority: structuredClone(authority), meetings };
+    });
+  }
+  async requestHostedErasure(accountId: string, version: number) {
+    accountId = accountId.toLowerCase();
+    return this.serialize(async () => {
+      let row = this.hostedErasures.get(accountId);
+      if (!row) {
+        const authority = this.hostedAuthorities.get(accountId);
+        requireErasureVersion(authority, version);
+        if (authority!.enabled)
+          throw new HttpError(
+            409,
+            "Disable hosting before deleting an account",
+          );
+        this.hostedErasures.set(accountId, (row = { version, erased: false }));
+      }
+      requireErasureVersion(row, version);
+      const meetings = [...this.data.values()]
+        .filter((m) => m.hosted?.accountId === accountId)
+        .sort((a, b) => a.code.localeCompare(b.code))
+        .slice(0, 4);
+      for (const m of meetings) {
+        m.hosted!.erasureRequested = true;
+        revokeHostedMeeting(m);
+        m.revision++;
+      }
+      return {
+        version,
+        erased: row.erased,
+        meetings: structuredClone(meetings),
+      };
+    });
+  }
+  async finishHostedErasure(accountId: string, version: number) {
+    accountId = accountId.toLowerCase();
+    return this.serialize(async () => {
+      const row = this.hostedErasures.get(accountId);
+      requireErasureVersion(row, version);
+      if (row!.erased) return true;
+      const meetings = [...this.data.values()]
+        .filter((m) => m.hosted?.accountId === accountId)
+        .sort((a, b) => a.code.localeCompare(b.code))
+        .slice(0, 4);
+      for (const m of meetings) {
+        if (
+          !erasureSettled(m) ||
+          m.recordings.some((r) =>
+            this.recordingLocks.has(JSON.stringify([m.code, r.id])),
+          ) ||
+          (await this.hasPhoneReservations(m.code))
+        )
+          continue;
+        for (const key of this.whiteboards.keys())
+          if (key.startsWith(`${m.code}\0`)) this.whiteboards.delete(key);
+        for (const [key, call] of this.phoneCalls)
+          if (call.code === m.code) this.phoneCalls.delete(key);
+        for (const [key, dialog] of this.phoneDialogs)
+          if (dialog.binding?.code === m.code) this.phoneDialogs.delete(key);
+        this.auditEvents = this.auditEvents.filter((e) => e.code !== m.code);
+        this.data.delete(m.code);
+      }
+      if (
+        [...this.data.values()].some((m) => m.hosted?.accountId === accountId)
+      )
+        return false;
+      row!.erased = true;
+      return true;
     });
   }
   async hasPhoneReservations(code: string) {
@@ -3078,7 +3351,8 @@ export class MemoryStore implements Store {
     target?: string;
   }[] = [];
   async audit(code: string, actor: string, action: string, target?: string) {
-    this.auditEvents.push({ code, actor, action, target });
+    if (code === "installation" || this.data.has(code))
+      this.auditEvents.push({ code, actor, action, target });
   }
   async close() {}
 }

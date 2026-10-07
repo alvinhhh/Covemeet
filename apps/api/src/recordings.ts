@@ -874,6 +874,9 @@ export class RecordingService {
       await this.stop(m, r.id);
   }
   private async finishFiles(m: Meeting, r: Recording, lock: RecordingLock) {
+    // Legacy ciphertext may include uncommitted attempts outside its row. Keep
+    // the erasure pending until an operator reconciles its storage inventory.
+    if (m.hosted?.erasureRequested && !r.storage) return;
     if (r.rawCleanupPending) {
       await lock.check();
       await this.removeFile(this.file(r, true));
@@ -885,6 +888,9 @@ export class RecordingService {
       return;
     }
     if (
+      (m.hosted?.erasureRequested &&
+        !["starting", "recording", "stopping"].includes(r.status) &&
+        (r.status !== "encrypting" || !!r.storage || !!r.metadata)) ||
       r.status === "deleting" ||
       (r.status === "ready" && r.createdAt <= Date.now() - retentionMs)
     ) {
@@ -966,12 +972,15 @@ export class RecordingService {
   async reconcile(
     snapshot: Meeting,
     phase: "capture" | "files" | "all" = "all",
+    limit = Infinity,
   ) {
+    let processed = 0;
     for (const candidate of snapshot.recordings) {
       const capture = ["starting", "recording", "stopping"].includes(
         candidate.status,
       );
       const files =
+        (snapshot.hosted?.erasureRequested && candidate.status !== "deleted") ||
         candidate.rawCleanupPending ||
         ["ready", "deleting", "encrypting"].includes(candidate.status);
       if (
@@ -980,6 +989,7 @@ export class RecordingService {
         (phase === "files" && !files)
       )
         continue;
+      if (processed++ >= limit) break;
       try {
         await this.store.withRecordingLock(
           snapshot.code,
