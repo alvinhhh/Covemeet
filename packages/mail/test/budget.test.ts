@@ -54,15 +54,76 @@ test("already aborted requests and invalid scopes never connect", async (t) => {
     budget.reserve({ ...scope, signal: controller.signal }),
     reason,
   );
-  await assert.rejects(
-    budget.reserve({
-      ...scope,
-      accountId: "not-an-account",
-      signal: new AbortController().signal,
-    }),
-    /Invalid mail budget/,
-  );
+  for (const invalid of [
+    { ...scope, accountId: "not-an-account" },
+    { ...scope, region: "twilio-email" },
+    { ...scope, accountId: `AC${"a".repeat(32)}` },
+    { accountId: `AC${"a".repeat(31)}`, region: "twilio-email" },
+    { accountId: `AC${"g".repeat(32)}`, region: "twilio-email" },
+  ]) {
+    await assert.rejects(
+      budget.reserve({ ...invalid, signal: new AbortController().signal }),
+      /Invalid mail budget/,
+    );
+  }
   await budget.close();
+});
+
+test("Twilio permits keep the shared ledger and canonicalize account casing", async (t) => {
+  const statements: string[] = [];
+  const scopes: unknown[][] = [];
+  let attempts = ["95000"],
+    now = 100000;
+  const client = {
+    async query(sql: string, values?: unknown[]) {
+      statements.push(sql);
+      if (sql.startsWith("SELECT attempts")) {
+        scopes.push(values!);
+        return { rows: [{ attempts }] };
+      }
+      if (sql.includes("clock_timestamp()"))
+        return { rows: [{ now_ms: String(now) }] };
+      if (sql.startsWith("UPDATE public.mail_send_budget"))
+        attempts = (values![2] as number[]).map(String);
+      return { rows: [] };
+    },
+    release() {},
+  } as unknown as pg.PoolClient;
+  t.mock.method(pg.Pool.prototype, "connect", async () => client);
+  t.mock.method(pg.Pool.prototype, "end", async () => {});
+  const budget = createMailBudget(config);
+  try {
+    for (const hex of ["AB".repeat(16), "ab".repeat(16)]) {
+      await budget.reserve({
+        accountId: `AC${hex}`,
+        region: "twilio-email",
+        signal: new AbortController().signal,
+      });
+      now += 1000;
+    }
+    assert.deepEqual(attempts, ["95000", "100000", "101000"]);
+    assert.deepEqual(
+      scopes,
+      Array(2).fill([`AC${"ab".repeat(16)}`, "twilio-email"]),
+    );
+    const lock = statements.findIndex((sql) =>
+      sql.includes("pg_advisory_xact_lock"),
+    );
+    const migration = statements.findIndex((sql) =>
+      sql.includes(
+        "DROP CONSTRAINT IF EXISTS mail_send_budget_account_id_check",
+      ),
+    );
+    assert(lock >= 0 && migration > lock);
+    assert(statements[migration]!.includes("region='twilio-email'"));
+    assert.equal(statements.filter((sql) => sql.startsWith("DO $$")).length, 1);
+    assert.equal(
+      statements.some((sql) => /TRUNCATE|DROP TABLE|DELETE FROM/.test(sql)),
+      false,
+    );
+  } finally {
+    await budget.close();
+  }
 });
 
 test("abort while acquiring a connection releases its eventual client without starting a transaction", async (t) => {

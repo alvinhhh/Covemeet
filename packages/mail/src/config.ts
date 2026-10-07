@@ -1,6 +1,6 @@
 export interface MailConfig {
   production: boolean;
-  mailTransport?: "smtp" | "ses";
+  mailTransport?: "smtp" | "ses" | "twilio-email";
   smtpHost: string;
   smtpPort: number;
   smtpSecure: boolean;
@@ -14,6 +14,11 @@ export interface MailConfig {
     accountId: string;
     roleArn: string;
     configurationSet?: string;
+  };
+  twilioEmail?: {
+    accountId: string;
+    apiKeySid: string;
+    apiKeySecret: string;
   };
 }
 
@@ -68,7 +73,7 @@ export function loadMailConfig(
   defaults: { defaultFrom: string; defaultPort: number },
 ): MailConfig {
   const mode = env.MAIL_TRANSPORT ?? "smtp";
-  if (mode !== "smtp" && mode !== "ses")
+  if (mode !== "smtp" && mode !== "ses" && mode !== "twilio-email")
     throw new Error("Invalid MAIL_TRANSPORT");
   const smtpPort = Number(env.SMTP_PORT ?? defaults.defaultPort);
   if (!Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535)
@@ -117,10 +122,34 @@ export function loadMailConfig(
       throw new Error("Invalid SES_CONFIGURATION_SET");
     config.ses = { region, accountId, roleArn, configurationSet };
   }
+  if (mode === "twilio-email") {
+    const {
+      TWILIO_EMAIL_ACCOUNT_SID: accountId = "",
+      TWILIO_EMAIL_API_KEY_SID: apiKeySid = "",
+      TWILIO_EMAIL_API_KEY_SECRET: apiKeySecret = "",
+    } = env;
+    if (
+      !/^AC[0-9a-fA-F]{32}$/.test(accountId) ||
+      !/^SK[0-9a-fA-F]{32}$/.test(apiKeySid) ||
+      !/^[A-Za-z0-9_-]{32,256}$/.test(apiKeySecret)
+    )
+      throw new Error(
+        "Twilio Email requires an account SID and API key credentials",
+      );
+    if (!config.mailDatabaseUrl)
+      throw new Error("Twilio Email requires MAIL_DATABASE_URL");
+    config.twilioEmail = {
+      accountId: `AC${accountId.slice(2).toLowerCase()}`,
+      apiKeySid,
+      apiKeySecret,
+    };
+  }
   return config;
 }
 
 export function hasMail(config: MailConfig): boolean {
+  if (config.mailTransport === "twilio-email")
+    return Boolean(config.twilioEmail && config.mailDatabaseUrl);
   return config.mailTransport === "ses"
     ? Boolean(config.ses && config.mailDatabaseUrl)
     : Boolean(config.smtpHost);

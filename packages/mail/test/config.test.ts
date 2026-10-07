@@ -67,3 +67,47 @@ test("SES needs explicit account, role, region, durable budget and fixed IMDS", 
   }))
     assert.throws(() => loadMailConfig({ ...ses, [key]: value }, defaults));
 });
+
+test("Twilio Email requires its own credentials and durable budget without AWS configuration", () => {
+  const env = {
+    MAIL_TRANSPORT: "twilio-email",
+    TWILIO_EMAIL_ACCOUNT_SID: "AC" + "A".repeat(32),
+    TWILIO_EMAIL_API_KEY_SID: "SK" + "b".repeat(32),
+    TWILIO_EMAIL_API_KEY_SECRET: "c".repeat(32),
+    MAIL_DATABASE_URL: "postgres://mail:fixture@localhost/mail_test",
+  };
+  const configured = loadMailConfig(env, defaults);
+  assert.equal(configured.mailTransport, "twilio-email");
+  assert.equal(configured.twilioEmail?.accountId, "AC" + "a".repeat(32));
+  assert.equal(configured.ses, undefined);
+  assert.equal(hasMail(configured), true);
+  assert.equal(hasMail({ ...configured, mailDatabaseUrl: undefined }), false);
+  for (const key of [
+    "TWILIO_EMAIL_ACCOUNT_SID",
+    "TWILIO_EMAIL_API_KEY_SID",
+    "TWILIO_EMAIL_API_KEY_SECRET",
+    "MAIL_DATABASE_URL",
+  ])
+    assert.throws(
+      () => loadMailConfig({ ...env, [key]: "" }, defaults),
+      /Twilio Email/,
+    );
+  for (const [key, value] of Object.entries({
+    TWILIO_EMAIL_ACCOUNT_SID: "123456789012",
+    TWILIO_EMAIL_API_KEY_SID: "AC" + "b".repeat(32),
+    TWILIO_EMAIL_API_KEY_SECRET: "private\r\nheader",
+  }))
+    assert.throws(
+      () => loadMailConfig({ ...env, [key]: value }, defaults),
+      /Twilio Email/,
+    );
+  assert.equal(
+    hasMail(
+      loadMailConfig(
+        { ...env, AWS_PROFILE: "unrelated", AWS_EC2_METADATA_DISABLED: "true" },
+        defaults,
+      ),
+    ),
+    true,
+  );
+});

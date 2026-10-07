@@ -95,9 +95,9 @@ function connect(pool: pg.Pool, signal: AbortSignal): Promise<pg.PoolClient> {
 }
 
 /**
- * Shared conservative SES sandbox budget. Both applications must use the same
+ * Shared conservative delivery budget. Both applications must use the same
  * database. Permits are spaced; process/network delays can still bunch arrivals
- * at SES. Consume immediately before dispatch and never refund an uncertain send.
+ * at the provider. Consume immediately before dispatch and never refund an uncertain send.
  */
 export function createMailBudget(
   config: Pick<
@@ -144,12 +144,24 @@ export function createMailBudget(
           "SELECT pg_advisory_xact_lock(hashtextextended('meeting-platform:mail-budget-schema', 0))",
         );
         await client.query(`CREATE TABLE IF NOT EXISTS public.mail_send_budget (
-          account_id text NOT NULL CHECK (account_id ~ '^[0-9]{12}$'),
-          region text NOT NULL CHECK (region ~ '^[a-z]{2}-[a-z]+-[0-9]$'),
+          account_id text NOT NULL,
+          region text NOT NULL,
           attempts bigint[] NOT NULL DEFAULT '{}',
           PRIMARY KEY (account_id, region),
           CHECK (cardinality(attempts) <= 200 AND array_position(attempts, NULL) IS NULL)
         )`);
+        await client.query(`DO $$ BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint
+            WHERE conrelid='public.mail_send_budget'::regclass AND conname='mail_send_budget_scope_check') THEN
+            ALTER TABLE public.mail_send_budget
+              DROP CONSTRAINT IF EXISTS mail_send_budget_account_id_check,
+              DROP CONSTRAINT IF EXISTS mail_send_budget_region_check,
+              ADD CONSTRAINT mail_send_budget_scope_check CHECK (
+                (account_id ~ '^[0-9]{12}$' AND region ~ '^[a-z]{2}-[a-z]+-[0-9]$') OR
+                (account_id ~ '^AC[0-9a-f]{32}$' AND region='twilio-email')
+              );
+          END IF;
+        END $$`);
         signal.throwIfAborted();
         await client.query("COMMIT");
         transaction = false;
@@ -234,15 +246,22 @@ export function createMailBudget(
     async reserve(input) {
       const signal = AbortSignal.any([input.signal, closing.signal]);
       signal.throwIfAborted();
+      const twilio =
+        input.region === "twilio-email" &&
+        /^AC[0-9a-fA-F]{32}$/.test(input.accountId);
       if (
-        !/^\d{12}$/.test(input.accountId) ||
-        !/^[a-z]{2}-[a-z]+-\d$/.test(input.region)
+        !twilio &&
+        (!/^\d{12}$/.test(input.accountId) ||
+          !/^[a-z]{2}-[a-z]+-\d$/.test(input.region))
       )
         throw new Error("Invalid mail budget account or region");
+      const accountId = twilio
+        ? `AC${input.accountId.slice(2).toLowerCase()}`
+        : input.accountId;
       for (;;) {
         let wait: number;
         try {
-          wait = await attempt(input.accountId, input.region, signal);
+          wait = await attempt(accountId, input.region, signal);
         } catch (error) {
           signal.throwIfAborted();
           if (error instanceof DailyBudgetExhausted) throw error;

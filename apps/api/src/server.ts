@@ -147,7 +147,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
     },
   );
   const mailBudget =
-    config.mailTransport === "ses" ? createMailBudget(config) : undefined;
+    config.mailTransport === "ses" || config.mailTransport === "twilio-email"
+      ? createMailBudget(config)
+      : undefined;
   const mail = createMailTransport(config, { budget: mailBudget });
   const recordings = new RecordingService(config, store, mail);
   const phone = new PhoneService(config, store, media);

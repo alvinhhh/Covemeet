@@ -241,6 +241,125 @@ async function sendSmtp(
   }
 }
 
+async function sendTwilioEmail(
+  config: MailConfig,
+  mail: SendMailOptions,
+  budget: MailBudget,
+  signal: AbortSignal,
+): Promise<{ messageId: string }> {
+  const credentials = config.twilioEmail!;
+  const text = mail.text as string | undefined;
+  // Twilio requires HTML. Preserve plain-text-only mail without interpreting it.
+  const html =
+    (mail.html as string | undefined) ??
+    `<pre>${(text ?? "").replace(
+      /[&<>"']/g,
+      (character) =>
+        ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[character]!,
+    )}</pre>`;
+  const event = mail.icalEvent as
+    | { content: string; method?: string; filename?: string }
+    | undefined;
+  const from = mailbox(config.smtpFrom);
+  const name = config.smtpFrom.match(/^([^<>]*)</)?.[1]?.trim();
+  const body = JSON.stringify({
+    from: { address: from, name: name || from },
+    to: [
+      {
+        address: mail.to,
+        variables: { subject: mail.subject, text: text ?? "", html },
+      },
+    ],
+    content: {
+      // Keep user content out of the provider's Liquid template source.
+      subject: "{{ subject }}",
+      text: "{{ text }}",
+      html: "{{ html }}",
+      ...(mail.messageId ? { headers: { "Message-ID": mail.messageId } } : {}),
+      ...(event
+        ? {
+            attachments: [
+              {
+                filename: "meeting.ics",
+                contentType: `text/calendar; charset=utf-8; method=${(event.method ?? "PUBLISH").toUpperCase()}`,
+                content: Buffer.from(event.content, "utf8").toString("base64"),
+              },
+            ],
+          }
+        : {}),
+    },
+  });
+  if (Buffer.byteLength(body) > 2 * 1024 * 1024)
+    throw new Error("Mail message is too large");
+  await abortable(
+    budget.reserve({
+      accountId: credentials.accountId,
+      region: "twilio-email",
+      signal,
+    }),
+    signal,
+  );
+  signal.throwIfAborted();
+  const requestSignal = AbortSignal.any([
+    signal,
+    AbortSignal.timeout(SDK_DEADLINE_MS),
+  ]);
+  const response = await abortable(
+    fetch("https://comms.twilio.com/v1/Emails", {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${credentials.apiKeySid}:${credentials.apiKeySecret}`, "utf8").toString("base64")}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body,
+      signal: requestSignal,
+    }),
+    requestSignal,
+  );
+  if (response.status !== 202) {
+    await response.body?.cancel();
+    throw new Error("Mail was not accepted");
+  }
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Mail acceptance was not confirmed");
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const part = await abortable(reader.read(), requestSignal);
+      if (part.done) break;
+      size += part.value.length;
+      if (size > 65536) throw new Error("Mail provider response too large");
+      chunks.push(part.value);
+    }
+  } catch {
+    await abortable(reader.cancel(), requestSignal).catch(() => {});
+    throw new Error("Mail acceptance was not confirmed");
+  } finally {
+    reader.releaseLock();
+  }
+  const result: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  if (
+    !result ||
+    typeof result !== "object" ||
+    !("operationId" in result) ||
+    typeof result.operationId !== "string" ||
+    !/^comms_operation_[0-7][a-hjkmnpqrstv-z0-9]{25,34}$/.test(
+      result.operationId,
+    )
+  )
+    throw new Error("Mail acceptance was not confirmed");
+  return { messageId: result.operationId };
+}
+
 export function createMailTransport(
   config: MailConfig,
   options: { budget?: MailBudget } = {},
@@ -248,8 +367,9 @@ export function createMailTransport(
 ): MailTransport | undefined {
   if (!hasMail(config)) return undefined;
   const isSes = config.mailTransport === "ses";
-  if (isSes && !options.budget)
-    throw new Error("SES requires a shared durable mail budget");
+  const isTwilioEmail = config.mailTransport === "twilio-email";
+  if ((isSes || isTwilioEmail) && !options.budget)
+    throw new Error("Mail provider requires a shared durable mail budget");
   const sesConfig = config.ses;
   const deps = isSes ? (injected ?? dependencies()) : undefined;
   if (deps) assertInstanceEnvironment(deps.environment());
@@ -270,6 +390,8 @@ export function createMailTransport(
       const deadline = setTimeout(() => controller.abort(), SEND_DEADLINE_MS);
       const signal = controller.signal;
       const task = (async () => {
+        if (isTwilioEmail)
+          return sendTwilioEmail(config, mail, options.budget!, signal);
         if (!isSes) {
           const result = await sendSmtp(config, mail, signal);
           return { messageId: result.messageId };
@@ -350,7 +472,7 @@ export function createMailTransport(
         }
       })()
         .catch(() => {
-          // SDK/SMTP errors can contain destinations, MIME or credential-provider details.
+          // Provider errors can contain destinations, content or credentials.
           throw new Error("Mail delivery was not confirmed");
         })
         .finally(() => {
