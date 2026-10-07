@@ -4,7 +4,7 @@ ARG ASTERISK_VERSION=22.11.0
 ARG LIBXML2_VERSION=2.15.4
 ARG LIBXML2_SHA256=98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821
 ARG ASTERISK_SHA256=3bd5ee040509a3d3cd9b1ba9520c18e6ec0a7e7981ca68c457dcd36ba3c54d94
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl pkg-config python3 \
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl patch pkg-config python3 \
     libssl-dev libsrtp2-dev zlib1g-dev xz-utils libsqlite3-dev libjansson-dev uuid-dev libedit-dev libncurses-dev \
     espeak-ng sox && rm -rf /var/lib/apt/lists/*
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
@@ -20,6 +20,8 @@ WORKDIR /build
 RUN curl --fail --location --retry 3 --max-time 180 "https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-${ASTERISK_VERSION}.tar.gz" -o asterisk.tar.gz \
     && echo "${ASTERISK_SHA256}  asterisk.tar.gz" | sha256sum --check --strict \
     && tar -xzf asterisk.tar.gz --strip-components=1 && rm asterisk.tar.gz
+COPY infra/asterisk/inbound-tls.patch /build/inbound-tls.patch
+RUN patch --batch --fuzz=0 -p1 < /build/inbound-tls.patch
 RUN ./configure --with-pjproject-bundled --with-jansson --with-ssl --with-srtp --without-dahdi --without-pri \
     && make menuselect.makeopts \
     && menuselect/menuselect --disable BUILD_NATIVE --disable-category MENUSELECT_CORE_SOUNDS --disable-category MENUSELECT_MOH --disable-category MENUSELECT_EXTRA_SOUNDS menuselect.makeopts \

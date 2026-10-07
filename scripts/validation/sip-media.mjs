@@ -760,8 +760,9 @@ async function run() {
   assert(
     peers.some((p) => p.kind === 3 && p.identity === "sip_0278c3fed86ac9f4"),
   );
+  assert.equal(transport.inbound["CHANNEL(pjsip,inbound_tls)"], true);
+  assert.equal(transport.outbound["CHANNEL(pjsip,secure)"], true);
   for (const leg of [transport.inbound, transport.outbound]) {
-    assert.equal(leg["CHANNEL(pjsip,secure)"], true);
     assert.equal(leg["CHANNEL(rtp,secure)"], true);
   }
   await check("native call verifies TLS and requires SRTP on both PBX legs", {

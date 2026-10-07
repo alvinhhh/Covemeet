@@ -261,7 +261,7 @@ function fixture(t: TestContext, config: Partial<SupervisorConfig> = {}) {
 
 for (const variable of [
   "CHANNEL(endpoint)",
-  "CHANNEL(pjsip,secure)",
+  "CHANNEL(pjsip,inbound_tls)",
   "CHANNEL(rtp,secure)",
 ] as const)
   test(`supervisor rejects an untrusted ${variable} before credentials or media`, async (t) => {
@@ -279,21 +279,25 @@ for (const variable of [
       assert.equal(f.log.includes(`answer:${c.id}`), false);
   });
 
-test("failed SRTP check emits only redacted setup state and closes the call", async (t) => {
-  const f = fixture(t);
-  const original = f.ari.getChannelVariable;
-  f.ari.getChannelVariable = (id, name) =>
-    name === "CHANNEL(rtp,secure)" ? Promise.resolve("0") : original(id, name);
-  const c = f.start();
-  await until(() => f.supervisor.status.calls === 0);
-  assert.deepEqual(f.diagnostics, [
-    { stage: "security", signaling: "1", media: "0", ended: false },
-  ]);
-  assert(f.log.includes(`hangup:${c.id}`));
-  assert.equal(f.plays.length, 0);
-  assert.equal(f.joins.length, 0);
-  assert(f.log.includes("journal:finish"));
-});
+for (const [variable, signaling, media] of [
+  ["CHANNEL(pjsip,inbound_tls)", "0", "1"],
+  ["CHANNEL(rtp,secure)", "1", "0"],
+] as const)
+  test(`failed ${variable} check emits only redacted setup state and closes the call`, async (t) => {
+    const f = fixture(t);
+    const original = f.ari.getChannelVariable;
+    f.ari.getChannelVariable = (id, name) =>
+      name === variable ? Promise.resolve("0") : original(id, name);
+    const c = f.start();
+    await until(() => f.supervisor.status.calls === 0);
+    assert.deepEqual(f.diagnostics, [
+      { stage: "security", signaling, media, ended: false },
+    ]);
+    assert(f.log.includes(`hangup:${c.id}`));
+    assert.equal(f.plays.length, 0);
+    assert.equal(f.joins.length, 0);
+    assert(f.log.includes("journal:finish"));
+  });
 
 test("early channel end reports closure without setup values or credentials", async (t) => {
   const f = fixture(t);

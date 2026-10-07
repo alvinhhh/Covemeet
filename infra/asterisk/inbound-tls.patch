@@ -1,0 +1,41 @@
+--- a/channels/pjsip/include/chan_pjsip.h
++++ b/channels/pjsip/include/chan_pjsip.h
+@@ -32,6 +32,8 @@
+ 	pj_sockaddr remote_addr;
+ 	/*! \brief Our address that received the request */
+ 	pj_sockaddr local_addr;
++	/*! \brief The initial INVITE arrived on a TLS transport */
++	unsigned int inbound_tls;
+ };
+ 
+ 
+--- a/channels/chan_pjsip.c
++++ b/channels/chan_pjsip.c
+@@ -3233,6 +3233,8 @@
+ 	}
+ 	pj_sockaddr_cp(&transport_data->local_addr, &rdata->tp_info.transport->local_addr);
+ 	pj_sockaddr_cp(&transport_data->remote_addr, &rdata->pkt_info.src_addr);
++	transport_data->inbound_tls = rdata->tp_info.transport->key.type == PJSIP_TRANSPORT_TLS
++		|| rdata->tp_info.transport->key.type == PJSIP_TRANSPORT_TLS6;
+ 	datastore->data = transport_data;
+ 	ast_sip_session_add_datastore(session, datastore);
+ 
+--- a/channels/pjsip/dialplan_functions.c
++++ b/channels/pjsip/dialplan_functions.c
+@@ -338,6 +338,16 @@
+ 		}
+ 	} else if (!strcmp(type, "t38state")) {
+ 		ast_copy_string(buf, t38state_to_string[channel->session->t38state], buflen);
++	} else if (!strcmp(type, "inbound_tls")) {
++		RAII_VAR(struct ast_datastore *, datastore, NULL, ao2_cleanup);
++		struct transport_info_data *transport_data;
++
++		datastore = ast_sip_session_get_datastore(channel->session, "transport_info");
++		if (!datastore) {
++			return -1;
++		}
++		transport_data = datastore->data;
++		snprintf(buf, buflen, "%u", transport_data->inbound_tls);
+ 	} else if (!strcmp(type, "local_addr")) {
+ 		RAII_VAR(struct ast_datastore *, datastore, NULL, ao2_cleanup);
+ 		struct transport_info_data *transport_data;

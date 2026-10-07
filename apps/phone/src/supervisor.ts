@@ -296,7 +296,7 @@ export class SipSupervisor {
       call.setupStage = "security";
       const [signaling, media] = await Promise.all([
         this.ari
-          .getChannelVariable(channel.id, "CHANNEL(pjsip,secure)")
+          .getChannelVariable(channel.id, "CHANNEL(pjsip,inbound_tls)")
           .then((value) => {
             call.signaling =
               value === "1" ? "1" : value === "0" ? "0" : "unavailable";

@@ -72,10 +72,12 @@ export type AriBridge = z.infer<typeof bridgeSchema>;
 export type AriEvent = z.infer<typeof eventSchema>;
 export type AriChannelVariable =
   | "CHANNEL(endpoint)"
+  | "CHANNEL(pjsip,inbound_tls)"
   | "CHANNEL(pjsip,secure)"
   | "CHANNEL(rtp,secure)";
 const variables = new Set<AriChannelVariable>([
   "CHANNEL(endpoint)",
+  "CHANNEL(pjsip,inbound_tls)",
   "CHANNEL(pjsip,secure)",
   "CHANNEL(rtp,secure)",
 ]);
