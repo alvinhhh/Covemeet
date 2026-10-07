@@ -9,6 +9,22 @@ the inventory, audit result, commit and lockfile hash for 14 days, including fai
 audits. Registry errors also fail the check. OS packages, native libraries and
 deployed-image provenance require separate checks.
 
+## Built image checks
+
+CI scans the core image already built for media-generation validation and the
+Asterisk/SIP images already built for native SIP validation. The checksum-pinned
+Grype 0.120.1 binary scans each immutable local image ID without pulling or rebuilding
+the target. High/critical findings, unavailable images and scanner errors fail the
+job; all requested images are attempted even when an earlier scan fails. The JSON
+reports, image IDs, source revision and scanner identity are retained for 14 days
+in `image-security-core-<commit>` or `image-security-sip-<commit>` artifacts.
+
+These reports describe CI-built images, not deployed image digests. Coverage is
+limited to packages and native components the scanner recognizes; copied or
+source-built binaries may not be identified. Hosted, Egress and the production
+phone supervisor images are not built by these jobs and remain outside this
+check. Image signing and authenticated build provenance remain separate requirements.
+
 ## Initial functional checks
 
 Verified against the first Covemeet implementation on the local development stack:

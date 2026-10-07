@@ -8,6 +8,7 @@ on:
       - apps/phone/**
       - apps/api/**
       - scripts/sip-test*.mjs
+      - scripts/ci-image-security.*
       - scripts/validation/sip-*
       - scripts/validation/rtc-fixture.mjs
       - infra/asterisk.Dockerfile
@@ -22,9 +23,9 @@ permissions:
 jobs:
   native-sip:
     runs-on: ubuntu-latest
-    # Bounded steps total 29 minutes, leaving 1 minute for runner/post-step overhead.
+    # Bounded steps total 38 minutes, leaving 2 minutes for runner/post-step overhead.
     # A lost or forcibly killed runner can still prevent recovery and upload.
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         timeout-minutes: 1
@@ -41,6 +42,7 @@ jobs:
         timeout-minutes: 1
         run: node --test --test-concurrency=1 scripts/validation/sip-client.test.mjs scripts/sip-test-support.test.mjs
       - name: Isolated native SIP validation
+        id: native-validation
         timeout-minutes: 20
         run: npm run test:sip
       - name: Scoped SIP recovery
@@ -54,4 +56,17 @@ jobs:
         with:
           name: native-sip-validation
           path: test-results/sip/*.json
+          if-no-files-found: error
+      - name: Built SIP image vulnerabilities
+        if: ${{ !cancelled() && steps.native-validation.outcome != 'skipped' }}
+        timeout-minutes: 8
+        run: bash scripts/ci-image-security.sh asterisk=covemeet-asterisk:local sip=covemeet-sip:local
+      - name: SIP image security evidence
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-security-sip-${{ github.sha }}
+          path: security-results/images/
+          retention-days: 14
           if-no-files-found: error

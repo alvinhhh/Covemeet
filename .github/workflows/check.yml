@@ -55,11 +55,12 @@ jobs:
         env:
           MAIL_TEST_DATABASE_URL: postgres://mail_test:ci-only-mail-test-password@127.0.0.1:5432/covemeet_mail_test
       - name: Local network and relay validation helpers
-        run: node --test scripts/local-network-test.test.mjs scripts/validation/browser-turn.test.mjs
+        run: node --test scripts/local-network-test.test.mjs scripts/validation/browser-turn.test.mjs scripts/ci-image-security.test.mjs
       - run: npm run build
       - name: PostgreSQL certificate validation and plaintext refusal
         run: node scripts/database-tls-test.mjs
       - name: Delayed media cleanup regression
+        id: media-generation
         timeout-minutes: 10
         run: |
           docker pull postgres:17.11-alpine3.23
@@ -83,3 +84,15 @@ jobs:
           name: phone-validation
           path: test-results/phone/*.json
           if-no-files-found: ignore
+      - name: Built core image vulnerabilities
+        if: ${{ !cancelled() && steps.media-generation.outcome != 'skipped' }}
+        timeout-minutes: 8
+        run: bash scripts/ci-image-security.sh core=covemeet-core:generation-test
+      - name: Core image security evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-security-core-${{ github.sha }}
+          path: security-results/images/
+          retention-days: 14
+          if-no-files-found: error
