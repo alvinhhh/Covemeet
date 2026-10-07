@@ -771,6 +771,14 @@ function finishedPhoneParticipant(dialog: PhoneDialog, meeting?: Meeting) {
 }
 export class PgStore implements Store {
   pool: pg.Pool;
+  private meterHeartbeats = new Map<
+    string,
+    {
+      input: MeterInput;
+      resolve: (value: { meeting: Meeting; participant: Participant }) => void;
+      reject: (reason: unknown) => void;
+    }[]
+  >();
   constructor(url: string, transport: { tls?: boolean; ca?: string } = {}) {
     let parsed: URL;
     try {
@@ -999,6 +1007,20 @@ export class PgStore implements Store {
     );
   }
   async updateParticipantMeter(code: string, input: MeterInput) {
+    if (input.action === "heartbeat") {
+      return new Promise<{ meeting: Meeting; participant: Participant }>(
+        (resolve, reject) => {
+          const pending = this.meterHeartbeats.get(code);
+          const request = { input: { ...input }, resolve, reject };
+          if (pending) pending.push(request);
+          else {
+            const queue = [request];
+            this.meterHeartbeats.set(code, queue);
+            void this.flushMeterHeartbeats(code, queue);
+          }
+        },
+      );
+    }
     return this.meetingUsage(
       code,
       (ledger, grant, meetings, m, now) => {
@@ -1017,6 +1039,68 @@ export class PgStore implements Store {
         return { meeting: m, participant: p };
       },
     );
+  }
+  private async flushMeterHeartbeats(
+    code: string,
+    queue: NonNullable<ReturnType<typeof this.meterHeartbeats.get>>,
+  ) {
+    while (queue.length) {
+      const batch = queue.splice(0);
+      try {
+        const results = await this.meetingUsage<
+          PromiseSettledResult<{ meeting: Meeting; participant: Participant }>[]
+        >(
+          code,
+          (ledger, grant, meetings, m, now) => {
+            const failures = new Map<(typeof batch)[number], unknown>();
+            for (const request of batch) {
+              try {
+                updateMeter(ledger, grant, meetings, m, request.input, now);
+              } catch (error) {
+                failures.set(request, error);
+              }
+            }
+            const snapshot = structuredClone(m);
+            return batch.map((request) =>
+              failures.has(request)
+                ? { status: "rejected" as const, reason: failures.get(request) }
+                : {
+                    status: "fulfilled" as const,
+                    value: {
+                      meeting: snapshot,
+                      participant: snapshot.participants.find(
+                        (p) => p.id === request.input.participantId,
+                      )!,
+                    },
+                  },
+            );
+          },
+          async () => {
+            const m = (await this.get(code)) as Meeting | null;
+            if (!m) throw new HttpError(404, "Meeting unavailable");
+            return batch.map(({ input }) => {
+              const p = m.participants.find((p) => p.id === input.participantId);
+              return p
+                ? {
+                    status: "fulfilled" as const,
+                    value: { meeting: m, participant: p },
+                  }
+                : {
+                    status: "rejected" as const,
+                    reason: new HttpError(403, "Media access denied"),
+                  };
+            });
+          },
+        );
+        for (const [i, result] of results.entries()) {
+          if (result.status === "fulfilled") batch[i]!.resolve(result.value);
+          else batch[i]!.reject(result.reason);
+        }
+      } catch (error) {
+        for (const request of batch) request.reject(error);
+      }
+    }
+    this.meterHeartbeats.delete(code);
   }
   async settleParticipantMeter(
     code: string,

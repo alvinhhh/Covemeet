@@ -448,6 +448,181 @@ test(
 );
 
 test(
+  "PostgreSQL queued heartbeats share a transaction without reviving stale or fenced peers",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+    const f = await fixture(t),
+      owner = f.account();
+    const created = await f.create(0, owner, randomUUID());
+    assert.equal(created.statusCode, 200, created.body);
+    const { code, hostToken } = created.json();
+    const started = await f.apps[0].inject({
+      method: "POST",
+      url: `/api/meetings/${code}/host`,
+      headers: browserHeaders,
+      payload: { token: hostToken },
+    });
+    assert.equal(started.statusCode, 200, started.body);
+    await f.stores[0].change(code, (m) => {
+      for (let i = 0; i < 5; i++)
+        m.participants.push({
+          ...m.participants[0]!,
+          id: randomUUID(),
+          name: `Guest ${i}`,
+          role: "participant",
+        });
+    });
+    const peers = ((await f.stores[0].get(code)) as Meeting).participants.map(
+      (p) => ({
+        participantId: p.id,
+        mediaVersion: p.mediaVersion,
+        connectionId: randomUUID(),
+      }),
+    );
+    for (const peer of peers) {
+      await f.stores[0].updateParticipantMeter(code, {
+        ...peer,
+        action: "claim",
+      });
+      await f.stores[0].updateParticipantMeter(code, {
+        ...peer,
+        action: "connected",
+      });
+    }
+    t.mock.timers.tick(1000);
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reading = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    t.after(() => release());
+    const get = f.stores[0].get.bind(f.stores[0]);
+    let reads = 0;
+    const lookup = t.mock.method(
+      f.stores[0],
+      "get",
+      async (current: string) => {
+        const snapshot = await get(current);
+        if (++reads === 1) {
+          entered();
+          await gate;
+        }
+        return snapshot;
+      },
+    );
+    const first = f.stores[0].updateParticipantMeter(code, {
+      ...peers[0]!,
+      action: "heartbeat",
+    });
+    await reading;
+    const pending = Promise.allSettled([
+      first,
+      ...[1, 3, 4, 5, 1].map((i) =>
+        f.stores[0].updateParticipantMeter(code, {
+          ...peers[i]!,
+          action: "heartbeat",
+        }),
+      ),
+    ]);
+    // Another process changes authority after the queued heartbeat's lookup.
+    await f.stores[1].updateParticipantMeter(code, {
+      ...peers[3]!,
+      action: "claim",
+      connectionId: "replacement",
+    });
+    await f.stores[1].change(code, (m) => {
+      fenceParticipantMedia(m, m.participants[4]!);
+      m.participants[5]!.meter!.presenceUntil = Date.now() - 1;
+    });
+    const other = f.stores[1].updateParticipantMeter(code, {
+      ...peers[2]!,
+      action: "heartbeat",
+    });
+    release();
+    const results = await pending;
+    await other;
+    assert.deepEqual(
+      results.map((r) => r.status),
+      [
+        "fulfilled",
+        "fulfilled",
+        "rejected",
+        "rejected",
+        "rejected",
+        "fulfilled",
+      ],
+    );
+    assert.equal(
+      reads,
+      2,
+      "one owner lookup for each committed heartbeat batch",
+    );
+    lookup.mock.restore();
+    const queued = results[1]!;
+    const last = results[5]!;
+    assert.equal(queued.status, "fulfilled");
+    assert.equal(last.status, "fulfilled");
+    if (queued.status !== "fulfilled" || last.status !== "fulfilled") return;
+    assert.equal(queued.value.meeting, last.value.meeting);
+    queued.value.meeting.title = "Detached result";
+    const current = (await f.stores[1].get(code)) as Meeting;
+    assert.equal(current.title, meeting.title);
+    for (const i of [0, 1, 2])
+      assert.equal(
+        current.participants[i]!.meter!.presenceUntil,
+        Date.now() + 15000,
+      );
+    assert.equal(current.participants[3]!.meter!.connectionId, "replacement");
+    for (const i of [4, 5]) {
+      assert.equal(current.participants[i]!.meter!.phase, "closing");
+      assert.equal(current.participants[i]!.enforcementPending, true);
+      assert.equal(
+        current.participants[i]!.mediaVersion,
+        peers[i]!.mediaVersion + 1,
+      );
+    }
+    const guard = `heartbeat_commit_${randomUUID().replaceAll("-", "")}`;
+    await f.stores[1].pool.query(`
+      CREATE FUNCTION ${guard}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF NEW.billing_owner_id = '${owner}'::uuid THEN
+          RAISE EXCEPTION 'Heartbeat commit rejected';
+        END IF;
+        RETURN NEW;
+      END $$;
+      CREATE CONSTRAINT TRIGGER ${guard} AFTER UPDATE ON hosted_usage
+      DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ${guard}()
+    `);
+    try {
+      t.mock.timers.tick(1000);
+      const failed = await Promise.allSettled(
+        peers.slice(0, 3).map((peer) =>
+          f.stores[0].updateParticipantMeter(code, {
+            ...peer,
+            action: "heartbeat",
+          }),
+        ),
+      );
+      for (const result of failed) {
+        assert.equal(result.status, "rejected");
+        if (result.status === "rejected")
+          assert.match(result.reason.message, /Heartbeat commit rejected/);
+      }
+      assert.deepEqual(await f.stores[1].get(code), current);
+    } finally {
+      await f.stores[1].pool.query(`
+        DROP TRIGGER ${guard} ON hosted_usage;
+        DROP FUNCTION ${guard}()
+      `);
+    }
+  },
+);
+
+test(
   "PostgreSQL meeting reservations serialize per room across pools and survive a process restart",
   { skip: !databaseUrl, timeout: 30000 },
   async (t) => {
