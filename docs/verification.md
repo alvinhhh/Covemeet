@@ -2,12 +2,13 @@
 
 ## Dependency checks
 
-The Checks workflow generates a CycloneDX inventory from the lockfile and audits
-all npm dependencies, including build tools, before installation. Known moderate, high or critical
-vulnerabilities fail the check. The `dependency-security-<commit>` artifact retains
-the inventory, audit result, commit and lockfile hash for 14 days, including failed
-audits. Registry errors also fail the check. OS packages, native libraries and
-deployed-image provenance require separate checks.
+The Checks workflow audits the full npm lockfile, including development and build
+dependencies, before installation. After `npm ci`, it generates a CycloneDX inventory
+of the actual installed tree, including build tools and the runner's platform-specific
+packages. Known moderate, high or critical vulnerabilities and command failures fail
+the check. The `dependency-security-<commit>` artifact retains generated inventory,
+audit result, commit and lockfile hash for 14 days, including failed audits. OS packages,
+native libraries and deployed-image provenance require separate checks.
 
 ## Built image checks
 

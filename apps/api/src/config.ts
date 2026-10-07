@@ -166,6 +166,22 @@ export function loadConfig(env = process.env) {
     0,
   );
   const freeMaxActiveRooms = boundedLimit("FREE_MAX_ACTIVE_ROOMS", 1, 1000);
+  const meetingDataRetentionDays = boundedLimit(
+    "MEETING_DATA_RETENTION_DAYS",
+    0,
+    36500,
+    0,
+  );
+  const meetingDataRetentionMode =
+    env.MEETING_DATA_RETENTION_MODE ?? "disabled";
+  if (!["disabled", "preview", "delete"].includes(meetingDataRetentionMode))
+    throw new Error(
+      "MEETING_DATA_RETENTION_MODE must be disabled, preview or delete",
+    );
+  if (meetingDataRetentionMode !== "disabled" && !meetingDataRetentionDays)
+    throw new Error(
+      "Set MEETING_DATA_RETENTION_DAYS before enabling retention",
+    );
   return {
     meetingParticipantLimit,
     webinarParticipantLimit,
@@ -175,6 +191,8 @@ export function loadConfig(env = process.env) {
         ? 300
         : boundedLimit("HOST_ABSENCE_GRACE_SECONDS", 300, 1800, 30),
     freeMaxActiveRooms,
+    meetingDataRetentionDays,
+    meetingDataRetentionMode,
     secret,
     origin,
     portalOrigin,

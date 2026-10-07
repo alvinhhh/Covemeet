@@ -460,6 +460,7 @@ export function holdsMeetingReservation(m: Meeting) {
 export function endMeeting(m: Meeting) {
   if (m.ended) return false;
   m.ended = true;
+  m.endedAt = Date.now();
   m.cleanupPending = true;
   m.locked = true;
   m.recordingAllowed = false;

@@ -249,6 +249,8 @@ export type Meeting = {
   };
   locked: boolean;
   ended: boolean;
+  endedAt?: number;
+  retentionPurgedAt?: number;
   recordingAllowed: boolean;
   chatMode?: "everyone" | "host-only" | "disabled";
   createdAt: number;
@@ -410,7 +412,21 @@ function recordingTimeMethods(
       }),
   };
 }
+export type RetentionBatch = {
+  scanned: number;
+  eligible: number;
+  purged: number;
+  blocked: number;
+  missingEndedAt: number;
+  notExpired: number;
+  nextAfter: string | null;
+};
 export interface Store {
+  retainEndedMeetings(
+    cutoff: number,
+    dryRun: boolean,
+    after?: string,
+  ): Promise<RetentionBatch>;
   hostedUsage(billingOwnerId: string): Promise<ReturnType<typeof usageView>>;
   debitRecordingDownload(
     code: string,
@@ -556,6 +572,12 @@ function erasureSettled(m: Meeting) {
     m.hosted?.erasureRequested &&
     m.hosted.revoked &&
     m.hosted.cleanupConfirmed &&
+    settledMeetingContent(m)
+  );
+}
+
+function settledMeetingContent(m: Meeting) {
+  return (
     !m.cleanupPending &&
     !m.meetingMeter &&
     m.participants.every(
@@ -574,6 +596,78 @@ function erasureSettled(m: Meeting) {
         r.storage.attempts.every((a) => a.state === "released" && !!a.release),
     )
   );
+}
+
+function retentionState(
+  m: Meeting,
+  cutoff: number,
+): "eligible" | "blocked" | "missingEndedAt" | "notExpired" {
+  if (!m.ended || m.retentionPurgedAt) return "notExpired";
+  if (!Number.isSafeInteger(m.endedAt) || m.endedAt! < m.createdAt)
+    return "missingEndedAt";
+  if (m.endedAt! > cutoff) return "notExpired";
+  return m.cleanupPending === false &&
+    (!m.lifecycle || m.lifecycle.cleanupConfirmed === true) &&
+    settledMeetingContent(m)
+    ? "eligible"
+    : "blocked";
+}
+
+function retentionTombstone(m: Meeting): Meeting {
+  return {
+    id: m.id,
+    code: m.code,
+    room: m.room,
+    mode: m.mode,
+    title: "",
+    createdAt: m.createdAt,
+    endedAt: m.endedAt,
+    retentionPurgedAt: Date.now(),
+    revision: m.revision + 1,
+    ended: true,
+    locked: true,
+    cleanupPending: false,
+    recordingAllowed: false,
+    passwordHash: "",
+    hostTokenExpiresAt: 0,
+    participants: [],
+    messages: [],
+    recordings: [],
+    breakouts: [],
+    bans: { ip: [], device: [] },
+    ...(m.hosted
+      ? {
+          hosted: {
+            accountId: m.hosted.accountId,
+            billingOwnerId: m.hosted.billingOwnerId,
+            version: m.hosted.version,
+            operationId: m.hosted.operationId,
+            requestHash: m.hosted.requestHash,
+            brandingProfileId: m.hosted.brandingProfileId,
+            revoked: true,
+            cleanupConfirmed: true,
+            ...(m.hosted.erasureRequested ? { erasureRequested: true } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+function retentionResult(rows: Meeting[]): RetentionBatch {
+  return {
+    scanned: rows.length,
+    eligible: 0,
+    purged: 0,
+    blocked: 0,
+    missingEndedAt: 0,
+    notExpired: 0,
+    nextAfter: rows.length === 4 ? rows.at(-1)!.code : null,
+  };
+}
+
+function validateRetentionCutoff(cutoff: number) {
+  if (!Number.isSafeInteger(cutoff) || cutoff < 0 || cutoff > Date.now())
+    throw new HttpError(400, "Invalid retention cutoff");
 }
 
 function requireCurrentHostedRecordingAccess(
@@ -686,6 +780,7 @@ function revokeHostedMeeting(m: Meeting) {
   delete m.recordingAccess;
   delete m.recordingRecovery;
   m.cleanupPending = true;
+  if (!m.ended) m.endedAt = Date.now();
   m.ended = true;
   m.locked = true;
   m.recordingAllowed = false;
@@ -843,6 +938,7 @@ export class PgStore implements Store {
       CREATE TABLE IF NOT EXISTS hosted_usage(billing_owner_id uuid PRIMARY KEY, data jsonb NOT NULL);
       CREATE INDEX IF NOT EXISTS meetings_billing_owner ON meetings ((data->'hosted'->>'billingOwnerId'));
       CREATE INDEX IF NOT EXISTS meetings_hosted_account ON meetings ((data->'hosted'->>'accountId'));
+      CREATE INDEX IF NOT EXISTS meetings_retention_ended ON meetings(code) WHERE data->>'ended'='true' AND NOT (data ? 'retentionPurgedAt');
       CREATE TABLE IF NOT EXISTS whiteboards(
         meeting_code text NOT NULL REFERENCES meetings(code),
         scope text NOT NULL,
@@ -1493,6 +1589,7 @@ export class PgStore implements Store {
       );
       const meetings: Meeting[] = [];
       for (const m of rows) {
+        if (m.retentionPurgedAt && !m.hosted) continue;
         m.hosted ??= { accountId: input.accountId, version: 0 };
         if (
           (m.hosted.version < authority.version || !authority.enabled) &&
@@ -1642,6 +1739,89 @@ export class PgStore implements Store {
       );
       return true;
     });
+  }
+  async retainEndedMeetings(cutoff: number, dryRun: boolean, after = "") {
+    validateRetentionCutoff(cutoff);
+    const rows = (
+      await this.pool.query(
+        "SELECT data FROM meetings WHERE code>$1 AND data->>'ended'='true' AND NOT (data ? 'retentionPurgedAt') ORDER BY code LIMIT 4",
+        [after],
+      )
+    ).rows.map((row) => row.data as Meeting);
+    const result = retentionResult(rows);
+    for (const snapshot of rows) {
+      await this.hostedTransaction(
+        snapshot.hosted?.accountId ?? `retention:${snapshot.code}`,
+        async (c) => {
+          await c.query("SELECT pg_advisory_xact_lock(704621938)");
+          const m = (
+            await c.query(
+              "SELECT data FROM meetings WHERE code=$1 FOR UPDATE",
+              [snapshot.code],
+            )
+          ).rows[0]?.data as Meeting | undefined;
+          if (!m) {
+            result.notExpired++;
+            return;
+          }
+          let state = retentionState(m, cutoff);
+          if (
+            m.hosted?.accountId !== snapshot.hosted?.accountId ||
+            m.hosted?.billingOwnerId !== snapshot.hosted?.billingOwnerId
+          )
+            state = "blocked";
+          if (state === "eligible") {
+            for (const r of m.recordings) {
+              if (
+                !(
+                  await c.query(
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired",
+                    [JSON.stringify(["recording", m.code, r.id])],
+                  )
+                ).rows[0].acquired
+              ) {
+                state = "blocked";
+                break;
+              }
+            }
+            if (
+              (
+                await c.query(
+                  "SELECT 1 FROM phone_calls WHERE meeting_code=$1 AND released=false UNION ALL SELECT 1 FROM phone_dialogs WHERE data->'binding'->>'code'=$1 AND data->>'state'<>'closed' LIMIT 1",
+                  [m.code],
+                )
+              ).rowCount
+            )
+              state = "blocked";
+          }
+          result[state]++;
+          if (state !== "eligible" || dryRun) return;
+          await c.query("DELETE FROM whiteboard_events WHERE meeting_code=$1", [
+            m.code,
+          ]);
+          await c.query("DELETE FROM whiteboards WHERE meeting_code=$1", [
+            m.code,
+          ]);
+          await c.query("DELETE FROM phone_calls WHERE meeting_code=$1", [
+            m.code,
+          ]);
+          await c.query(
+            "DELETE FROM phone_dialogs WHERE data->'binding'->>'code'=$1",
+            [m.code],
+          );
+          await c.query("DELETE FROM audit_events WHERE meeting_code=$1", [
+            m.code,
+          ]);
+          await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
+            m.code,
+            JSON.stringify(retentionTombstone(m)),
+          ]);
+          result.purged++;
+        },
+        snapshot.hosted?.billingOwnerId,
+      );
+    }
+    return result;
   }
   async hasPhoneReservations(code: string) {
     return !!(
@@ -2423,7 +2603,7 @@ export class PgStore implements Store {
         audit: async (actor, action, target) => {
           await check();
           await c.query(
-            "INSERT INTO audit_events(meeting_code,actor,action,target) SELECT code,$2,$3,$4 FROM meetings WHERE code=$1 FOR KEY SHARE",
+            "INSERT INTO audit_events(meeting_code,actor,action,target) SELECT code,$2,$3,$4 FROM meetings WHERE code=$1 AND NOT (data ? 'retentionPurgedAt') FOR KEY SHARE",
             [code, actor, action, target],
           );
         },
@@ -2450,7 +2630,7 @@ export class PgStore implements Store {
     await this.pool.query(
       code === "installation"
         ? "INSERT INTO audit_events(meeting_code,actor,action,target) VALUES($1,$2,$3,$4)"
-        : "INSERT INTO audit_events(meeting_code,actor,action,target) SELECT code,$2,$3,$4 FROM meetings WHERE code=$1 FOR KEY SHARE",
+        : "INSERT INTO audit_events(meeting_code,actor,action,target) SELECT code,$2,$3,$4 FROM meetings WHERE code=$1 AND NOT (data ? 'retentionPurgedAt') FOR KEY SHARE",
       [code, actor, action, target],
     );
   }
@@ -2820,6 +3000,7 @@ export class MemoryStore implements Store {
         throw new HttpError(409, "Legacy meeting belongs to another account");
       const meetings: Meeting[] = [];
       for (const m of rows) {
+        if (m.retentionPurgedAt && !m.hosted) continue;
         m.hosted ??= { accountId: input.accountId, version: 0 };
         if (
           (m.hosted.version < authority.version || !authority.enabled) &&
@@ -2904,6 +3085,39 @@ export class MemoryStore implements Store {
         return false;
       row!.erased = true;
       return true;
+    });
+  }
+  async retainEndedMeetings(cutoff: number, dryRun: boolean, after = "") {
+    validateRetentionCutoff(cutoff);
+    return this.serialize(async () => {
+      const rows = [...this.data.values()]
+        .filter((m) => m.code > after && m.ended && !m.retentionPurgedAt)
+        .sort((a, b) => (a.code < b.code ? -1 : a.code > b.code ? 1 : 0))
+        .slice(0, 4);
+      const result = retentionResult(rows);
+      for (const m of rows) {
+        let state = retentionState(m, cutoff);
+        if (
+          state === "eligible" &&
+          (m.recordings.some((r) =>
+            this.recordingLocks.has(JSON.stringify([m.code, r.id])),
+          ) ||
+            (await this.hasPhoneReservations(m.code)))
+        )
+          state = "blocked";
+        result[state]++;
+        if (state !== "eligible" || dryRun) continue;
+        for (const key of this.whiteboards.keys())
+          if (key.startsWith(`${m.code}\0`)) this.whiteboards.delete(key);
+        for (const [key, call] of this.phoneCalls)
+          if (call.code === m.code) this.phoneCalls.delete(key);
+        for (const [key, dialog] of this.phoneDialogs)
+          if (dialog.binding?.code === m.code) this.phoneDialogs.delete(key);
+        this.auditEvents = this.auditEvents.filter((e) => e.code !== m.code);
+        this.data.set(m.code, retentionTombstone(m));
+        result.purged++;
+      }
+      return result;
     });
   }
   async hasPhoneReservations(code: string) {
@@ -3435,7 +3649,10 @@ export class MemoryStore implements Store {
     target?: string;
   }[] = [];
   async audit(code: string, actor: string, action: string, target?: string) {
-    if (code === "installation" || this.data.has(code))
+    if (
+      code === "installation" ||
+      (this.data.has(code) && !this.data.get(code)!.retentionPurgedAt)
+    )
       this.auditEvents.push({ code, actor, action, target });
   }
   async close() {}

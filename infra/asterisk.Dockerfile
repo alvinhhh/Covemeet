@@ -18,7 +18,9 @@ RUN sh /build/prompts.sh /staging/var/lib/asterisk/sounds/en
 
 FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3t64 libsrtp2-1 libxml2 \
-    libsqlite3-0 libjansson4 libuuid1 libedit2 libncurses6 libstdc++6 && rm -rf /var/lib/apt/lists/* \
+    libsqlite3-0 libjansson4 libuuid1 libedit2 libncurses6 libstdc++6 libpcre2-8-0 \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libpcre2-8-0)" ge '10.46-1~deb13u3' \
+    && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 10001 asterisk && useradd -u 10001 -g asterisk -M -s /usr/sbin/nologin asterisk
 COPY --from=build /staging/usr/ /usr/
 COPY --from=build /staging/var/lib/asterisk/ /var/lib/asterisk/

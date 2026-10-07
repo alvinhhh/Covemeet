@@ -659,6 +659,27 @@ export async function createApp(config: Config, store: Store, media: Media) {
       return { ok: true };
     },
   );
+  app.post("/api/admin/retention/preview", async (req) => {
+    admin(req);
+    const { after } = z
+      .object({ after: z.string().max(100).optional() })
+      .strict()
+      .parse(req.body);
+    if (!config.meetingDataRetentionDays)
+      throw new HttpError(
+        409,
+        "Set MEETING_DATA_RETENTION_DAYS before previewing retention",
+      );
+    return {
+      mode: config.meetingDataRetentionMode,
+      days: config.meetingDataRetentionDays,
+      ...(await store.retainEndedMeetings(
+        Math.max(0, Date.now() - config.meetingDataRetentionDays * 86400000),
+        true,
+        after,
+      )),
+    };
+  });
   app.patch("/api/admin/branding", async (req) => {
     admin(req);
     const branding = brandingSchema.parse(req.body);
@@ -2767,8 +2788,34 @@ export async function createApp(config: Config, store: Store, media: Media) {
   let filesPass: Promise<void> | undefined;
   let deliveryPass: Promise<void> | undefined;
   let deliveryCursor = 0;
+  let retentionPass: Promise<void> | undefined;
+  let retentionAfter: string | undefined;
+  let retentionNextAt = 0;
   let closing = false;
   const timer = setInterval(() => {
+    if (
+      !closing &&
+      !retentionPass &&
+      config.meetingDataRetentionMode === "delete" &&
+      Date.now() >= retentionNextAt
+    ) {
+      retentionNextAt = Date.now() + 60000;
+      retentionPass = store
+        .retainEndedMeetings(
+          Math.max(0, Date.now() - config.meetingDataRetentionDays * 86400000),
+          false,
+          retentionAfter,
+        )
+        .then((result) => {
+          retentionAfter = result.nextAfter ?? undefined;
+        })
+        .catch(() => {
+          console.error("Meeting retention pass failed; retrying next minute");
+        })
+        .finally(() => {
+          retentionPass = undefined;
+        });
+    }
     if (!closing && !deliveryPass)
       deliveryPass = (async () => {
         const meetings = await store.all();
@@ -2880,7 +2927,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     closing = true;
     clearInterval(timer);
     media.close();
-    await Promise.all([controlPass, filesPass, deliveryPass]);
+    await Promise.all([controlPass, filesPass, deliveryPass, retentionPass]);
     try {
       await mail?.close();
     } finally {

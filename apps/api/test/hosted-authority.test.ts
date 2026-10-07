@@ -7,6 +7,7 @@ import { LiveMedia } from "../src/media.js";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import { RecordingService } from "../src/recordings.js";
 import { usageWindow } from "../src/participant-meter.js";
+import { endMeeting } from "../src/meeting-limits.js";
 
 const origin = "http://localhost:5173";
 const creationKey = "hosted-authority-creation-key-at-least-32-chars";
@@ -2741,4 +2742,281 @@ test("account erasure advances in four-meeting batches", async (t) => {
     version: 2,
   });
   assert.equal(second.statusCode, 200, second.body);
+});
+
+
+test("ended-meeting retention previews bounded pages and preserves active, pending, recent and undated rooms", async (t) => {
+  const f = await fixture(t);
+  const cutoff = Date.now() - 86400000;
+  const cases = [
+    "expired",
+    "active",
+    "pending",
+    "boundary",
+    "undated",
+    "recording",
+  ] as const;
+  const rooms = new Map<string, Meeting>();
+  for (const kind of cases) {
+    const made = (await f.create({ operationId: randomUUID() })).json();
+    await f.store.change(made.code, (m) => {
+      m.createdAt = cutoff - 1000;
+      if (kind !== "active") {
+        endMeeting(m);
+        const endedAt = m.endedAt;
+        assert.equal(endMeeting(m), false);
+        assert.equal(
+          m.endedAt,
+          endedAt,
+          "repeated End must not restart retention",
+        );
+        m.endedAt = kind === "boundary" ? cutoff + 1 : cutoff;
+        m.cleanupPending = kind === "pending";
+        for (const p of m.participants) delete p.enforcementPending;
+      }
+      if (kind === "undated") delete m.endedAt;
+      if (kind === "recording")
+        m.recordings.push({
+          id: randomUUID(),
+          createdAt: Date.now(),
+          status: "ready",
+          expiresAt: Date.now() + 86400000,
+        });
+      m.hostEmail = "private@example.test";
+      m.bans.ip.push("private-ip-marker");
+      m.privateMessages = [
+        {
+          id: randomUUID(),
+          name: "Private name",
+          text: "Private message",
+          createdAt: cutoff,
+          breakoutId: null,
+        },
+      ];
+      m.backstageMessages = structuredClone(m.privateMessages);
+    });
+    rooms.set(kind, (await f.store.get(made.code))!);
+  }
+  const expired = rooms.get("expired")!;
+  f.store.whiteboards.set(`${expired.code}\0main`, {
+    seq: 1,
+    epoch: 0,
+    bytesUsed: 1,
+    readOnly: false,
+    events: [],
+  });
+  await f.store.audit(expired.code, "private-actor", "private-event");
+  const before = await f.store.all();
+  const collect = async (dryRun: boolean) => {
+    const totals = {
+      scanned: 0,
+      eligible: 0,
+      purged: 0,
+      blocked: 0,
+      missingEndedAt: 0,
+      notExpired: 0,
+    };
+    let after: string | undefined;
+    do {
+      const result = await f.store.retainEndedMeetings(cutoff, dryRun, after);
+      assert.ok(result.scanned <= 4);
+      for (const key of Object.keys(totals) as (keyof typeof totals)[])
+        totals[key] += result[key];
+      after = result.nextAfter ?? undefined;
+    } while (after);
+    return totals;
+  };
+  assert.deepEqual(await collect(true), {
+    scanned: 5,
+    eligible: 1,
+    purged: 0,
+    blocked: 2,
+    missingEndedAt: 1,
+    notExpired: 1,
+  });
+  assert.deepEqual(
+    await f.store.all(),
+    before,
+    "preview must not mutate content or timestamps",
+  );
+  assert.equal(f.store.whiteboards.size, 1);
+  const result = await collect(false);
+  assert.equal(result.purged, 1);
+  const retained = (await f.store.get(expired.code))!;
+  assert.ok(retained.retentionPurgedAt);
+  assert.equal(
+    retained.endedAt,
+    cutoff,
+    "the exact end-age boundary is eligible",
+  );
+  assert.equal(retained.title, "");
+  assert.deepEqual(retained.participants, []);
+  assert.equal(retained.hostEmail, undefined);
+  assert.equal(retained.privateMessages, undefined);
+  assert.equal(retained.backstageMessages, undefined);
+  assert.deepEqual(retained.bans, { ip: [], device: [] });
+  assert.equal(f.store.whiteboards.size, 0);
+  await f.store.audit(expired.code, "late-private-actor", "late-event");
+  assert.equal(
+    f.store.auditEvents.some((e) => e.code === expired.code),
+    false,
+  );
+  for (const [kind, original] of rooms)
+    if (kind !== "expired")
+      assert.deepEqual(await f.store.get(original.code), original);
+  assert.ok(f.store.usageLedgers.has(f.billingOwnerId));
+  assert.equal(
+    (await f.create({ operationId: expired.hosted!.operationId })).statusCode,
+    409,
+    "a retried hosted create cannot revive a retained operation",
+  );
+  await assert.rejects(() => f.store.create(expired), /duplicate/);
+  const legacy = structuredClone(retained);
+  legacy.code = randomUUID().replaceAll("-", "").slice(0, 26).toUpperCase();
+  legacy.id = randomUUID();
+  legacy.room = randomUUID();
+  delete legacy.hosted;
+  await f.store.create(legacy);
+  assert.equal(
+    (await f.authority(1, true, { legacyCodes: [legacy.code] })).statusCode,
+    200,
+  );
+  assert.deepEqual(await f.store.get(legacy.code), legacy);
+  assert.equal(f.store.auditEvents.some((e) => e.code === legacy.code), false);
+  assert.equal(
+    (
+      await f.internal("meeting-operations/lookup", {
+        accountId: f.accountId,
+        operationIds: [expired.hosted!.operationId],
+      })
+    ).json().operations[0].revoked,
+    true,
+  );
+  await f.authority(2, false);
+  assert.equal(
+    (await f.internal(`accounts/${f.accountId}/erase`, { version: 2 }))
+      .statusCode,
+    202,
+    "remaining unsettled recordings keep account erasure pending",
+  );
+});
+
+test("retention holds remain until recording, phone and meter cleanup settles", async (t) => {
+  const f = await fixture(t);
+  const made = (await f.create()).json();
+  const cutoff = Date.now() - 86400000;
+  const recordingId = randomUUID();
+  await f.store.change(made.code, (m) => {
+    m.createdAt = cutoff - 1;
+    endMeeting(m);
+    m.endedAt = cutoff;
+    m.cleanupPending = false;
+    for (const p of m.participants) delete p.enforcementPending;
+    m.recordings.push({
+      id: recordingId,
+      status: "deleted",
+      createdAt: cutoff,
+    });
+  });
+  assert.equal(
+    (await f.store.retainEndedMeetings(cutoff, false)).blocked,
+    1,
+    "legacy recordings without deletion inventory must not disappear",
+  );
+  await f.store.change(made.code, (m) => {
+    m.recordings[0]!.storage = {
+      billingOwnerId: f.billingOwnerId,
+      maxBytes: 1,
+      attempts: [
+        {
+          id: randomUUID(),
+          kind: "local",
+          maxBytes: 1,
+          state: "released",
+          release: { kind: "unused" },
+        },
+      ],
+    };
+    m.recordings[0]!.rawCleanupPending = true;
+  });
+  assert.equal((await f.store.retainEndedMeetings(cutoff, false)).blocked, 1);
+  await f.store.change(made.code, (m) => {
+    delete m.recordings[0]!.rawCleanupPending;
+    m.meetingMeter = { phase: "closing", accountedAt: 1, fundedUntil: 2 };
+  });
+  assert.equal((await f.store.retainEndedMeetings(cutoff, false)).blocked, 1);
+  await f.store.change(made.code, (m) => {
+    delete m.meetingMeter;
+  });
+  const callId = randomUUID();
+  f.store.phoneCalls.set(callId, {
+    code: made.code,
+    participantId: "phone",
+    released: false,
+  });
+  assert.equal((await f.store.retainEndedMeetings(cutoff, false)).blocked, 1);
+  f.store.phoneCalls.get(callId)!.released = true;
+  await f.store.withRecordingLock(made.code, recordingId, async () => {
+    assert.equal((await f.store.retainEndedMeetings(cutoff, false)).blocked, 1);
+  });
+  assert.equal((await f.store.retainEndedMeetings(cutoff, false)).purged, 1);
+  assert.equal(f.store.phoneCalls.has(callId), false);
+  await f.authority(2, false);
+  assert.equal(
+    (await f.internal(`accounts/${f.accountId}/erase`, { version: 2 }))
+      .statusCode,
+    200,
+    "retained tombstones must not strand later account deletion",
+  );
+});
+
+test("retention is disabled by default and preview requires operator authentication", async (t) => {
+  const f = await fixture(t);
+  assert.equal(f.config.meetingDataRetentionMode, "disabled");
+  assert.equal(f.config.meetingDataRetentionDays, 0);
+  const env = { SESSION_SECRET: "retention-fixture-secret-over-32-characters" };
+  for (const mode of ["preview", "delete"])
+    assert.throws(
+      () => loadConfig({ ...env, MEETING_DATA_RETENTION_MODE: mode }),
+      /Set MEETING_DATA_RETENTION_DAYS/,
+    );
+  assert.throws(
+    () => loadConfig({ ...env, MEETING_DATA_RETENTION_MODE: "yes" }),
+    /disabled, preview or delete/,
+  );
+  assert.throws(
+    () => loadConfig({ ...env, MEETING_DATA_RETENTION_DAYS: "-1" }),
+    /MEETING_DATA_RETENTION_DAYS/,
+  );
+  const made = (await f.create()).json();
+  await f.store.change(made.code, (m) => {
+    m.createdAt = Date.now() - 3 * 86400000;
+    endMeeting(m);
+    m.endedAt = Date.now() - 2 * 86400000;
+    m.cleanupPending = false;
+    for (const p of m.participants) delete p.enforcementPending;
+  });
+  const preview = (headers: Record<string, string>) =>
+    f.app.inject({
+      method: "POST",
+      url: "/api/admin/retention/preview",
+      headers,
+      payload: {},
+    });
+  assert.equal(
+    (await preview({ origin, "x-requested-with": "MeetingPlatform" }))
+      .statusCode,
+    401,
+  );
+  assert.equal((await preview(machineHeaders)).statusCode, 409);
+  f.config.meetingDataRetentionDays = 1;
+  f.config.meetingDataRetentionMode = "preview";
+  const response = await preview(machineHeaders);
+  assert.equal(response.statusCode, 200, response.body);
+  assert.equal(response.json().eligible, 1);
+  await f.tick();
+  assert.equal((await f.store.get(made.code))!.retentionPurgedAt, undefined);
+  f.config.meetingDataRetentionMode = "delete";
+  await f.tick();
+  assert.ok((await f.store.get(made.code))!.retentionPurgedAt);
 });

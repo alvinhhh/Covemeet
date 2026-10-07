@@ -5,6 +5,7 @@ import pg from "pg";
 import { loadConfig } from "../src/config.js";
 import { digest, keyedDigest } from "../src/security.js";
 import { createApp } from "../src/server.js";
+import { endMeeting } from "../src/meeting-limits.js";
 import { PgStore, type Meeting, type Participant } from "../src/store.js";
 import { LiveMedia, type Media } from "../src/media.js";
 import {
@@ -2133,5 +2134,149 @@ test(
     );
     assert.equal((await f.authority(1, account, 3, true)).statusCode, 409);
     assert.equal((await f.create(1, account, randomUUID(), 3)).statusCode, 409);
+  },
+);
+
+
+test(
+  "PostgreSQL retention keeps operation fences and serializes recorder/audit cleanup",
+  { skip: !databaseUrl, timeout: 30000 },
+  async (t) => {
+    const f = await fixture(t);
+    const account = f.account(),
+      foreignAccount = f.account(),
+      operationId = randomUUID();
+    const made = (await f.create(0, account, operationId)).json();
+    const foreign = (await f.create(0, foreignAccount, randomUUID())).json();
+    const legacyCode = randomUUID().replaceAll("-", "").slice(0, 26).toUpperCase();
+    const recordingId = randomUUID(),
+      callId = randomUUID(),
+      cutoff = Date.now() - 86400000;
+    await f.stores[0].change(made.code, (m) => {
+      m.createdAt = cutoff - 1;
+      endMeeting(m);
+      m.endedAt = cutoff;
+      m.cleanupPending = false;
+      for (const p of m.participants) delete p.enforcementPending;
+      m.hostEmail = "retention-private@example.test";
+      m.recordings.push({
+        id: recordingId,
+        createdAt: cutoff,
+        status: "deleted",
+        storage: {
+          billingOwnerId: account,
+          maxBytes: 1,
+          attempts: [
+            {
+              id: randomUUID(),
+              kind: "local",
+              maxBytes: 1,
+              state: "released",
+              release: { kind: "unused" },
+            },
+          ],
+        },
+      });
+    });
+    const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+    t.after(() => pool.end());
+    try {
+      await pool.query(
+        "INSERT INTO whiteboards(meeting_code,scope) VALUES($1,'main')",
+        [made.code],
+      );
+      await pool.query(
+        "INSERT INTO whiteboard_events(meeting_code,scope,seq,event) VALUES($1,'main',1,$2)",
+        [made.code, JSON.stringify({ private: "retained content" })],
+      );
+      await pool.query(
+        "INSERT INTO phone_calls(call_id,meeting_code,participant_id,released) VALUES($1,$2,'phone',false)",
+        [callId, made.code],
+      );
+      assert.equal(
+        (await f.stores[1].retainEndedMeetings(cutoff, true)).eligible,
+        0,
+      );
+      await pool.query(
+        "UPDATE phone_calls SET released=true WHERE call_id=$1",
+        [callId],
+      );
+      const original = await f.stores[0].get(made.code);
+      assert.equal(
+        (await f.stores[1].retainEndedMeetings(cutoff, true)).eligible,
+        1,
+      );
+      assert.deepEqual(await f.stores[0].get(made.code), original);
+      await f.stores[0].withRecordingLock(made.code, recordingId, async () => {
+        assert.equal(
+          (await f.stores[1].retainEndedMeetings(cutoff, false)).purged,
+          0,
+        );
+      });
+      const c = await pool.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query("SELECT code FROM meetings WHERE code=$1 FOR KEY SHARE", [
+          made.code,
+        ]);
+        const purge = f.stores[1].retainEndedMeetings(cutoff, false);
+        await c.query(
+          "INSERT INTO audit_events(meeting_code,actor,action) VALUES($1,'private-actor','before-purge')",
+          [made.code],
+        );
+        await c.query("COMMIT");
+        assert.equal((await purge).purged, 1);
+      } finally {
+        await c.query("ROLLBACK");
+        c.release();
+      }
+      await f.stores[0].audit(made.code, "late-private-actor", "after-purge");
+      for (const table of [
+        "whiteboards",
+        "whiteboard_events",
+        "phone_calls",
+        "audit_events",
+      ])
+        assert.equal(
+          (
+            await pool.query(`SELECT 1 FROM ${table} WHERE meeting_code=$1`, [
+              made.code,
+            ])
+          ).rowCount,
+          0,
+        );
+      const retained = (await f.stores[0].get(made.code))!;
+      assert.ok(retained.retentionPurgedAt);
+      assert.equal(retained.hostEmail, undefined);
+      assert.deepEqual(retained.participants, []);
+      assert.equal(retained.hosted!.operationId, operationId);
+      const legacy = structuredClone(retained);
+      legacy.code = legacyCode;
+      legacy.id = randomUUID();
+      legacy.room = randomUUID();
+      delete legacy.hosted;
+      await f.stores[0].create(legacy);
+      const replay = await f.stores[1].setHostedAuthority({
+        accountId: account, version: 1, enabled: true, legacyCodes: [legacyCode],
+      });
+      assert.deepEqual(replay.meetings, []);
+      assert.deepEqual(await f.stores[0].get(legacyCode), legacy);
+      assert.equal((await pool.query("SELECT 1 FROM audit_events WHERE meeting_code=$1", [legacyCode])).rowCount, 0);
+      assert.equal((await f.create(1, account, operationId)).statusCode, 409);
+      assert.ok(await f.stores[1].get(foreign.code));
+      await f.authority(0, account, 2, false);
+      await f.stores[0].requestHostedErasure(account, 2);
+      assert.equal(await f.stores[1].finishHostedErasure(account, 2), true);
+    } finally {
+      await pool.query("DELETE FROM whiteboard_events WHERE meeting_code=$1", [
+        made.code,
+      ]);
+      await pool.query("DELETE FROM whiteboards WHERE meeting_code=$1", [
+        made.code,
+      ]);
+      await pool.query("DELETE FROM phone_calls WHERE call_id=$1", [callId]);
+      await pool.query("DELETE FROM audit_events WHERE meeting_code=$1", [legacyCode]);
+      await pool.query("DELETE FROM meetings WHERE code=$1", [legacyCode]);
+    }
   },
 );

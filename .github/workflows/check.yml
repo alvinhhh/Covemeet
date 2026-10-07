@@ -28,13 +28,15 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-      - name: Dependency inventory and audit
+      - name: Dependency audit
         run: |
           mkdir -p security-results
           git rev-parse HEAD > security-results/commit.txt
           sha256sum package-lock.json > security-results/package-lock.sha256
-          npm sbom --package-lock-only --sbom-format=cyclonedx --sbom-type=application > security-results/sbom.cdx.json
           npm audit --package-lock-only --audit-level=moderate --json > security-results/audit.json
+      - run: npm ci
+      - name: Installed dependency inventory
+        run: npm sbom --sbom-format=cyclonedx --sbom-type=application > security-results/sbom.cdx.json
       - name: Dependency security evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -47,7 +49,6 @@ jobs:
             security-results/audit.json
           retention-days: 14
           if-no-files-found: error
-      - run: npm ci
       - run: npm run check
       - run: npm test
       - name: Shared email budget concurrency and restart
