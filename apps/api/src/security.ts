@@ -5,6 +5,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import argon2 from "argon2";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 export const randomToken = () => randomBytes(32).toString("base64url");
 export const digest = (value: string) =>
   createHash("sha256").update(value).digest("hex");
@@ -71,4 +72,34 @@ export class HttpError extends Error {
   ) {
     super(message);
   }
+}
+
+// Valid sessions behind one gateway have independent budgets. Invalid sessions
+// still consume the existing shared IP budget, checked before another lookup.
+export function authenticatedRateLimit(
+  app: FastifyInstance,
+  identify: (req: FastifyRequest) => Promise<string | undefined>,
+  max = 120,
+) {
+  const ipBudget = app.createRateLimit();
+  const keys = new WeakMap<FastifyRequest, string>();
+  const sessionBudget = app.createRateLimit({
+    max,
+    timeWindow: "1 minute",
+    keyGenerator: (req) => keys.get(req)!,
+  });
+  return async (req: FastifyRequest, reply: FastifyReply) => {
+    const ip = await ipBudget(req, { increment: false });
+    if (!ip.isAllowed && ip.remaining === 0) {
+      reply.header("retry-after", ip.ttlInSeconds);
+      throw new HttpError(429, "Too many attempts. Try again shortly.");
+    }
+    const key = await identify(req);
+    if (key) keys.set(req, key);
+    const result = await (key ? sessionBudget(req) : ipBudget(req));
+    if (!result.isAllowed && result.isExceeded) {
+      reply.header("retry-after", result.ttlInSeconds);
+      throw new HttpError(429, "Too many attempts. Try again shortly.");
+    }
+  };
 }

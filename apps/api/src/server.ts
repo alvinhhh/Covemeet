@@ -23,6 +23,7 @@ import type { Media } from "./media.js";
 import { LiveMedia } from "./media.js";
 import {
   checkPassword,
+  authenticatedRateLimit,
   digest,
   HttpError,
   keyedDigest,
@@ -1629,7 +1630,19 @@ export async function createApp(config: Config, store: Store, media: Media) {
     );
     return { ok: true };
   });
-  app.post("/api/meetings/:code/participants/:id/action", async (req) => {
+  app.post("/api/meetings/:code/participants/:id/action", {
+    config: { rateLimit: false },
+    onRequest: authenticatedRateLimit(app, async (req) => {
+      const meeting = await store.get(codeOf(req));
+      if (!meeting || !meetingAllowed(meeting)) return;
+      try {
+        return `${meeting.id}:${moderationActor(req, meeting).id}`;
+      } catch (error) {
+        if (error instanceof HttpError) return;
+        throw error;
+      }
+    }, 1200),
+  }, async (req) => {
     const body = z
       .object({
         action: z.enum([
@@ -2079,7 +2092,17 @@ export async function createApp(config: Config, store: Store, media: Media) {
     await store.audit(m.code, actorId, `webinar.${body.location}`, changed.id);
     return { ok: true };
   });
-  app.post("/api/meetings/:code/media", async (req) => {
+  app.post("/api/meetings/:code/media", {
+    config: { rateLimit: false },
+    onRequest: authenticatedRateLimit(app, async (req) => {
+      const meeting = await store.get(codeOf(req));
+      if (!meeting) return;
+      const participant = sessionParticipant(req, meeting);
+      return participant && participantMediaAllowed(meeting, participant)
+        ? `${meeting.id}:${participant.id}`
+        : undefined;
+    }),
+  }, async (req) => {
     const m = await find(req);
     active(m);
     const p = actor(req, m);

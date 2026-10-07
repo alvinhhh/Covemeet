@@ -10,4 +10,4 @@ COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/apps/phone ./apps/phone
 USER node
-CMD ["node", "apps/phone/dist/run.js"]
+CMD ["node", "apps/phone/dist/serve.js"]

@@ -1854,6 +1854,83 @@ test("hand rate limits keep admitted participants behind one NAT independent", a
   );
 });
 
+test("media grants and host admissions have authenticated budgets behind a shared NAT", async (t) => {
+  const f = await fixture(t);
+  const room = await f.meeting();
+  const guests = [
+    await f.join(room.code, f.host.ip),
+    await f.join(room.code, f.host.ip),
+  ];
+  for (const guest of guests) await f.action(room.code, guest.id, "admit");
+  const media = `/api/meetings/${room.code}/media`;
+  for (let i = 0; i < 70; i++)
+    for (const guest of guests)
+      ok(await guest.client.request("POST", media, {}));
+  for (let i = 0; i < 50; i++)
+    ok(await guests[0]!.client.request("POST", media, {}));
+  assert.equal(
+    (await guests[0]!.client.request("POST", media, {})).statusCode,
+    429,
+  );
+  ok(await guests[1]!.client.request("POST", media, {}));
+  // Host moderation does not consume the guests' media or shared IP budget.
+  for (let i = 0; i < 125; i++)
+    await f.action(room.code, guests[0]!.id, "rename", { name: "Guest" });
+  ok(await f.host.request("POST", media, {}));
+});
+
+test("forged meeting sessions retain the shared IP budget before further lookups", async (t) => {
+  const f = await fixture(t);
+  const room = await f.meeting();
+  const guest = await f.join(room.code, "198.51.100.122");
+  await f.action(room.code, guest.id, "admit");
+  const reads = t.mock.method(f.store, "get");
+  for (let i = 0; i < 120; i++) {
+    const client = new Client(f.app, guest.client.ip);
+    client.cookie = guest.client.cookie.replace(
+      new RegExp(`mp_${room.code}=[^;]+`),
+      `mp_${room.code}=forged-${i}`,
+    );
+    const suffix = i % 2 ? "media" : `participants/${guest.id}/action`;
+    assert.equal(
+      (
+        await client.request("POST", `/api/meetings/${room.code}/${suffix}`, {
+          action: "admit",
+        })
+      ).statusCode,
+      401,
+    );
+  }
+  const before = reads.mock.callCount();
+  assert.equal(
+    (await guest.client.request("POST", `/api/meetings/${room.code}/media`, {}))
+      .statusCode,
+    429,
+  );
+  assert.equal(reads.mock.callCount(), before);
+  // The pre-auth join limiter remains independent and unchanged.
+  const unknown = new Client(f.app, "198.51.100.123");
+  for (let i = 0; i < 120; i++)
+    assert.equal(
+      (
+        await unknown.request("POST", "/api/meetings/UNKNOWN/join", {
+          name: "Guest",
+          password,
+        })
+      ).statusCode,
+      404,
+    );
+  assert.equal(
+    (
+      await unknown.request("POST", "/api/meetings/UNKNOWN/join", {
+        name: "Guest",
+        password,
+      })
+    ).statusCode,
+    429,
+  );
+});
+
 test("poll limits reject forged cookie and code rotation before further store reads", async (t) => {
   const f = await fixture(t);
   const stateReads = t.mock.method(f.store, "get");

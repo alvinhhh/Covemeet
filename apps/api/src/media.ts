@@ -28,7 +28,12 @@ import type { FastifyInstance } from "fastify";
 import type { Config } from "./config.js";
 import type { Meeting, Participant, Store } from "./store.js";
 import { canShareScreen, participantRoom } from "./store.js";
-import { digest, safeEqual, HttpError } from "./security.js";
+import {
+  authenticatedRateLimit,
+  digest,
+  safeEqual,
+  HttpError,
+} from "./security.js";
 export interface Media {
   available: boolean;
   token(m: Meeting, p: Participant): Promise<string>;
@@ -441,14 +446,30 @@ export class LiveMedia implements Media {
         socket.destroy();
       }
     });
-    app.get("/rtc/validate", async (req, reply) => {
-      try {
-        await this.authorize((req.query as any).access_token ?? "");
-        return { ok: true };
-      } catch {
-        return reply.code(403).send({ error: "Media access denied" });
-      }
-    });
+    app.get(
+      "/rtc/validate",
+      {
+        config: { rateLimit: false },
+        onRequest: authenticatedRateLimit(app, async (req) => {
+          try {
+            const { m, p } = await this.authorize(
+              (req.query as any).access_token ?? "",
+            );
+            return `${m.id}:${p.id}`;
+          } catch {
+            return undefined;
+          }
+        }),
+      },
+      async (req, reply) => {
+        try {
+          await this.authorize((req.query as any).access_token ?? "");
+          return { ok: true };
+        } catch {
+          return reply.code(403).send({ error: "Media access denied" });
+        }
+      },
+    );
   }
   close() {
     for (const set of this.sockets.values())
