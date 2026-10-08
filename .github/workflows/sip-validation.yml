@@ -4,11 +4,14 @@ on:
   push:
     branches: [main]
     paths:
+      - .dockerignore
       - .github/workflows/sip-validation.yml
       - apps/phone/**
       - apps/api/**
       - scripts/sip-test*.mjs
       - scripts/ci-image-security.*
+      - security/sip-image.vex.json
+      - security/asterisk-image.vex.json
       - scripts/validation/sip-*
       - scripts/validation/rtc-fixture.mjs
       - infra/asterisk.Dockerfile

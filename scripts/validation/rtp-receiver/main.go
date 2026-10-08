@@ -36,6 +36,21 @@ type config struct {
 	Peers      []peerInput `json:"peers"`
 	Publishers []string    `json:"publishers"`
 }
+
+const (
+	firstPeer      = 18
+	maxPeers       = 982
+	publisherCount = 9
+	maxTokenBytes  = 8192
+	// 982 JWTs plus peer fields and nine publisher identities fit below 8 MiB.
+	maxConfigBytes = 8 << 20
+	parallelJoins  = 20
+)
+
+func joinBudget(count int) time.Duration {
+	return min(time.Duration((count+parallelJoins-1)/parallelJoins)*15*time.Second, 90*time.Second)
+}
+
 type command struct {
 	Type string `json:"type"`
 	ID   int    `json:"id"`
@@ -92,7 +107,7 @@ func decode(line []byte, target any) error {
 	return nil
 }
 func validate(c config) bool {
-	if len(c.Peers) != 2 || len(c.Publishers) != 9 {
+	if len(c.Peers) < 2 || len(c.Peers) > maxPeers || len(c.Publishers) != publisherCount {
 		return false
 	}
 	seen := map[string]bool{}
@@ -105,11 +120,11 @@ func validate(c config) bool {
 	room := ""
 	for i, p := range c.Peers {
 		u, err := url.Parse(p.URL)
-		if err != nil || p.Index != 18+i || u.Scheme != "ws" || u.Hostname() != "127.0.0.1" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		if err != nil || p.Index != firstPeer+i || u.Scheme != "ws" || u.Hostname() != "127.0.0.1" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
 			return false
 		}
 		port, err := strconv.Atoi(u.Port())
-		if err != nil || port < 1 || port > 65535 || len(p.Token) > 8192 {
+		if err != nil || port < 1 || port > 65535 || len(p.Token) > maxTokenBytes {
 			return false
 		}
 		parts := strings.Split(p.Token, ".")
@@ -177,9 +192,9 @@ func run() int {
 		}
 	}
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 4096), 65536)
+	scanner.Buffer(make([]byte, 4096), maxConfigBytes+1)
 	var c config
-	if !scanner.Scan() || decode(scanner.Bytes(), &c) != nil || !validate(c) {
+	if !scanner.Scan() || len(scanner.Bytes()) > maxConfigBytes || decode(scanner.Bytes(), &c) != nil || !validate(c) {
 		emit(map[string]any{"type": "fault", "failure": "receiver-input"})
 		return 1
 	}
@@ -188,7 +203,7 @@ func run() int {
 		defer cancel()
 		for scanner.Scan() {
 			var cmd command
-			if decode(scanner.Bytes(), &cmd) != nil || (cmd.Type != "snapshot" && cmd.Type != "stop") || cmd.ID < 1 {
+			if len(scanner.Bytes()) > 128 || decode(scanner.Bytes(), &cmd) != nil || (cmd.Type != "snapshot" && cmd.Type != "stop") || cmd.ID < 1 {
 				fault("receiver-command")
 				return
 			}
@@ -298,20 +313,34 @@ func run() int {
 		})
 	}
 	var joins sync.WaitGroup
+	slots := make(chan struct{}, parallelJoins)
+	joinTimer := time.AfterFunc(joinBudget(len(peers)), func() { fault("receiver-connect-timeout") })
+joinLoop:
 	for i, p := range peers {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			break joinLoop
+		}
 		joins.Add(1)
 		go func() {
 			defer joins.Done()
+			defer func() { <-slots }()
 			if p.room.JoinWithContextAndToken(ctx, c.Peers[i].URL, c.Peers[i].Token, lksdk.WithConnectTimeout(15*time.Second)) != nil {
 				fault("receiver-connect-failed")
 			}
 		}()
 	}
 	joins.Wait()
+	joinTimer.Stop()
 	if ctx.Err() != nil {
 		return 1
 	}
-	emit(map[string]any{"type": "connected", "indices": []int{18, 19}})
+	indices := make([]int, len(peers))
+	for i, p := range peers {
+		indices[i] = p.index
+	}
+	emit(map[string]any{"type": "connected", "indices": indices})
 	for {
 		select {
 		case <-ctx.Done():
