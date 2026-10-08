@@ -93,6 +93,7 @@ export class LiveMedia implements Media {
       canSubscribe: true,
       canPublishData: false,
       canUpdateOwnMetadata: false,
+      hidden: m.mode === "webinar" && p.role === "viewer",
     });
     return token.toJwt();
   }

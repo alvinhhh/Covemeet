@@ -138,6 +138,7 @@ test("media token claims deny data publishing, metadata changes, and blocked tra
   });
   assert.equal(viewer.video?.canPublish, false);
   assert.deepEqual(viewer.video?.canPublishSources, []);
+  assert.equal(viewer.video?.hidden, false);
   const inconsistentViewer = await inspect({
     ...f.participant,
     role: "viewer",
@@ -151,6 +152,33 @@ test("media token claims deny data publishing, metadata changes, and blocked tra
     screenShareAllowed: true,
   });
   assert.deepEqual(phone.video?.canPublishSources, ["microphone"]);
+});
+
+test("webinar viewer media tokens hide audience identities from other peers", async (t) => {
+  const f = await fixture(t);
+  const meeting = structuredClone(f.meeting);
+  meeting.mode = "webinar";
+  meeting.webinar = {
+    phase: "live",
+    revision: 1,
+    backstageRoom: `w_${randomUUID()}`,
+  };
+  const viewer = {
+    ...f.participant,
+    role: "viewer" as const,
+    audioAllowed: false,
+    videoAllowed: false,
+  };
+  const claims = async (p: Participant) =>
+    f.media.verifier.verify(await f.media.token(meeting, p));
+
+  const audience = await claims(viewer);
+  assert.equal(audience.video?.hidden, true);
+  assert.equal(audience.video?.canPublish, false);
+  assert.equal(audience.video?.canSubscribe, true);
+  assert.equal(audience.video?.canPublishData, false);
+  assert.equal((await claims({ ...viewer, role: "participant" })).video?.hidden, false);
+  assert.equal((await claims({ ...viewer, role: "host" })).video?.hidden, false);
 });
 
 test("screen-share grant and revocation fence stale media tokens", async (t) => {
