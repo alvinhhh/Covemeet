@@ -1552,8 +1552,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
         participants: m.participants
           .filter(
             (x) =>
-              canSeeParticipant(m, p, x) &&
-              (!audienceView || x.id === p.id || x.role !== "viewer"),
+              (!audienceView || x.id === p.id || x.role !== "viewer") &&
+              canSeeParticipant(m, p, x),
           )
           .map(pub),
         messages: canSee
