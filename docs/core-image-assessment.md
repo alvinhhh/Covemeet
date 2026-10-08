@@ -2,6 +2,8 @@
 
 This assessment covers the Linux/amd64 core API image built from source revision `74dd2795b0d818e47b8b748d748d17ff13f0cfa0`. The inspected image ID is `sha256:2829a6c6369a6466529a1ceaf629140f081c64e571444871fd13ea988971f86f`. Its configured user is `node`; its command starts `apps/api/dist/index.js`. It is not an assessment of the phone worker, Egress, a shell session in the image, or arbitrary future native modules.
 
+Source revision `dba5ee2c2a90ca3b925936d5a56da0c502cb14d2` adds a state-polling cache and focused tests. It changes no imports, native dependencies, Dockerfile, package lock, user, or entrypoint, and introduces no calls to the affected native paths or privileged tools listed below. Its reviewed source fingerprint is `17c22233aff38accd170c672e725f7e0ae3faba85d9e599a4da1ffa7315856d4`. CI applies these decisions to an image built from that source only if the exact runtime binaries and image configuration below also match; the prior image ID is the native inspection corpus, not an assertion about the new image ID.
+
 The four relevant inspected binaries have these SHA-256 hashes:
 
 | File | SHA-256 |
