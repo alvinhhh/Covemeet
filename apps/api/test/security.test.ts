@@ -699,6 +699,45 @@ test("kick invalidates the old session but permits a fresh lobby admission", asy
   assert.equal(state.json().me.status, "waiting");
 });
 
+test("state checks session expiry and current moderation status on every request", async (t) => {
+  const f = await fixture(t);
+  const room = await f.meeting();
+  const guest = await f.join(room.code);
+  await f.action(room.code, guest.id, "admit");
+  const state = () =>
+    guest.client.request("GET", `/api/meetings/${room.code}/state`);
+  assert.equal((await state()).json().me.status, "admitted");
+
+  await f.store.change(room.code, (m) => {
+    m.participants.find((p) => p.id === guest.id)!.expiresAt = Date.now() - 1;
+  });
+  assert.equal((await state()).statusCode, 401);
+
+  await f.store.change(room.code, (m) => {
+    m.participants.find((p) => p.id === guest.id)!.expiresAt =
+      Date.now() + 60 * 60 * 1000;
+  });
+  await f.action(room.code, guest.id, "kick");
+  const kicked = await state();
+  ok(kicked);
+  assert.equal(kicked.json().me.status, "kicked");
+  assert.deepEqual(kicked.json().messages, []);
+
+  const other = await f.join(room.code, "198.51.100.31");
+  await f.action(room.code, other.id, "admit");
+  await f.action(room.code, other.id, "ban", {
+    banDevice: true,
+    banIp: false,
+  });
+  const banned = await other.client.request(
+    "GET",
+    `/api/meetings/${room.code}/state`,
+  );
+  ok(banned);
+  assert.equal(banned.json().me.status, "banned");
+  assert.deepEqual(banned.json().messages, []);
+});
+
 test("device meeting ban follows its signed device marker to another IP", async (t) => {
   const f = await fixture(t);
   const m = await f.meeting();

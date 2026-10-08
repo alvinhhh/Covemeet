@@ -484,6 +484,7 @@ export interface Store {
   setAsset(id: string, mime: string, data: string): Promise<void>;
   create(m: Meeting): Promise<void>;
   get(code: string): Promise<Meeting | null>;
+  getState(code: string, tokenHash: string): Promise<StateSnapshot | null>;
   hostedMeetings(accountId: string): Promise<Meeting[]>;
   hostedOperations(
     accountId: string,
@@ -550,6 +551,40 @@ export interface Store {
   ): Promise<void>;
   close(): Promise<void>;
 }
+
+export interface StateSnapshot {
+  meeting: Meeting;
+  candidates: readonly Participant[];
+}
+
+// State responses only read these snapshots. Mutations use get/change and
+// must never change an object shared by concurrent state requests.
+function freezeState(meeting: Meeting) {
+  const pending: object[] = [meeting];
+  while (pending.length) {
+    const value = pending.pop()!;
+    if (Object.isFrozen(value)) continue;
+    Object.freeze(value);
+    for (const child of Object.values(value))
+      if (child !== null && typeof child === "object") pending.push(child);
+  }
+  return meeting;
+}
+
+function stateTokenIndex(meeting: Meeting) {
+  const byToken = new Map<string, Participant[]>();
+  for (const participant of meeting.participants) {
+    let matches = byToken.get(participant.tokenHash);
+    if (!matches) byToken.set(participant.tokenHash, (matches = []));
+    matches.push(participant);
+  }
+  for (const matches of byToken.values()) Object.freeze(matches);
+  return byToken;
+}
+
+const stateCacheEntryLimit = 16;
+const stateCacheByteLimit = 32 * 1024 * 1024;
+const stateCacheSingleEntryLimit = 8 * 1024 * 1024;
 
 export type HostedAuthority = {
   accountId: string;
@@ -866,6 +901,25 @@ function finishedPhoneParticipant(dialog: PhoneDialog, meeting?: Meeting) {
 }
 export class PgStore implements Store {
   pool: pg.Pool;
+  private stateCache = new Map<
+    string,
+    {
+      version: string;
+      meeting: Meeting;
+      byToken: Map<string, Participant[]>;
+      bytes: number;
+    }
+  >();
+  private stateCacheBytes = 0;
+  private stateLoads = new Map<
+    string,
+    Promise<{
+      version: string;
+      meeting: Meeting;
+      byToken: Map<string, Participant[]>;
+      bytes: number;
+    } | null>
+  >();
   private meterHeartbeats = new Map<
     string,
     {
@@ -1866,6 +1920,86 @@ export class PgStore implements Store {
       (await this.pool.query("SELECT data FROM meetings WHERE code=$1", [code]))
         .rows[0]?.data ?? null
     );
+  }
+  private dropState(code: string) {
+    const prior = this.stateCache.get(code);
+    if (prior) this.stateCacheBytes -= prior.bytes;
+    this.stateCache.delete(code);
+  }
+  private async loadState(code: string) {
+    const row = (
+      await this.pool.query<{
+        data: Meeting;
+        version: string;
+        location: string;
+      }>(
+        "SELECT data, xmin::text AS version, ctid::text AS location FROM meetings WHERE code=$1",
+        [code],
+      )
+    ).rows[0];
+    if (!row) {
+      this.dropState(code);
+      return null;
+    }
+    const meeting = freezeState(row.data);
+    const entry = {
+      version: `${row.version}:${row.location}`,
+      meeting,
+      byToken: stateTokenIndex(meeting),
+      // Parsed JSON objects can occupy more memory than their UTF-8 source.
+      bytes: 2 * Buffer.byteLength(JSON.stringify(meeting), "utf8"),
+    };
+    // An oversized replacement must also evict an older, smaller snapshot.
+    this.dropState(code);
+    if (entry.bytes <= stateCacheSingleEntryLimit) {
+      while (
+        this.stateCache.size >= stateCacheEntryLimit ||
+        this.stateCacheBytes + entry.bytes > stateCacheByteLimit
+      ) {
+        const oldest = this.stateCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.dropState(oldest);
+      }
+      this.stateCache.set(code, entry);
+      this.stateCacheBytes += entry.bytes;
+    }
+    return entry;
+  }
+  async getState(code: string, tokenHash: string): Promise<StateSnapshot | null> {
+    // Every request checks PostgreSQL's physical row version. A kick, ban, or
+    // direct UPDATE invalidates the parsed snapshot even without a revision bump.
+    const row = (
+      await this.pool.query<{ version: string; location: string }>(
+        "SELECT xmin::text AS version, ctid::text AS location FROM meetings WHERE code=$1",
+        [code],
+      )
+    ).rows[0];
+    if (!row) {
+      this.dropState(code);
+      return null;
+    }
+    const version = `${row.version}:${row.location}`;
+    let entry = this.stateCache.get(code);
+    if (entry?.version === version) {
+      this.stateCache.delete(code);
+      this.stateCache.set(code, entry);
+    } else {
+      // One full JSON read per code/version even under a polling burst.
+      const key = `${code}\0${version}`;
+      let load = this.stateLoads.get(key);
+      if (!load) {
+        load = this.loadState(code);
+        this.stateLoads.set(key, load);
+      }
+      try {
+        entry = (await load) ?? undefined;
+      } finally {
+        if (this.stateLoads.get(key) === load) this.stateLoads.delete(key);
+      }
+    }
+    return entry
+      ? { meeting: entry.meeting, candidates: entry.byToken.get(tokenHash) ?? [] }
+      : null;
   }
   async hostedMeetings(accountId: string) {
     return (
@@ -3221,6 +3355,15 @@ export class MemoryStore implements Store {
   }
   async get(code: string) {
     return structuredClone(this.data.get(code) ?? null);
+  }
+  async getState(code: string, tokenHash: string): Promise<StateSnapshot | null> {
+    const meeting = await this.get(code);
+    if (!meeting) return null;
+    freezeState(meeting);
+    return {
+      meeting,
+      candidates: stateTokenIndex(meeting).get(tokenHash) ?? [],
+    };
   }
   async hostedMeetings(accountId: string) {
     return structuredClone(

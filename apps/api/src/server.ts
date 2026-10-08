@@ -297,14 +297,23 @@ export async function createApp(config: Config, store: Store, media: Media) {
     )
       throw new HttpError(409, "Meeting is full");
   }
-  function sessionParticipant(req: FastifyRequest, m: Meeting) {
+  function sessionParticipant(
+    req: FastifyRequest,
+    m: Meeting,
+    candidates: readonly Participant[] = m.participants,
+  ) {
     const tokenHash = digest(req.cookies[authCookie(m.code)] ?? "");
-    return m.participants.find(
+    return candidates.find(
       (x) => safeEqual(x.tokenHash, tokenHash) && x.expiresAt > Date.now(),
     );
   }
-  function actor(req: FastifyRequest, m: Meeting, host = false) {
-    const p = sessionParticipant(req, m);
+  function actor(
+    req: FastifyRequest,
+    m: Meeting,
+    host = false,
+    candidates?: readonly Participant[],
+  ) {
+    const p = sessionParticipant(req, m, candidates);
     if (!p) throw new HttpError(401, "Join this meeting first");
     if (p.transport === "phone")
       throw new HttpError(403, "Phone sessions use the phone gateway");
@@ -1396,8 +1405,14 @@ export async function createApp(config: Config, store: Store, media: Media) {
       },
     },
     async (req, reply) => {
-      let m = await find(req),
-        p = actor(req, m);
+      const code = codeOf(req);
+      const snapshot = await store.getState(
+        code,
+        digest(req.cookies[authCookie(code)] ?? ""),
+      );
+      if (!snapshot) throw new HttpError(404, "Meeting unavailable");
+      let m = snapshot.meeting,
+        p = actor(req, m, false, snapshot.candidates);
       if (
         p.status === "admitted" &&
         meetingAllowed(m) &&
