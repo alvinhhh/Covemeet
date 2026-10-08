@@ -1,5 +1,6 @@
 # Covemeet
 
+**STILL IN DEVELOPMENT! DO NOT USE IN A PRODUCTION ENVIRONMENT!**
 Covemeet is self-hosted video meeting software. Guests join in their browser with a link or a meeting code and password. No app to install, no guest account to create.
 
 Built with React, TypeScript, LiveKit, Fastify, PostgreSQL and Redis.
