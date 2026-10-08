@@ -787,6 +787,7 @@ export class RecordingService {
           new EncodedFileOutput({
             fileType: EncodedFileType.MP4,
             filepath: `${this.config.egressFileRoot}/raw/${r.id}.mp4`,
+            disableManifest: true,
           }),
           {
             layout: "grid",

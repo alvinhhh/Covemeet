@@ -213,6 +213,11 @@ test("hosted capture requests explicit 720p24 while self-hosted keeps recorder d
   const hosted = await hostedFixture(t, null);
   hosted.config.edition = "hosted";
   await hosted.service.start(await hosted.current());
+  for (const f of [selfHosted, hosted]) {
+    const request = f.jobs[0]?.request;
+    assert.ok(request?.case === "roomComposite");
+    assert.equal(request.value.fileOutputs[0]?.disableManifest, true);
+  }
   const options = hosted.startOptions[0]!;
   assert.equal(options.layout, "grid");
   assert.ok(options.encodingOptions instanceof EncodingOptions);
