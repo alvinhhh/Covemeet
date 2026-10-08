@@ -6,6 +6,7 @@ import { serviceUrl, type MeetingGrant } from "./authority.js";
 
 export interface GatewayProxy {
   url: string;
+  readonly failure?: { httpStatus?: number; transportFailed?: boolean };
   updateGrant(grant: MeetingGrant): void;
   close(): Promise<void>;
 }
@@ -30,6 +31,12 @@ export async function openGateway(
   const sockets = new Set<WebSocket>();
   const incomingSockets = new Set<import("node:net").Socket>();
   let closed = false;
+  let failure: GatewayProxy["failure"];
+  const markHttpFailure = (status: number | undefined) => {
+    if (Number.isInteger(status) && status! >= 400 && status! <= 599)
+      failure = { httpStatus: status };
+    else failure ??= { transportFailed: true };
+  };
   const authorize = (raw = "", authorization?: string) => {
     const u = new URL(raw, "http://127.0.0.1");
     const provided = authorization?.startsWith("Bearer ")
@@ -67,12 +74,15 @@ export async function openGateway(
         headers: { Origin: origin.origin, Cookie: grant.cookie },
       });
       await response.body?.cancel();
+      if (response.ok) failure = undefined;
+      else markHttpFailure(response.status);
       res
         .writeHead(response.ok ? 200 : 403, {
           "Content-Type": "application/json",
         })
         .end(response.ok ? '{"ok":true}' : '{"error":"Denied"}');
     } catch {
+      failure ??= { transportFailed: true };
       res.writeHead(502).end();
     }
   });
@@ -102,21 +112,27 @@ export async function openGateway(
       handshakeTimeout: 4000,
       followRedirects: false,
     });
+    let opened = false;
     sockets.add(upstream);
     upstream.on("error", () => {
+      failure ??= { transportFailed: true };
       socket.destroy();
       upstream.terminate();
     });
     upstream.on("close", () => {
+      if (!opened) failure ??= { transportFailed: true };
       sockets.delete(upstream);
       socket.destroy();
     });
     upstream.on("unexpected-response", (_req, response) => {
+      markHttpFailure(response.statusCode);
       response.resume();
       socket.destroy();
       upstream.terminate();
     });
     upstream.once("open", () => {
+      opened = true;
+      failure = undefined;
       if (closed || socket.destroyed) {
         upstream.terminate();
         return;
@@ -158,6 +174,9 @@ export async function openGateway(
     throw new Error("Loopback gateway failed");
   return {
     url: `ws://127.0.0.1:${address.port}`,
+    get failure() {
+      return failure;
+    },
     updateGrant(next) {
       if (
         next.cookie !== grant.cookie ||

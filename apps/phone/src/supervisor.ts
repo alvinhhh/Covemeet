@@ -6,7 +6,13 @@ import {
   type AriChannel,
 } from "./ari.js";
 import type { Authority, CallPolicy, MeetingGrant } from "./authority.js";
-import { AudioBridgeOpenError, PhoneRelay, type AudioBridge } from "./relay.js";
+import {
+  AudioBridgeOpenError,
+  PhoneRelay,
+  type AudioBridge,
+  type RelayFailureDetail,
+  type RelayFailureStage,
+} from "./relay.js";
 import type { CallJournal, JournalRegistry } from "./journal.js";
 
 export type SupervisorAri = Pick<
@@ -39,13 +45,19 @@ type SetupStage =
   | "answer"
   | "security"
   | "prompt"
-  | "channel-ended";
+  | "channel-ended"
+  | "carrier-ended"
+  | "prompt-admitted"
+  | RelayFailureStage;
 type SecurityFlag = "0" | "1" | "unavailable";
 export interface SetupDiagnostic {
   stage: SetupStage;
   signaling: SecurityFlag;
   media: SecurityFlag;
   ended: boolean;
+  httpStatus?: number;
+  timedOut?: boolean;
+  transportFailed?: boolean;
 }
 interface Playback {
   id: string;
@@ -145,7 +157,12 @@ export class SipSupervisor {
   private isClosed(call: Call) {
     return call.phase === "closed";
   }
-  private diagnose(call: Call, stage: SetupStage, ended = this.isClosed(call)) {
+  private diagnose(
+    call: Call,
+    stage: SetupStage,
+    ended = this.isClosed(call),
+    detail?: RelayFailureDetail,
+  ) {
     if (call.diagnosticSent) return;
     call.diagnosticSent = true;
     try {
@@ -154,6 +171,14 @@ export class SipSupervisor {
         signaling: call.signaling,
         media: call.mediaSecurity,
         ended,
+        ...(detail?.httpStatus &&
+        Number.isInteger(detail.httpStatus) &&
+        detail.httpStatus >= 400 &&
+        detail.httpStatus <= 599
+          ? { httpStatus: detail.httpStatus }
+          : {}),
+        ...(detail?.timedOut ? { timedOut: true } : {}),
+        ...(detail?.transportFailed ? { transportFailed: true } : {}),
       });
     } catch {
       // Diagnostics cannot change call control or cleanup.
@@ -198,6 +223,12 @@ export class SipSupervisor {
           ["checking", "code", "pin"].includes(call.phase)
         )
           this.diagnose(call, "channel-ended", true);
+        else if (
+          event.channel.id === call.channel.id &&
+          call.phase === "active" &&
+          !call.stopping
+        )
+          this.diagnose(call, "carrier-ended", true);
         void this.stopCall(call).catch(() => {});
       } else if (
         event.type === "ChannelDtmfReceived" &&
@@ -439,7 +470,14 @@ export class SipSupervisor {
                             ? "muted"
                             : "unmuted"
                           : undefined;
-                  if (notice) await this.prompt(call, notice, true);
+                  if (notice) {
+                    try {
+                      await this.prompt(call, notice, true);
+                    } catch (error) {
+                      this.diagnose(call, "prompt-admitted");
+                      throw error;
+                    }
+                  }
                 }
                 if (call.phase === "closed") throw error();
                 await bridge.meeting(grant, policy);
@@ -448,11 +486,13 @@ export class SipSupervisor {
             };
           },
           terminateNative: () => this.closeNative(call),
+          onFailureStage: (stage, detail) =>
+            this.diagnose(call, stage, this.isClosed(call), detail),
         },
       );
       void call.relay
         .run()
-        .catch(() => {})
+        .catch(() => this.diagnose(call, "relay-unexpected"))
         .finally(() => this.stopCall(call))
         .catch(() => {});
       return;

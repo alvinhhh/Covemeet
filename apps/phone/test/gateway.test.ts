@@ -82,6 +82,9 @@ test("gateway preserves cookie scope, renews initial token, and forwards SDK ref
     sdk,
     "SDK-issued refresh must not be replaced with a stale authority token",
   );
+  assert.equal(proxy.failure, undefined);
+  await assert.rejects(request("forged-".repeat(8)));
+  assert.deepEqual(proxy.failure, { httpStatus: 403 });
   assert.throws(
     () => proxy.updateGrant({ ...grant, cookie: cookie + "changed" }),
     /scope/,
@@ -91,6 +94,11 @@ test("gateway preserves cookie scope, renews initial token, and forwards SDK ref
     (await fetch(validate, { headers: { Authorization: `Bearer ${initial}` } }))
       .status,
     200,
+  );
+  assert.equal(
+    proxy.failure,
+    undefined,
+    "successful validation clears an earlier rejection",
   );
   assert.equal(
     (

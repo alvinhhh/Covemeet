@@ -5,10 +5,12 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   PhoneRelay,
   AudioBridgeOpenError,
+  PhoneMediaStageError,
   type AudioBridge,
 } from "../src/relay.js";
 import {
   PhoneActionDenied,
+  PhoneAuthorityRejected,
   type Authority,
   type CallPolicy,
   type MeetingGrant,
@@ -262,6 +264,40 @@ test("speaking denial does not end call; unknown keypad commands cannot send arb
   assert.equal(f.terminated(), 0);
   await f.relay.stop();
   await run;
+});
+
+test("unexpected failures report only fixed media stage or numeric authority status and release both legs", async () => {
+  const media = fixture();
+  const mediaStages: unknown[] = [];
+  media.deps.onFailureStage = (stage, detail) =>
+    mediaStages.push({ stage, detail });
+  media.setPolicy({ state: "admitted", grant: media.grant });
+  media.bridge.meeting = async () => {
+    throw new PhoneMediaStageError("connect", {
+      httpStatus: 403,
+      timedOut: true,
+    });
+  };
+  await assert.rejects(media.relay.run(), /failure/);
+  assert.deepEqual(mediaStages, [
+    { stage: "media-connect", detail: { httpStatus: 403, timedOut: true } },
+  ]);
+  assert.equal(media.terminated(), 1);
+
+  const authority = fixture();
+  const authorityStages: unknown[] = [];
+  authority.deps.onFailureStage = (stage, detail) =>
+    authorityStages.push({ stage, detail });
+  const original = authority.authority.action;
+  authority.authority.action = async (session, callId, action) => {
+    if (action === "poll") throw new PhoneAuthorityRejected(503);
+    return original(session, callId, action);
+  };
+  await assert.rejects(authority.relay.run(), /failure/);
+  assert.deepEqual(authorityStages, [
+    { stage: "authority-poll", detail: { httpStatus: 503 } },
+  ]);
+  assert.equal(authority.terminated(), 1);
 });
 
 test("late bridge opening is closed before leave acknowledgement", async () => {

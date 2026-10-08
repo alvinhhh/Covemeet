@@ -18,7 +18,12 @@ import { serviceUrl, type CallPolicy, type MeetingGrant } from "./authority.js";
 import { openGateway, type GatewayProxy } from "./gateway.js";
 import { FrameQueue } from "./audio.js";
 import { isHoldingRoom } from "./holding-name.js";
-import { AudioBridgeOpenError, type AudioBridge } from "./relay.js";
+import {
+  AudioBridgeOpenError,
+  PhoneMediaStageError,
+  type AudioBridge,
+  type PhoneMediaStage,
+} from "./relay.js";
 
 const RATE = 48000,
   CHANNELS = 1,
@@ -339,11 +344,11 @@ export class RtcBridge implements AudioBridge {
   ) {
     await this.closeMeeting();
     if (this.closed || !grant) return;
-    const proxy = await this.rtc.gateway(
-      grant,
-      this.config.meetingOrigin,
-      this.config.development,
-    );
+    const proxy = await this.rtc
+      .gateway(grant, this.config.meetingOrigin, this.config.development)
+      .catch(() => {
+        throw new PhoneMediaStageError("gateway");
+      });
     // Track the new resource before checking terminal state so a failed proxy close
     // remains part of final cleanup; no late connection may escape that cleanup.
     const leg: MeetingLeg = {
@@ -419,6 +424,7 @@ export class RtcBridge implements AudioBridge {
     };
     leg.room.on(RoomEvent.Disconnected, disconnected);
     leg.room.on(RoomEvent.Reconnecting, disconnected);
+    let stage: PhoneMediaStage = "connect";
     try {
       if (this.closed)
         throw new Error("Phone relay closed during gateway opening");
@@ -436,6 +442,7 @@ export class RtcBridge implements AudioBridge {
       const identity = leg.room.localParticipant!.identity;
       leg.allowed.delete(identity);
       if (leg.uplink) {
+        stage = "publish";
         leg.source = this.rtc.source();
         leg.track = this.rtc.track("phone-microphone", leg.source);
         const options = new TrackPublishOptions();
@@ -449,6 +456,7 @@ export class RtcBridge implements AudioBridge {
       }
       if (this.closed || this.current !== leg)
         throw new Error("Phone relay closed during publish");
+      stage = "active";
       leg.active = true;
       // A silence stream keeps the SDK mixer alive when its last speaker departs.
       leg.mixer.addStream({
@@ -477,8 +485,20 @@ export class RtcBridge implements AudioBridge {
         for (const pub of p.trackPublications.values())
           this.subscribeNative(pub, p);
     } catch (error) {
-      await this.closeMeeting();
-      throw error;
+      const closing = this.closed || this.current !== leg;
+      const upstream = proxy.failure;
+      try {
+        await this.closeMeeting();
+      } catch {
+        throw new PhoneMediaStageError("cleanup");
+      }
+      if (closing) throw error;
+      throw new PhoneMediaStageError(stage, {
+        ...(upstream ?? {}),
+        ...(error instanceof Error && error.message === "Phone media timed out"
+          ? { timedOut: true }
+          : {}),
+      });
     }
   }
   private async closeMeeting() {

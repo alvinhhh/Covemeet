@@ -1,6 +1,7 @@
 import { setTimeout as delay } from "node:timers/promises";
 import {
   PhoneActionDenied,
+  PhoneAuthorityRejected,
   joinSchema,
   pollSchema,
   sessionSchema,
@@ -26,6 +27,41 @@ export class AudioBridgeOpenError extends Error {
     super("Phone media opening failed");
   }
 }
+export type PhoneMediaStage =
+  | "gateway"
+  | "connect"
+  | "publish"
+  | "active"
+  | "cleanup";
+export class PhoneMediaStageError extends Error {
+  constructor(
+    readonly stage: PhoneMediaStage,
+    readonly detail: RelayFailureDetail = {},
+  ) {
+    super("Phone meeting media failed");
+  }
+}
+export interface RelayFailureDetail {
+  httpStatus?: number;
+  timedOut?: boolean;
+  transportFailed?: boolean;
+}
+export type RelayFailureStage =
+  | "join"
+  | "holding-open"
+  | "holding-disconnected"
+  | "authority-poll"
+  | "authority-toggle-mute"
+  | "authority-toggle-hand"
+  | "media-gateway"
+  | "media-connect"
+  | "media-publish"
+  | "media-active"
+  | "media-cleanup"
+  | "media-bridge"
+  | "lease-expired"
+  | "cleanup"
+  | "relay-unexpected";
 export interface RelayDependencies {
   authority: Authority;
   openBridge(
@@ -34,6 +70,8 @@ export interface RelayDependencies {
   ): Promise<AudioBridge>;
   /** Must remove only this call's native SIP participant; carrier hangup is a separate adapter. */
   terminateNative(): Promise<void>;
+  /** Fixed stage labels only: no caller, meeting, credential, URL or raw error. */
+  onFailureStage?(stage: RelayFailureStage, detail?: RelayFailureDetail): void;
   now?: () => number;
   pollIntervalMs?: number;
 }
@@ -45,6 +83,7 @@ export class PhoneRelay {
   private bridge?: AudioBridge;
   private stopped = false;
   private failed = false;
+  private failureStage?: RelayFailureStage;
   private leaseTimer?: ReturnType<typeof setTimeout>;
   private deadline = 0;
   private policyKey = "";
@@ -70,6 +109,15 @@ export class PhoneRelay {
   private gate() {
     this.bridge?.silence();
   }
+  private reportFailure(stage: RelayFailureStage, detail?: RelayFailureDetail) {
+    if (this.failureStage) return;
+    this.failureStage = stage;
+    try {
+      this.deps.onFailureStage?.(stage, detail);
+    } catch {
+      /* Logging cannot affect call cleanup. */
+    }
+  }
   private arm(policy: CallPolicy) {
     const now = this.now();
     this.deadline = Math.min(
@@ -81,6 +129,7 @@ export class PhoneRelay {
     clearTimeout(this.leaseTimer);
     this.leaseTimer = setTimeout(() => {
       this.failed = true;
+      this.reportFailure("lease-expired");
       this.gate();
       void this.stop().catch(() => {});
     }, this.deadline - now);
@@ -95,8 +144,10 @@ export class PhoneRelay {
       // PIN/caller identity are never retained for polling or added to media metadata.
       this.input.pin = "";
       delete this.input.callerId;
-      if (this.session.expiresAt <= this.now())
+      if (this.session.expiresAt <= this.now()) {
+        this.reportFailure("lease-expired");
         throw new Error("Phone session expired");
+      }
       if (this.stopped) return;
       this.arm({
         state: "waiting",
@@ -110,14 +161,21 @@ export class PhoneRelay {
       this.opening = Promise.resolve().then(() =>
         this.deps.openBridge(
           () => {
+            if (this.stopped) return;
             this.failed = true;
+            this.reportFailure("holding-disconnected");
             this.gate();
             void this.stop().catch(() => {});
           },
           (digit) => this.dtmf(digit),
         ),
       );
-      this.bridge = await this.opening;
+      try {
+        this.bridge = await this.opening;
+      } catch (error) {
+        if (!this.stopped) this.reportFailure("holding-open");
+        throw error;
+      }
       if (this.stopped) return;
       while (!this.stopped) {
         await this.action("poll");
@@ -126,6 +184,7 @@ export class PhoneRelay {
       }
     } catch (error) {
       if (!this.stopped) {
+        this.reportFailure(this.session ? "relay-unexpected" : "join");
         await this.stop();
         throw new Error(
           "Phone relay stopped after an authority or media failure",
@@ -143,7 +202,10 @@ export class PhoneRelay {
     if (action === "leave") return this.stop();
     const task = this.actionQueue.then(async () => {
       if (this.stopped || !this.session) return;
-      if (this.now() >= this.deadline) throw new Error("Phone lease expired");
+      if (this.now() >= this.deadline) {
+        this.reportFailure("lease-expired");
+        throw new Error("Phone lease expired");
+      }
       let policy: CallPolicy;
       try {
         policy = pollSchema.parse(
@@ -156,6 +218,12 @@ export class PhoneRelay {
       } catch (error) {
         if (action === "toggle-mute" && error instanceof PhoneActionDenied)
           return;
+        this.reportFailure(
+          `authority-${action}` as RelayFailureStage,
+          error instanceof PhoneAuthorityRejected
+            ? { httpStatus: error.status }
+            : undefined,
+        );
         throw error;
       }
       if (this.stopped) return;
@@ -184,23 +252,39 @@ export class PhoneRelay {
         (policy.state === "admitted" && this.bridge?.needsReconnect)
       ) {
         this.gate();
-        await this.bridge?.meeting(
-          policy.state === "admitted" ? policy.grant : undefined,
-          policy,
-        );
+        try {
+          await this.bridge?.meeting(
+            policy.state === "admitted" ? policy.grant : undefined,
+            policy,
+          );
+        } catch (error) {
+          if (!this.stopped)
+            this.reportFailure(
+              error instanceof PhoneMediaStageError
+                ? `media-${error.stage}`
+                : "media-bridge",
+              error instanceof PhoneMediaStageError ? error.detail : undefined,
+            );
+          throw error;
+        }
         if (this.stopped) {
           this.gate();
           return;
         }
-        if (this.now() >= this.deadline)
+        if (this.now() >= this.deadline) {
+          this.reportFailure("lease-expired");
           throw new Error("Phone lease expired during media connection");
+        }
         this.policyKey = key;
       } else if (policy.grant) {
         this.bridge?.refreshGrant?.(policy.grant);
       }
     });
     this.actionQueue = task.catch(async () => {
-      this.failed = true;
+      if (!this.stopped) {
+        this.failed = true;
+        this.reportFailure("relay-unexpected");
+      }
       this.gate();
       await this.stop().catch(() => {});
     });
@@ -256,7 +340,10 @@ export class PhoneRelay {
       // An uncertain cleanup retains the authority's reserved capacity.
       if (session)
         await this.deps.authority.action(session, this.input.callId, "leave");
-    })();
+    })().catch((error) => {
+      this.reportFailure("cleanup");
+      throw error;
+    });
     return this.stopPromise;
   }
 }

@@ -387,6 +387,41 @@ test("supervisor waits for targeted waiting and admission announcements before m
   await until(() => f.log.includes("meeting:admitted"));
 });
 
+test("unexpected admitted media failure logs a fixed stage and still releases both legs", async (t) => {
+  const f = fixture(t),
+    c = f.start();
+  f.policy({ state: "admitted", mediaVersion: 1, grant: f.grant });
+  f.bridge.meeting = async () => {
+    throw new Error("secret caller and token must not be logged");
+  };
+  await f.credentials(c);
+  await until(() => f.supervisor.status.calls === 0);
+  assert.deepEqual(f.diagnostics, [
+    { stage: "media-bridge", signaling: "1", media: "1", ended: false },
+  ]);
+  assert(!JSON.stringify(f.diagnostics).includes("secret"));
+  assert(f.log.includes("rtc:closed"));
+  assert(f.log.includes("native:closed"));
+  assert(f.log.includes(`hangup:${c.id}`));
+  assert(f.log.indexOf("authority:leave") > f.log.indexOf("native:closed"));
+});
+
+test("normal carrier hangup is a normal terminal event and still releases both legs", async (t) => {
+  const f = fixture(t),
+    c = f.start();
+  f.policy({ state: "admitted", mediaVersion: 1, grant: f.grant });
+  await f.credentials(c);
+  await until(() => f.log.includes("meeting:admitted"));
+  f.supervisor.onEvent({ type: "ChannelDestroyed", channel: c });
+  await until(() => f.supervisor.status.calls === 0);
+  assert.deepEqual(f.diagnostics, [
+    { stage: "carrier-ended", signaling: "1", media: "1", ended: true },
+  ]);
+  assert(f.log.includes("rtc:closed"));
+  assert(f.log.includes("native:closed"));
+  assert(f.log.includes("authority:leave"));
+});
+
 test("a failed mandatory announcement closes native call without opening RTC and releases after confirmed cleanup", async (t) => {
   const f = fixture(t),
     c = f.start();
@@ -444,6 +479,7 @@ test("authority-ended calls close both legs and acknowledge leave", async (t) =>
   assert(f.log.includes("rtc:closed"));
   assert(f.log.includes(`hangup:${c.id}`));
   assert(f.log.indexOf("authority:leave") > f.log.indexOf("rtc:closed"));
+  assert.deepEqual(f.diagnostics, []);
 });
 
 test("unknown application channels are hung up; failed media construction retains its reservation", async (t) => {
