@@ -29,6 +29,7 @@ const state: MeetingState = {
     code: "meeting",
     title: "Meeting",
     mode: "meeting",
+    attendeeCount: 2,
     locked: false,
     ended: false,
     recordingAllowed: false,

@@ -89,6 +89,7 @@ export type MeetingState = {
     hostAbsentSince?: number;
     canEnd?: boolean;
     participantLimit?: number;
+    attendeeCount: number;
     startedAt?: number;
     deadlineAt?: number;
     usage?: null | {

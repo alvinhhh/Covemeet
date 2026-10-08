@@ -9,18 +9,22 @@ import {
   mailbox,
   type MailConfig,
 } from "./config.js";
+import { MailBudgetExhausted } from "./budget.js";
+
+export type MailMessage = SendMailOptions & { deliveryClass?: "invitation" };
 
 export interface MailBudget {
   reserve(input: {
     accountId: string;
     region: string;
+    deliveryClass?: "invitation";
     signal: AbortSignal;
   }): Promise<void>;
   close(): Promise<void>;
 }
 
 export interface MailTransport {
-  sendMail(message: SendMailOptions): Promise<{ messageId?: string }>;
+  sendMail(message: MailMessage): Promise<{ messageId?: string }>;
   close(): Promise<void>;
 }
 
@@ -79,7 +83,7 @@ function dependencies(): SesDependencies {
 
 function messageFor(
   config: MailConfig,
-  message: SendMailOptions,
+  message: MailMessage,
 ): SendMailOptions {
   // All product mail is text/HTML with an optional in-memory calendar event.
   // Exclude envelope, raw MIME, URL/file attachments and caller SES overrides.
@@ -91,9 +95,11 @@ function messageFor(
     "text",
     "html",
     "icalEvent",
+    "deliveryClass",
   ]);
   if (
     Object.keys(message).some((key) => !allowed.has(key)) ||
+    (message.deliveryClass !== undefined && message.deliveryClass !== "invitation") ||
     (message.from !== undefined && message.from !== config.smtpFrom) ||
     typeof message.subject !== "string" ||
     /[\r\n]/.test(message.subject) ||
@@ -134,7 +140,8 @@ function messageFor(
     256 * 1024
   )
     throw new Error("Mail message is too large");
-  return { ...message, from: config.smtpFrom, to };
+  const { deliveryClass: _deliveryClass, ...content } = message;
+  return { ...content, from: config.smtpFrom, to };
 }
 
 function snapshot(value: Credentials): Credentials {
@@ -245,6 +252,7 @@ async function sendTwilioEmail(
   config: MailConfig,
   mail: SendMailOptions,
   budget: MailBudget,
+  deliveryClass: "invitation" | undefined,
   signal: AbortSignal,
 ): Promise<{ messageId: string }> {
   const credentials = config.twilioEmail!;
@@ -302,6 +310,7 @@ async function sendTwilioEmail(
     budget.reserve({
       accountId: credentials.accountId,
       region: "twilio-email",
+      deliveryClass,
       signal,
     }),
     signal,
@@ -392,7 +401,7 @@ export function createMailTransport(
       const signal = controller.signal;
       const task = (async () => {
         if (isTwilioEmail)
-          return sendTwilioEmail(config, mail, options.budget!, signal);
+          return sendTwilioEmail(config, mail, options.budget!, message.deliveryClass, signal);
         if (!isSes) {
           const result = await sendSmtp(config, mail, signal);
           return { messageId: result.messageId };
@@ -434,6 +443,7 @@ export function createMailTransport(
                   await options.budget!.reserve({
                     accountId: sesConfig.accountId,
                     region: sesConfig.region,
+                    deliveryClass: message.deliveryClass,
                     signal,
                   });
                   signal.throwIfAborted();
@@ -472,7 +482,8 @@ export function createMailTransport(
           sender.close();
         }
       })()
-        .catch(() => {
+        .catch((error: unknown) => {
+          if (error instanceof MailBudgetExhausted) throw error;
           // Provider errors can contain destinations, content or credentials.
           throw new Error("Mail delivery was not confirmed");
         })

@@ -5,6 +5,7 @@ import { STSClient } from "@aws-sdk/client-sts";
 import { SESv2Client } from "@aws-sdk/client-sesv2";
 import { createServer, type Socket } from "node:net";
 import { loadMailConfig } from "../src/config.js";
+import { MailBudgetExhausted } from "../src/budget.js";
 import {
   createMailTransport,
   type MailBudget,
@@ -108,6 +109,24 @@ function fixture() {
     },
   };
 }
+
+test("SES invitation capacity rejection remains identifiable before dispatch", async () => {
+  const f = fixture();
+  f.budget.reserve = async ({ deliveryClass }) => {
+    assert.equal(deliveryClass, "invitation");
+    throw new MailBudgetExhausted();
+  };
+  const mail = createMailTransport(config, { budget: f.budget }, f.deps)!;
+  try {
+    await assert.rejects(
+      mail.sendMail({ ...message, deliveryClass: "invitation" }),
+      MailBudgetExhausted,
+    );
+    assert.equal(f.events.includes("send"), false);
+  } finally {
+    await mail.close();
+  }
+});
 
 test("each SES send binds one temporary credential snapshot and rechecks rotated identity", async () => {
   const f = fixture();

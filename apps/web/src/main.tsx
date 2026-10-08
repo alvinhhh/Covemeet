@@ -1239,7 +1239,6 @@ function Conference({
           ? "Monthly time allowance is nearly used."
           : "";
   const code = state.meeting.code;
-  const admitted = state.participants.filter((p) => p.status === "admitted");
   const waiting = state.participants.filter((p) => p.status === "waiting");
   useEffect(() => {
     setMediaError("");
@@ -1497,7 +1496,7 @@ function Conference({
                         ? "Phone access"
                         : "Recordings"}
                 {panel === "participants" && (
-                  <span className="count">{admitted.length}</span>
+                  <span className="count">{state.meeting.attendeeCount}</span>
                 )}
               </h2>
               <button
@@ -1764,8 +1763,8 @@ function Conference({
                     : "Ended"}
               </>
             )}
-            <i /> {admitted.length}{" "}
-            {admitted.length === 1 ? "participant" : "participants"}
+            <i /> {state.meeting.attendeeCount}{" "}
+            {state.meeting.attendeeCount === 1 ? "participant" : "participants"}
           </span>
         </div>
         <div className="meeting-header-actions">
@@ -2537,7 +2536,11 @@ function Participants({
           {webinar.viewers}/{webinar.viewerLimit}
         </p>
       )}
-      <div className="section-label">IN MEETING</div>
+      <div className="section-label">
+        {webinar && state.me.role === "viewer" && !moderator
+          ? "VISIBLE PARTICIPANTS"
+          : "IN MEETING"}
+      </div>
       {admitted.map((p) => (
         <div className="participant-entry" key={p.id}>
           <div

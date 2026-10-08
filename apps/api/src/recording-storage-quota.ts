@@ -7,6 +7,7 @@ import type {
   OwnedRecordingUpload,
   RecordingObjectReference,
 } from "@meeting-platform/recording";
+import { OWNED_MAX_BYTES } from "@meeting-platform/recording";
 import type { HostedEntitlement } from "./meeting-limits.js";
 import { recordingContext } from "./recording-context.js";
 import { HttpError } from "./security.js";
@@ -130,7 +131,7 @@ export function reserveRecordingStorage(
     !plan ||
     !Number.isSafeInteger(plan.maxBytes) ||
     plan.maxBytes < 93 ||
-    plan.maxBytes > 3_000_000_000 ||
+    plan.maxBytes > OWNED_MAX_BYTES ||
     ![1, 2].includes(plan.copies)
   )
     capacity();

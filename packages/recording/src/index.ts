@@ -1005,6 +1005,7 @@ export { LocalKeyringProvider } from "./keyring.js";
 export { AwsKmsKeyProvider } from "./kms.js";
 export {
   S3RecordingStorage,
+  OWNED_MAX_BYTES,
   type RecordingObjectReference,
   type RecordingObjectStorage,
   type OwnedRecordingUpload,

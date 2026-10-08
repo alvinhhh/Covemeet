@@ -4,4 +4,4 @@ export {
   type MailTransport,
   type MailBudget,
 } from "./transport.js";
-export { createMailBudget } from "./budget.js";
+export { createMailBudget, MailBudgetExhausted } from "./budget.js";

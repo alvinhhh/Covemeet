@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import pg from "pg";
-import { createMailBudget } from "../src/budget.js";
+import { createMailBudget, MailBudgetExhausted } from "../src/budget.js";
 
 const config = {
   production: false,
@@ -121,6 +121,54 @@ test("Twilio permits keep the shared ledger and canonicalize account casing", as
       statements.some((sql) => /TRUNCATE|DROP TABLE|DELETE FROM/.test(sql)),
       false,
     );
+  } finally {
+    await budget.close();
+  }
+});
+
+test("invitations stop at 150 shared recipients while transactional mail can use the final 50", async (t) => {
+  const now = 100_000_000;
+  let attempts = Array.from({ length: 149 }, (_, i) =>
+    String(now - (149 - i) * 1000),
+  );
+  let updates = 0;
+  const client = {
+    async query(sql: string, values?: unknown[]) {
+      if (sql.startsWith("SELECT attempts")) return { rows: [{ attempts }] };
+      if (sql.includes("clock_timestamp()"))
+        return { rows: [{ now_ms: String(now) }] };
+      if (sql.startsWith("UPDATE public.mail_send_budget")) {
+        attempts = (values![2] as number[]).map(String);
+        updates++;
+      }
+      return { rows: [] };
+    },
+    release() {},
+  } as unknown as pg.PoolClient;
+  t.mock.method(pg.Pool.prototype, "connect", async () => client);
+  t.mock.method(pg.Pool.prototype, "end", async () => {});
+  const budget = createMailBudget(config);
+  const signal = new AbortController().signal;
+  try {
+    await budget.reserve({ ...scope, deliveryClass: "invitation", signal });
+    assert.equal(attempts.length, 150);
+    await assert.rejects(
+      budget.reserve({ ...scope, deliveryClass: "invitation", signal }),
+      MailBudgetExhausted,
+    );
+    assert.equal(updates, 1, "a rejected invitation cannot consume a permit");
+    // Move the last permit outside the one-second pacing interval.
+    attempts[149] = String(now - 1000);
+    await budget.reserve({ ...scope, signal });
+    assert.equal(attempts.length, 151);
+    attempts = Array.from({ length: 200 }, (_, i) =>
+      String(now - (200 - i) * 1000),
+    );
+    await assert.rejects(budget.reserve({ ...scope, signal }), MailBudgetExhausted);
+    assert.equal(updates, 2);
+    attempts = Array(200).fill(String(now - 24 * 60 * 60 * 1000 - 1));
+    await budget.reserve({ ...scope, deliveryClass: "invitation", signal });
+    assert.equal(attempts.length, 1, "expired permits restore invitation capacity");
   } finally {
     await budget.close();
   }

@@ -155,6 +155,14 @@ test("capture reserves both encrypted copies atomically and rejected starts pers
   );
 });
 
+test("paid capture can reserve a 5 GB object only when both copies fit", async (t) => {
+  const f = await fixture(t, 10_000_000_000);
+  const recording = await f.reserve(2, 5_000_000_000);
+  assert.equal(recording.storage?.maxBytes, 5_000_000_000);
+  assert.equal((await f.usage()).reserved, 10_000_000_000);
+  await assert.rejects(f.reserve(2, 5_000_000_000));
+});
+
 test("pending local attempts retain their ceiling until exact closed-writer cleanup, and late replay cannot reallocate", async (t) => {
   const f = await fixture(t),
     r = await f.reserve(),

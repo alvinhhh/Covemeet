@@ -6,9 +6,10 @@ import type { MailBudget } from "./transport.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAILY_RECIPIENTS = 200;
+const RESERVED_TRANSACTIONAL_RECIPIENTS = 50;
 const PERMIT_INTERVAL_MS = 1000;
 
-class DailyBudgetExhausted extends Error {
+export class MailBudgetExhausted extends Error {
   constructor() {
     super("Mail daily budget exhausted");
   }
@@ -114,6 +115,7 @@ export function createMailBudget(
   async function attempt(
     accountId: string,
     region: string,
+    deliveryClass: "invitation" | undefined,
     signal: AbortSignal,
   ): Promise<number> {
     signal.throwIfAborted();
@@ -212,7 +214,11 @@ export function createMailBudget(
       )
         throw new Error("Invalid mail budget state");
       const recent = attempts.filter((time) => time > now - DAY_MS);
-      if (recent.length >= DAILY_RECIPIENTS) throw new DailyBudgetExhausted();
+      const limit =
+        deliveryClass === "invitation"
+          ? DAILY_RECIPIENTS - RESERVED_TRANSACTIONAL_RECIPIENTS
+          : DAILY_RECIPIENTS;
+      if (recent.length >= limit) throw new MailBudgetExhausted();
       const wait = Math.max(0, (recent.at(-1) ?? 0) + PERMIT_INTERVAL_MS - now);
       if (wait === 0) {
         signal.throwIfAborted();
@@ -261,10 +267,10 @@ export function createMailBudget(
       for (;;) {
         let wait: number;
         try {
-          wait = await attempt(accountId, input.region, signal);
+          wait = await attempt(accountId, input.region, input.deliveryClass, signal);
         } catch (error) {
           signal.throwIfAborted();
-          if (error instanceof DailyBudgetExhausted) throw error;
+          if (error instanceof MailBudgetExhausted) throw error;
           throw new Error("Mail budget unavailable");
         }
         if (wait === 0) return;

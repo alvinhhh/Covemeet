@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { loadMailConfig } from "../src/config.js";
 import { createMailTransport, type MailBudget } from "../src/transport.js";
+import { MailBudgetExhausted } from "../src/budget.js";
 
 const config = loadMailConfig(
   {
@@ -182,6 +183,32 @@ test("Twilio Email rejects recipient/header/attachment overrides and oversize in
     );
   assert.equal(calls, 0);
   await mail.close();
+});
+
+test("invitation capacity rejection is identifiable before Twilio dispatch", async (t) => {
+  let sends = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    sends++;
+    throw new Error("unexpected provider call");
+  });
+  const mail = createMailTransport(config, {
+    budget: {
+      async reserve({ deliveryClass }) {
+        assert.equal(deliveryClass, "invitation");
+        throw new MailBudgetExhausted();
+      },
+      async close() {},
+    },
+  })!;
+  try {
+    await assert.rejects(
+      mail.sendMail({ ...message, deliveryClass: "invitation" }),
+      MailBudgetExhausted,
+    );
+    assert.equal(sends, 0);
+  } finally {
+    await mail.close();
+  }
 });
 
 test("Twilio Email never retries or refunds ambiguous sends and sanitizes provider responses", async (t) => {

@@ -314,6 +314,41 @@ test("hand moderation uses current authority and rejects inactive or stale actor
     assert.equal((await hand(client, guest.id, false)).statusCode, 410);
 });
 
+test("webinar audience state contains self and stage presenters, with an aggregate attendee count", async (t) => {
+  const f = await fixture(t, "self-hosted");
+  const room = await f.meeting({ mode: "webinar" });
+  const path = `/api/meetings/${room.code}`;
+  const presenter = await f.join(room.code);
+  const viewer = await f.join(room.code, "198.51.100.21");
+  const peer = await f.join(room.code, "198.51.100.22");
+  for (const participant of [presenter, viewer, peer])
+    await f.action(room.code, participant.id, "admit");
+  await f.action(room.code, presenter.id, "promote");
+  ok(await f.host.request("PUT", `${path}/participants/${presenter.id}/moderator`, { enabled: true }));
+  const before = (await f.store.get(room.code))!;
+  ok(await f.host.request("POST", `${path}/webinar/start`, {
+    expectedRevision: before.webinar!.revision,
+    expectedControlRevision: before.hostControl!.revision,
+  }));
+  const live = (await f.store.get(room.code))!;
+  ok(await f.host.request("PUT", `${path}/webinar/participants/${presenter.id}`, {
+    location: "stage",
+    expectedRevision: live.webinar!.revision,
+    expectedControlRevision: live.hostControl!.revision,
+  }));
+  const audience = (await viewer.client.request("GET", `${path}/state`)).json();
+  assert.deepEqual(
+    audience.participants.map((participant: { id: string }) => participant.id),
+    [room.hostId, presenter.id, viewer.id],
+  );
+  assert.equal(audience.meeting.attendeeCount, 4);
+  for (const client of [f.host, presenter.client]) {
+    const state = (await client.request("GET", `${path}/state`)).json();
+    assert.equal(state.meeting.attendeeCount, 4);
+    assert.ok(state.participants.some((participant: { id: string }) => participant.id === peer.id));
+  }
+});
+
 test("raised hands follow breakout and webinar roster visibility for guests and co-hosts", async (t) => {
   const f = await fixture(t, "self-hosted");
   const room = await f.meeting({ mode: "webinar" });

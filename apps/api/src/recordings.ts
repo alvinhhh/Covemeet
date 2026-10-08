@@ -17,6 +17,7 @@ import {
   LocalKeyringProvider,
   AwsKmsKeyProvider,
   S3RecordingStorage,
+  OWNED_MAX_BYTES,
   decryptRecordingFromStream,
   rotateRecordingKey,
   type KeyProvider,
@@ -774,7 +775,7 @@ export class RecordingService {
             );
         },
         {
-          maxBytes: Math.min(this.config.recordingMaxBytes, 3_000_000_000),
+          maxBytes: Math.min(this.config.recordingMaxBytes, OWNED_MAX_BYTES),
           copies: this.objectStorage ? 2 : 1,
         },
       );

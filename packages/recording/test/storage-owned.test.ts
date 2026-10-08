@@ -369,7 +369,7 @@ async function objectFixture(t: TestContext) {
     adapter = fake.adapter();
   let intent!: OwnedRecordingUpload;
   const options = {
-    maxBytes: 3_000_000_000,
+    maxBytes: 5_000_000_000,
     onPrepared: async (value: OwnedRecordingUpload) => {
       intent = value;
     },

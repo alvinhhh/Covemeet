@@ -96,7 +96,11 @@ export interface RecordingObjectStorage {
 
 const PART_SIZE = 8 * 1024 * 1024;
 const MAX_BYTES = 64 * 1024 ** 3;
-const OWNED_MAX_BYTES = 3_000_000_000;
+export const OWNED_MAX_BYTES = 5_000_000_000;
+const ownedTransferTimeout = (bytes: number) =>
+  AbortSignal.timeout(
+    Math.min(3_600_000, Math.max(120_000, Math.ceil(bytes / 2_000_000) * 1000)),
+  );
 const CONTENT_TYPE = "application/vnd.covemeet.recording";
 
 /** Uploads only fully authenticated ciphertext, never a raw recorder spool. */
@@ -350,7 +354,7 @@ export class S3RecordingStorage implements RecordingObjectStorage {
         end: intent.bytes - 1,
       });
       const signal = AbortSignal.any([
-        AbortSignal.timeout(120_000),
+        ownedTransferTimeout(intent.bytes),
         ...(options.signal ? [options.signal] : []),
       ]);
       addAbortSignal(signal, upload);
@@ -764,7 +768,7 @@ export class S3RecordingStorage implements RecordingObjectStorage {
   ): Promise<RecordingObjectReference> {
     const signal = owned
       ? AbortSignal.any([
-          AbortSignal.timeout(120_000),
+          ownedTransferTimeout(metadata.encryptedBytes),
           ...(owned.signal ? [owned.signal] : []),
         ])
       : undefined;

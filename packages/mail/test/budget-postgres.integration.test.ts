@@ -105,6 +105,16 @@ test(
     );
 
     // Each single-recipient attempt consumes capacity, including ambiguous sends.
+    await seed(149, "2 seconds");
+    const invitations = await Promise.allSettled([
+      second.reserve({ ...scope, deliveryClass: "invitation", signal: signal() }),
+      restarted.reserve({ ...scope, deliveryClass: "invitation", signal: signal() }),
+    ]);
+    assert.equal(invitations.filter((result) => result.status === "fulfilled").length, 1);
+    assert.equal((await read()).length, 150);
+    await second.reserve({ ...scope, signal: signal() });
+    assert.equal((await read()).length, 151, "transactional mail shares the same total budget");
+
     await seed(199, "2 seconds");
     const contenders = await Promise.allSettled([
       second.reserve({ ...scope, signal: signal() }),

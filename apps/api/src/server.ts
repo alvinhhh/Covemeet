@@ -1476,6 +1476,8 @@ export async function createApp(config: Config, store: Store, media: Media) {
         mediaAllowed: participantMediaAllowed(m, x),
       });
       const canSee = p.status === "admitted";
+      const audienceView =
+        m.mode === "webinar" && p.role === "viewer" && !canModerate(m, p);
       const usage =
         p.role === "host" && m.hosted?.billingOwnerId
           ? await store.hostedUsage(m.hosted.billingOwnerId).catch(() => null)
@@ -1514,6 +1516,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
           hostAbsentSince: m.hostControl?.absentSince,
           canEnd: canEndMeeting(m, p),
           participantLimit: participantLimit(m),
+          attendeeCount: m.participants.filter(
+            (x) => x.status === "admitted",
+          ).length,
           startedAt: m.lifecycle?.startedAt,
           deadlineAt: m.lifecycle?.deadlineAt,
           usage,
@@ -1530,7 +1535,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
         },
         me: pub(p),
         participants: m.participants
-          .filter((x) => canSeeParticipant(m, p, x))
+          .filter(
+            (x) =>
+              canSeeParticipant(m, p, x) &&
+              (!audienceView || x.id === p.id || x.role !== "viewer"),
+          )
           .map(pub),
         messages: canSee
           ? [
