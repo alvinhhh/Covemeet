@@ -50,7 +50,13 @@ import {
   offscreenSpeakers,
   type AudioSignal,
 } from "./audio-signal";
-import { DeviceCheck } from "./device-check";
+import { DeviceCheck, deviceError } from "./device-check";
+import {
+  CallDeviceSelect,
+  captureDevice,
+  type InputDevices,
+  type InputDeviceProps,
+} from "./device-select";
 import { Chat } from "./chat";
 import { ChatUnread } from "./chat-state";
 import { Whiteboard } from "./whiteboard";
@@ -785,6 +791,10 @@ function Meeting({
   onAvailable: () => void;
   config: Config;
 }) {
+  const [inputDevices, setInputDevices] = useState<InputDevices>({
+    cameraId: "",
+    microphoneId: "",
+  });
   const [state, setState] = useState<MeetingState>();
   const [needsJoin, setNeedsJoin] = useState(false);
   const [error, setError] = useState("");
@@ -886,6 +896,8 @@ function Meeting({
       <Prejoin
         config={config}
         code={code}
+        inputDevices={inputDevices}
+        setInputDevices={setInputDevices}
         onJoin={() => {
           setNeedsJoin(false);
           setRefresh((value) => value + 1);
@@ -999,7 +1011,10 @@ function Meeting({
         <div className="joining-as">
           Joining as <strong>{state.me.name}</strong>
         </div>
-        <DeviceCheck />
+        <DeviceCheck
+          inputDevices={inputDevices}
+          setInputDevices={setInputDevices}
+        />
         {error && <Notice>{error}</Notice>}
         <Button
           onClick={async () => {
@@ -1019,6 +1034,8 @@ function Meeting({
     <Conference
       config={config}
       state={state}
+      inputDevices={inputDevices}
+      setInputDevices={setInputDevices}
       networkError={error}
       refresh={() => setRefresh((v) => v + 1)}
       handChanged={(id, update) =>
@@ -1034,11 +1051,13 @@ function Prejoin({
   config,
   code,
   onJoin,
+  inputDevices,
+  setInputDevices,
 }: {
   config: Config;
   code: string;
   onJoin: () => void;
-}) {
+} & InputDeviceProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -1073,7 +1092,10 @@ function Prejoin({
         </a>
       </header>
       <div className="prejoin-grid">
-        <DeviceCheck />
+        <DeviceCheck
+          inputDevices={inputDevices}
+          setInputDevices={setInputDevices}
+        />
         <section className="prejoin-form">
           <p className="eyebrow">JOIN MEETING</p>
           <h1>Enter the waiting room</h1>
@@ -1119,13 +1141,15 @@ function Conference({
   networkError,
   refresh,
   handChanged,
+  inputDevices,
+  setInputDevices,
 }: {
   config: Config;
   state: MeetingState;
   networkError: string;
   refresh: () => void;
   handChanged: (id: string, update: HandUpdate) => void;
-}) {
+} & InputDeviceProps) {
   const [panel, setPanel] = useState<
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
   >(null);
@@ -1461,7 +1485,11 @@ function Conference({
               {stage}
               {mediaControlsTarget &&
                 createPortal(
-                  <MediaControls me={state.me} />,
+                  <MediaControls
+                    me={state.me}
+                    inputDevices={inputDevices}
+                    setInputDevices={setInputDevices}
+                  />,
                   mediaControlsTarget,
                 )}
             </LiveKitRoom>
@@ -2145,7 +2173,11 @@ function MediaStage({
   );
 }
 
-function MediaControls({ me }: { me: Participant }) {
+function MediaControls({
+  me,
+  inputDevices,
+  setInputDevices,
+}: { me: Participant } & InputDeviceProps) {
   const {
     localParticipant,
     isMicrophoneEnabled,
@@ -2200,6 +2232,7 @@ function MediaControls({ me }: { me: Participant }) {
         <TrackToggle
           className="button media-toggle"
           source={Track.Source.Microphone}
+          captureOptions={captureDevice(inputDevices.microphoneId)}
           showIcon={false}
           onDeviceError={(e) => setError(e.message)}
           title={microphoneAction}
@@ -2216,11 +2249,22 @@ function MediaControls({ me }: { me: Participant }) {
                 : "Unmute"}
           </span>
         </TrackToggle>
+        <CallDeviceSelect
+          kind="audioinput"
+          value={inputDevices.microphoneId}
+          disabled={!audioAllowed}
+          onSelect={(microphoneId) => {
+            setInputDevices((current) => ({ ...current, microphoneId }));
+            setError("");
+          }}
+          onError={(error) => setError(deviceError(error, "audio"))}
+        />
       </fieldset>
       <fieldset className="media-control-guard" disabled={!videoAllowed}>
         <TrackToggle
           className="button media-toggle"
           source={Track.Source.Camera}
+          captureOptions={captureDevice(inputDevices.cameraId)}
           showIcon={false}
           onDeviceError={(e) => setError(e.message)}
           title={cameraAction}
@@ -2237,6 +2281,16 @@ function MediaControls({ me }: { me: Participant }) {
                 : "Start video"}
           </span>
         </TrackToggle>
+        <CallDeviceSelect
+          kind="videoinput"
+          value={inputDevices.cameraId}
+          disabled={!videoAllowed}
+          onSelect={(cameraId) => {
+            setInputDevices((current) => ({ ...current, cameraId }));
+            setError("");
+          }}
+          onError={(error) => setError(deviceError(error, "video"))}
+        />
       </fieldset>
       <fieldset className="media-control-guard" disabled={!screenShareAllowed}>
         <TrackToggle

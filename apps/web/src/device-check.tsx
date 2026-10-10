@@ -7,6 +7,7 @@ import {
   type LocalVideoTrack,
 } from "livekit-client";
 import { Icon } from "./icons";
+import { DeviceSelect, type InputDeviceProps } from "./device-select";
 
 // getUserMedia has no abort API. An abandoned request must close its late track.
 export async function acquirePreviewTrack<
@@ -132,12 +133,14 @@ function useTestDevice(kind: "audio" | "video") {
   };
 }
 
-export function DeviceCheck() {
+export function DeviceCheck({
+  inputDevices,
+  setInputDevices,
+}: InputDeviceProps) {
   const camera = useTestDevice("video");
   const microphone = useTestDevice("audio");
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
-  const [cameraId, setCameraId] = useState("");
-  const [microphoneId, setMicrophoneId] = useState("");
+  const { cameraId, microphoneId } = inputDevices;
   const [level, setLevel] = useState(0);
   const [paused, setPaused] = useState(false);
   const [meterError, setMeterError] = useState("");
@@ -230,27 +233,16 @@ export function DeviceCheck() {
         )}
       </div>
       <div className="device-check-controls">
-        <label className="field">
-          <span>Camera</span>
-          <select
-            aria-label="Camera"
-            value={cameraId}
-            disabled={!!camera.pending}
-            onChange={(event) => {
-              setCameraId(event.target.value);
-              if (camera.track) void camera.start(event.target.value);
-            }}
-          >
-            <option value="">Default camera</option>
-            {devices
-              .filter((device) => device.kind === "videoinput")
-              .map((device, i) => (
-                <option key={device.deviceId} value={device.deviceId}>
-                  {device.label || `Camera ${i + 1}`}
-                </option>
-              ))}
-          </select>
-        </label>
+        <DeviceSelect
+          kind="videoinput"
+          devices={devices}
+          value={cameraId}
+          disabled={!!camera.pending}
+          onSelect={(cameraId) => {
+            setInputDevices((current) => ({ ...current, cameraId }));
+            if (camera.track) void camera.start(cameraId);
+          }}
+        />
         <button
           type="button"
           className="button"
@@ -273,27 +265,16 @@ export function DeviceCheck() {
             {camera.error}
           </p>
         )}
-        <label className="field">
-          <span>Microphone</span>
-          <select
-            aria-label="Microphone"
-            value={microphoneId}
-            disabled={!!microphone.pending}
-            onChange={(event) => {
-              setMicrophoneId(event.target.value);
-              if (microphone.track) void microphone.start(event.target.value);
-            }}
-          >
-            <option value="">Default microphone</option>
-            {devices
-              .filter((device) => device.kind === "audioinput")
-              .map((device, i) => (
-                <option key={device.deviceId} value={device.deviceId}>
-                  {device.label || `Microphone ${i + 1}`}
-                </option>
-              ))}
-          </select>
-        </label>
+        <DeviceSelect
+          kind="audioinput"
+          devices={devices}
+          value={microphoneId}
+          disabled={!!microphone.pending}
+          onSelect={(microphoneId) => {
+            setInputDevices((current) => ({ ...current, microphoneId }));
+            if (microphone.track) void microphone.start(microphoneId);
+          }}
+        />
         <button
           type="button"
           className="button"

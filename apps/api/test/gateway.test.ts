@@ -10,6 +10,9 @@ import { digest } from "../src/security.js";
 import { createApp } from "../src/server.js";
 
 test("gateway requires the meeting cookie, preserves signaling order, and disconnects an expired live session", async (t) => {
+  // Keep startup and socket handshakes outside the session's expiry window.
+  // Only the clock is controlled; sockets and expiry timers remain real.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const upstream = createServer();
   const wss = new WebSocketServer({ server: upstream });
   wss.on("connection", (ws) => {
@@ -86,7 +89,13 @@ test("gateway requires the meeting cookie, preserves signaling order, and discon
     headers: { Origin: config.origin, Cookie: `mp_${m.code}=session-cookie` },
   });
   const messages: string[] = [];
-  ws.on("message", (data) => messages.push(data.toString()));
+  ws.on("message", (data) => {
+    messages.push(data.toString());
+    if (messages.length === 2) {
+      assert.equal(removals, 0);
+      t.mock.timers.setTime(m.participants[0]!.expiresAt);
+    }
+  });
   const closed = once(ws, "close");
   await once(ws, "open");
   await Promise.race([
