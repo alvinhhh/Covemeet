@@ -51,7 +51,7 @@ phone_vex_ready() {
     sip)
       [[ "$reference" == covemeet-sip:local ]] || return 1
       set -- .dockerignore infra/sip.Dockerfile infra/sip/entrypoint.sh infra/compose.sip-test.yaml
-      expected_source=86b9608dbbc6c5aefad02a5abf3edbdd922a5184270b996436bc33c16c13a0fc
+      expected_source=09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f
       expected_config='amd64||["/bin/sh","/usr/local/bin/covemeet-sip-entrypoint"]|null'
       files='a459cf3a47ad39d3f957a2dfc3a083543e2a55576f6697a625d8bd576b0b8d8b /usr/bin/livekit-sip
 a90205500fbd60bed950af82c7d798853365898b863efd132fa6259bf1e14a86 /usr/local/bin/covemeet-sip-entrypoint
@@ -66,7 +66,7 @@ a90205500fbd60bed950af82c7d798853365898b863efd132fa6259bf1e14a86 /usr/local/bin/
     asterisk)
       [[ "$reference" == covemeet-asterisk:local ]] || return 1
       set -- .dockerignore infra/asterisk.Dockerfile infra/asterisk infra/compose.sip-test.yaml
-      expected_source=8f8f09773182166cca0df8131523252336cba07f0cfe6e3c1e73ac33f49ad62b
+      expected_source=4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e
       expected_config='amd64|10001:10001|["/usr/sbin/asterisk","-f","-n","-C","/etc/asterisk/asterisk.conf"]|null'
       files='3fd6eb6dabc170527b79cfcf67b0097bc7beef8cd6f98f1866323750ae496520 /usr/lib/libasteriskssl.so.1
 6f6a1356880c1b3b8bcf18a47954e1ade48a1014fea60568f11d8db5fcac9aff /usr/lib/libasteriskpj.so.2

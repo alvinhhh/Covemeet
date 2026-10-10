@@ -120,7 +120,10 @@ services:
       retries: 20
     restart: unless-stopped
   livekit:
-    image: livekit/livekit-server:v1.13.7
+    image: covemeet-livekit:local
+    build:
+      context: ..
+      dockerfile: infra/livekit.Dockerfile
     command: [--config, /etc/livekit.yaml]
     volumes:
       - ../runtime/local-tls/livekit.yaml:/etc/livekit.yaml:ro

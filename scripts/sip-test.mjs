@@ -503,7 +503,7 @@ try {
     ".",
   ]);
   await evidence.phase("build-services");
-  await compose(["build", "asterisk", "sip", "sip-runner"]);
+  await compose(["build", "livekit", "asterisk", "sip", "sip-runner"]);
   await evidence.phase("start-services");
   await compose([
     "up",

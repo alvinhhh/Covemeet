@@ -38,7 +38,7 @@ Pull the pinned fixture dependencies, build the current source and use its exact
 ```sh
 npm run build
 docker pull postgres:17.11-alpine3.23
-docker pull livekit/livekit-server:v1.13.7
+docker build -f infra/livekit.Dockerfile -t covemeet-livekit:local .
 docker build -t covemeet-core:local .
 MEDIA_GENERATION_IMAGE="$(docker image inspect covemeet-core:local --format '{{.Id}}')" \
   node scripts/media-generation-test.mjs --execute-reviewed-fixture

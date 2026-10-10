@@ -14,6 +14,7 @@ on:
       - security/asterisk-image.vex.json
       - scripts/validation/sip-*
       - scripts/validation/rtc-fixture.mjs
+      - infra/livekit.Dockerfile
       - infra/asterisk.Dockerfile
       - infra/asterisk/**
       - infra/compose.sip-test.yaml

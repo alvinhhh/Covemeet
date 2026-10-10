@@ -65,7 +65,7 @@ jobs:
         timeout-minutes: 10
         run: |
           docker pull postgres:17.11-alpine3.23
-          docker pull livekit/livekit-server:v1.13.7
+          docker build -f infra/livekit.Dockerfile -t covemeet-livekit:local .
           docker build -t covemeet-core:generation-test .
           MEDIA_GENERATION_IMAGE="$(docker image inspect covemeet-core:generation-test --format '{{.Id}}')" \
             node scripts/media-generation-test.mjs --execute-reviewed-fixture
@@ -85,10 +85,10 @@ jobs:
           name: phone-validation
           path: test-results/phone/*.json
           if-no-files-found: ignore
-      - name: Built core image vulnerabilities
+      - name: Built core and meeting server image vulnerabilities
         if: ${{ !cancelled() && steps.media-generation.outcome != 'skipped' }}
         timeout-minutes: 8
-        run: bash scripts/ci-image-security.sh core=covemeet-core:generation-test
+        run: bash scripts/ci-image-security.sh core=covemeet-core:generation-test livekit=covemeet-livekit:local
       - name: Core image security evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

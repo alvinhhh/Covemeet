@@ -149,6 +149,7 @@ try {
   prepared = true;
   const status = await compose([
     "up",
+    "--no-build",
     "--pull",
     "never",
     "--abort-on-container-exit",

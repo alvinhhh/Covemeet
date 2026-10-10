@@ -69,7 +69,7 @@ try {
     { mode: 0o600 },
   );
   prepared = true;
-  await compose(["build", "phone-runner"]);
+  await compose(["build", "phone-livekit", "phone-runner"]);
   await compose([
     "up",
     "--abort-on-container-exit",

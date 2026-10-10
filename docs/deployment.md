@@ -102,3 +102,5 @@ Pins were checked against official upstream sources on 2026-10-04. They are sele
 | Mailpit    | `v1.31.4`               | [Release](https://github.com/axllent/mailpit/releases/tag/v1.31.4) |
 
 The core repository is public under Apache-2.0; the proprietary hosted repository remains private. Check dependency obligations for packaged releases: Redis 8 has a choice of licenses that must be reviewed for the distribution and hosting model. [Redis licensing](https://redis.io/legal/licenses/)
+
+The meeting-server image is built from `infra/livekit.Dockerfile`: LiveKit 1.13.7 rebuilt with Go 1.26.9, `golang.org/x/net` 0.60.0 and OpenTelemetry 1.45.0. Its static runtime includes certificate roots and timezone data without a shell or shared libraries. Build it with the other Compose services; the CI media and phone tests use the same recipe.
