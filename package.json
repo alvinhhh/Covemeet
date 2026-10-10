@@ -20,7 +20,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "concurrently": "^9.2.0",
+    "concurrently": "^10.0.5",
     "prettier": "3.6.2",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0"
