@@ -51,9 +51,9 @@ phone_vex_ready() {
     sip)
       [[ "$reference" == covemeet-sip:local ]] || return 1
       set -- .dockerignore infra/sip.Dockerfile infra/sip/entrypoint.sh infra/compose.sip-test.yaml
-      expected_source=a39fcdf7fcf0d14fa3a40ad27aca5cc9218d649fe90d4c811fb5f92c711bca78
+      expected_source=86b9608dbbc6c5aefad02a5abf3edbdd922a5184270b996436bc33c16c13a0fc
       expected_config='amd64||["/bin/sh","/usr/local/bin/covemeet-sip-entrypoint"]|null'
-      files='c47fce23b7bda1b4267ec981ab247b9e8cc44c98407ad3512f5cd9a125e06b35 /usr/bin/livekit-sip
+      files='a459cf3a47ad39d3f957a2dfc3a083543e2a55576f6697a625d8bd576b0b8d8b /usr/bin/livekit-sip
 a90205500fbd60bed950af82c7d798853365898b863efd132fa6259bf1e14a86 /usr/local/bin/covemeet-sip-entrypoint
 9792e3cbb541c8f44c7acf5f14f4022ea62998ecc787d326bed4d8b6547dfd92 /usr/lib/x86_64-linux-gnu/libc.so.6
 85590dd58edf5445e18bc7193e5ebc01ac5841f1ae187e97705a662e90c6421e /usr/lib/x86_64-linux-gnu/libz.so.1

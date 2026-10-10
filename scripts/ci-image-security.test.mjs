@@ -51,7 +51,7 @@ test("reviewed image VEX requires unchanged source and binaries; new findings st
   const repo = fileURLToPath(new URL("..", import.meta.url));
   for (const [files, expected] of [
     [".dockerignore Dockerfile package.json package-lock.json apps/api packages", "8d4e14375c73976021b4b05f6859d825dcc9bf09faab259284b2960c78b96911"],
-    [".dockerignore infra/sip.Dockerfile infra/sip/entrypoint.sh infra/compose.sip-test.yaml", "a39fcdf7fcf0d14fa3a40ad27aca5cc9218d649fe90d4c811fb5f92c711bca78"],
+    [".dockerignore infra/sip.Dockerfile infra/sip/entrypoint.sh infra/compose.sip-test.yaml", "86b9608dbbc6c5aefad02a5abf3edbdd922a5184270b996436bc33c16c13a0fc"],
     [".dockerignore infra/asterisk.Dockerfile infra/asterisk infra/compose.sip-test.yaml", "8f8f09773182166cca0df8131523252336cba07f0cfe6e3c1e73ac33f49ad62b"],
   ]) {
     const digest = spawnSync("bash", ["-c",
@@ -173,7 +173,7 @@ esac`,
   assert.equal(JSON.parse(await readFile(path.join(root, "security-results/images/core.image.json"), "utf8")).vexApplied, true);
 
   for (const [name, digest] of [
-    ["sip", "a39fcdf7fcf0d14fa3a40ad27aca5cc9218d649fe90d4c811fb5f92c711bca78"],
+    ["sip", "86b9608dbbc6c5aefad02a5abf3edbdd922a5184270b996436bc33c16c13a0fc"],
     ["asterisk", "8f8f09773182166cca0df8131523252336cba07f0cfe6e3c1e73ac33f49ad62b"],
   ]) {
     const result = run({ KIND: name, SOURCE_DIGEST: digest }, `${name}=covemeet-${name}:local`);
