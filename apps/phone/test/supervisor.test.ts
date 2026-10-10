@@ -422,6 +422,33 @@ test("normal carrier hangup is a normal terminal event and still releases both l
   assert(f.log.includes("authority:leave"));
 });
 
+test("outbound holding leg failure reports fixed hangup cause and releases the call", async (t) => {
+  const f = fixture(t),
+    c = f.start(),
+    opening = deferred<AudioBridge>();
+  f.media.open = async () => {
+    f.log.push("media:open");
+    return opening.promise;
+  };
+  await f.credentials(c);
+  await until(() => f.log.includes("media:open"));
+  const outbound: AriChannel = {
+    id: `cm-out-${f.joins[0].callId}`,
+    name: "PJSIP/fixture-outbound",
+    state: "Down",
+  };
+  f.supervisor.onEvent({ type: "ChannelDestroyed", channel: outbound, cause: 19 });
+  opening.resolve(f.bridge);
+  await until(() => f.supervisor.status.calls === 0);
+  assert.deepEqual(f.diagnostics, [
+    { stage: "holding-ended", signaling: "1", media: "1", ended: true, hangupCause: 19 },
+  ]);
+  assert(f.log.includes("native:closed"));
+  assert(f.log.includes(`hangup:${c.id}`));
+  assert(f.log.includes("authority:leave"));
+  assert(!JSON.stringify(f.diagnostics).includes(c.id));
+});
+
 test("a failed mandatory announcement closes native call without opening RTC and releases after confirmed cleanup", async (t) => {
   const f = fixture(t),
     c = f.start();

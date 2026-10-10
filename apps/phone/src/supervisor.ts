@@ -48,6 +48,7 @@ type SetupStage =
   | "channel-ended"
   | "carrier-ended"
   | "prompt-admitted"
+  | "holding-ended"
   | RelayFailureStage;
 type SecurityFlag = "0" | "1" | "unavailable";
 export interface SetupDiagnostic {
@@ -58,6 +59,7 @@ export interface SetupDiagnostic {
   httpStatus?: number;
   timedOut?: boolean;
   transportFailed?: boolean;
+  hangupCause?: number;
 }
 interface Playback {
   id: string;
@@ -161,7 +163,7 @@ export class SipSupervisor {
     call: Call,
     stage: SetupStage,
     ended = this.isClosed(call),
-    detail?: RelayFailureDetail,
+    detail?: RelayFailureDetail & { hangupCause?: number },
   ) {
     if (call.diagnosticSent) return;
     call.diagnosticSent = true;
@@ -179,6 +181,12 @@ export class SipSupervisor {
           : {}),
         ...(detail?.timedOut ? { timedOut: true } : {}),
         ...(detail?.transportFailed ? { transportFailed: true } : {}),
+        ...(detail?.hangupCause !== undefined &&
+        Number.isInteger(detail.hangupCause) &&
+        detail.hangupCause >= 0 &&
+        detail.hangupCause <= 255
+          ? { hangupCause: detail.hangupCause }
+          : {}),
       });
     } catch {
       // Diagnostics cannot change call control or cleanup.
@@ -219,6 +227,14 @@ export class SipSupervisor {
         )
       ) {
         if (
+          event.channel.id === `cm-out-${call.id}` &&
+          call.phase === "joining" &&
+          !call.stopping
+        )
+          this.diagnose(call, "holding-ended", true, {
+            hangupCause: "cause" in event ? event.cause : undefined,
+          });
+        else if (
           event.channel.id === call.channel.id &&
           ["checking", "code", "pin"].includes(call.phase)
         )

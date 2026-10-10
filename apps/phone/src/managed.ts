@@ -195,7 +195,7 @@ export async function runManagedPhone(
       ),
     registry,
     (diagnostic) => {
-      const message = `Phone call stage=${diagnostic.stage} signaling=${diagnostic.signaling} media=${diagnostic.media} ended=${diagnostic.ended}${diagnostic.httpStatus ? ` httpStatus=${diagnostic.httpStatus}` : ""}${diagnostic.timedOut ? " timedOut=true" : ""}${diagnostic.transportFailed ? " transportFailed=true" : ""}`;
+      const message = `Phone call stage=${diagnostic.stage} signaling=${diagnostic.signaling} media=${diagnostic.media} ended=${diagnostic.ended}${diagnostic.httpStatus ? ` httpStatus=${diagnostic.httpStatus}` : ""}${diagnostic.timedOut ? " timedOut=true" : ""}${diagnostic.transportFailed ? " transportFailed=true" : ""}${diagnostic.hangupCause !== undefined ? ` hangupCause=${diagnostic.hangupCause}` : ""}`;
       if (diagnostic.stage === "carrier-ended") console.info(message);
       else console.warn(message);
     },

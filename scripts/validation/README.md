@@ -165,6 +165,56 @@ LiveKit 1.13.7's embedded TURN advertisement always uses TLS port 443 ([upstream
 
 This local browser check relies on the user's existing trust in the exact project CA. The fixture never installs trust or bypasses a certificate error. A passing run establishes this browser's selected local TURN route, not external firewall traversal, certificate renewal, protocol conformance, phone/SIP or capacity. UDP TURN still carries DTLS-SRTP media; it does not establish TLS protection of the client-to-TURN connection. Re-run after source or infrastructure changes.
 
+## RTP receiver
+
+`rtp-receiver/` supplies a Linux receive-only helper and a Node client for measuring authenticated RTP without decoding every receiver's audio and video. The caller supplies already-admitted sessions through private loopback signaling bridges; the helper does not create meetings, admit participants, sign tokens, or bypass the application's cookie and Origin checks.
+
+Build the helper with Go 1.26 or later, then run the protocol checks from the repository root:
+
+```sh
+cd scripts/validation/rtp-receiver
+go test ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/covemeet-rtp-receiver .
+cd ../../..
+node scripts/validation/rtp-receiver/client.mjs --offline-check
+```
+
+The protocol check starts simulated child processes only; it makes no SDK or network connections. Build outputs and runtime evidence must remain untracked.
+
+Import `startReceiver` from `scripts/validation/rtp-receiver/client.mjs`. Its arguments are `config`, an absolute Linux binary path, an `onFault(label)` callback, `offline` (leave `false` for the real helper), and an optional asynchronous `grantProvider(index)`.
+
+| Configuration | Default meeting profile | Webinar profile |
+| --- | --- | --- |
+| Top-level fields | `peers`, `publishers`; omit `profile` | `profile: "webinar"`, `peers`, `publishers` |
+| Publishers | Exactly nine unique media identities | Exactly ten unique stage media identities |
+| Receivers | 2–982 | Exactly 1,000 |
+| Peer fields | `index`, `url`, `token` | `index`, `url`; no pre-issued token |
+| Peer indices | Consecutive integers beginning at 18 | Consecutive integers beginning at 18 |
+| Signaling URL | `ws://127.0.0.1:<port>` | `ws://127.0.0.1:<port>` |
+| Tracks per publisher | Video | Audio and video |
+| Grant provider | Omit it | Required; returns the requested viewer's token |
+
+The default profile and its snapshot shape remain unchanged. Webinar joins use at most 20 concurrent slots. A slot requests its token immediately before joining, and grant replies may arrive out of order. Each token must identify a distinct viewer in the same room, have 15–180 seconds remaining, and explicitly grant `roomJoin`, `canSubscribe`, and `hidden` while denying `canPublish` and `canPublishData`. Stage identities cannot be reused as viewers. Claim validation is an input check; the SFU verifies the signature during connection.
+
+```js
+const receiver = startReceiver(config, binaryPath, onFault, false, grantProvider);
+try {
+  await receiver.connected;
+  const snapshot = await receiver.snapshot();
+  // Compare successive per-stream counters over the measured interval.
+} finally {
+  await receiver.close();
+}
+```
+
+`connected` confirms that every configured receiver joined. `snapshot()` returns ordered `rows`, process CPU microseconds, and peak Linux RSS bytes. Each row contains ordered per-publisher stream counters and their aggregate bytes, packets, complete RTP frames, and unusable packet gaps. Webinar streams add `kind: "audio" | "video"`, ordered audio then video for each publisher; meeting streams omit `kind`. VP8/H.264 video and Opus audio are accepted. Missing tracks remain visible as incomplete stream coverage: the caller must require every expected stream to advance throughout its hold interval.
+
+A non-null `subscriber` means every observed stream has received packets through Pion's authenticated SRTP reader, with connected DTLS and a remote certificate present. It records the selected local ICE candidate type and protocol. Cipher names are unavailable and remain `null`. Complete RTP frames are not decoded-media quality, and unusable packet gaps conservatively include discarded frame packets rather than estimating network loss.
+
+Faults use fixed labels without credentials. Connection deadlines are bounded (up to 90 seconds for meetings, 180 seconds for webinars); a track read stalls after five seconds without RTP. Always await `close()`, including during an interrupted connection. It cancels pending work and requires confirmed peer shutdown; forced termination is a cleanup failure. The caller remains responsible for ending its meeting, erasing fixture credentials, enforcing resource/transfer budgets, and stopping its generator.
+
+This helper enables a full stream-count measurement at the caller's explicit media profile. It does not establish 100-person/1,000-viewer capacity, browser decoding performance, recording quality, or any particular resolution by itself.
+
 ## Results
 
 Exit status 0 means all checks and cleanup passed. The JSON evidence includes timestamps, generated frame counts, outbound RTP bytes, negotiated DTLS/SRTP ciphers, failures, and cleanup status. Removal timing measures the post-response verification interval, including a 300 ms check that the participant did not return; it is not total moderation latency. Tokens, cookies, meeting passwords, and infrastructure secrets are omitted. Runtime output belongs in ignored `test-results/` or `work/`; do not commit it. Ended synthetic meeting records and their audit trail remain in the test database. Use a dedicated test stack, and reset its test data when appropriate.

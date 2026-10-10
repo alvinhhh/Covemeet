@@ -367,6 +367,48 @@ test("an active download stops if current recording authority is unavailable", a
   assert.equal(stream.destroyed, true);
 });
 
+test("an in-flight download stops at exact link expiry without refunding its allowance", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const f = await fixture(t, "ready", 2 * 1024 * 1024 + 17);
+  const used = await downloadAllowance(f, f.plaintext.length * 2);
+  const link = await f.link();
+  const gate = gateSecondFrameRead(f.store, f.meeting.code);
+  const stream = await f.service.download(
+    f.meeting,
+    f.recording,
+    link.token,
+    link.password,
+  );
+  t.after(() => {
+    gate.release();
+    gate.restore();
+    stream.destroy();
+  });
+  const frames = stream[Symbol.asyncIterator]();
+  assert.equal((await frames.next()).value.length, 1024 * 1024);
+  const next = frames.next();
+  await Promise.race([
+    gate.entered,
+    next.then(() =>
+      assert.fail("Second plaintext frame escaped the expiry check"),
+    ),
+  ]);
+  t.mock.timers.setTime(link.expiresAt);
+  gate.release();
+  await assert.rejects(next, forbidden);
+  assert.equal(stream.destroyed, true);
+  assert.equal(await used(), f.plaintext.length);
+  assert.equal(await f.service.findToken(link.token, f.meeting.code), null);
+  await assert.rejects(f.collect(link.token, link.password), forbidden);
+
+  const renewed = await f.link();
+  assert.deepEqual(
+    await f.collect(renewed.token, renewed.password),
+    f.plaintext,
+  );
+  assert.equal(await used(), f.plaintext.length * 2);
+});
+
 test("email failure retains one encrypted password intent for an exact retry", async (t) => {
   const f = await fixture(t);
   const failingMail = {
