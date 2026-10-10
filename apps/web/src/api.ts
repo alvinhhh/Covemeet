@@ -37,6 +37,7 @@ export type Participant = {
   videoAllowed: boolean;
   screenShareAllowed: boolean;
   mediaVersion: number;
+  cameraConsentVersion?: number;
   mediaIdentity?: string;
   breakoutId: string | null;
   webinarLocation?: "backstage" | "stage";

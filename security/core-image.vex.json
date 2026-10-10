@@ -2,8 +2,8 @@
   "@context": "https://openvex.dev/ns/v0.2.0",
   "@id": "urn:uuid:9bd1c4b6-9c2e-4d3b-a412-5532afb8a4ef",
   "author": "Covemeet",
-  "timestamp": "2026-10-10T22:54:40Z",
-  "version": 7,
+  "timestamp": "2026-10-10T23:54:01Z",
+  "version": 8,
   "statements": [
     {
       "vulnerability": {
@@ -17,7 +17,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_present",
       "impact_statement": "The exact Linux/amd64 libstdc++ binary in this image passes the original requested size to posix_memalign in aligned operator new; the affected size-rounding allocation branch is absent.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -31,7 +31,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The configured core API does not load the shipped LiveKit RTC native add-on. GNU PBDS binary-heap erase_if is absent from the other loaded native source. Reassess if core begins importing @livekit/rtc-node or another native add-on.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -45,7 +45,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The Node executable embeds the affected zlib 1.3.2.1 code, but the configured service does not call its gzwrite/gzprintf/gzvprintf file-writer API. Node's GZIP binding uses deflateInit2, and the shipped native add-ons do not reference the affected API. Reassess if native add-ons or module-loading behavior change.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -59,7 +59,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The configured Node service and its two loaded Linux/x64 native add-ons do not call the deprecated resolver debug printers that trigger this issue. Ordinary DNS resolution uses other APIs. Reassess if native dependencies or module loading change.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -73,7 +73,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The configured Node service and its two loaded Linux/x64 native add-ons do not call strfmon or strfmon_l. The formatter's internal helper is reached only through those wrappers in the exact libc binary. Reassess if native dependencies or module loading change.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -87,7 +87,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The vulnerable mount helper and its privileged post-hooks are not invoked by the configured core service; the required authorized fstab mount and privilege transition are absent.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -101,7 +101,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The vulnerable nsenter --join-cgroup path requires a privileged operator entering an attacker-controlled namespace; the configured core service has no nsenter caller, root authority, or host cgroup bind.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -115,7 +115,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The vulnerable X-mount.subdir detached-tree mount path requires an authorized fstab entry and privileged mount invocation that this configured core service does not provide.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -129,7 +129,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The vulnerable SUID bind-mount owner/group/mode hook path requires a privileged mount and root-controlled fstab entry absent from configured core operation.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -143,7 +143,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The configured Node API does not call the affected privileged libacl pathname APIs and has no higher-privilege ACL helper; writable recording paths remain same-user assets, not a privilege boundary.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -157,7 +157,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The configured core service does not invoke getfacl, setfacl or chacl recursively over attacker-controlled paths and has no privileged CLI path.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -171,7 +171,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The infocmp analyze_string CLI path is not invoked by the configured API, which does not process terminal descriptions.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -185,7 +185,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The configured API does not execute Perl Pod::Text or process attacker-supplied POD. The scanned perl-base package name alone does not establish the vulnerable module in the image.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     },
     {
       "vulnerability": {
@@ -199,7 +199,7 @@
       "status": "not_affected",
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The configured API does not execute Perl Archive::Tar or parse attacker-supplied tar files. The scanned perl-base package name alone does not establish the vulnerable module in the image.",
-      "status_notes": "Reviewed Linux/amd64 core source digest a480921ee3a35987d4149c84a2d44deaa2e4011fc478479c1e4b9bc0304f66bb; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
+      "status_notes": "Reviewed Linux/amd64 core source digest b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140; scripts/ci-image-security.sh verifies runtime binaries and entrypoint before applying this statement. Excludes phone, Egress, and host operator actions."
     }
   ]
 }

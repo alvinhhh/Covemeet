@@ -112,6 +112,7 @@ export type Participant = {
   videoAllowed: boolean;
   screenShareAllowed?: boolean;
   mediaVersion: number;
+  cameraConsentVersion?: number;
   mediaIdentity?: string;
   previousMediaIdentity?: string;
   gatewayConnectionId?: string;

@@ -9,6 +9,7 @@ import {
 import type { ChatMode, MeetingState } from "./api";
 import { Icon } from "./icons";
 import { sendsChatOnEnter } from "./chat-state";
+import { chatLinks } from "./chat-links";
 
 export function Chat({
   state,
@@ -178,7 +179,22 @@ export function Chat({
               </small>
             )}
             <p className={message.deleted ? "chat-removed" : undefined}>
-              {message.deleted ? "Message removed" : message.text}
+              {message.deleted
+                ? "Message removed"
+                : chatLinks(message.text).map((part, index) =>
+                    part.href ? (
+                      <a
+                        key={index}
+                        href={part.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {part.text}
+                      </a>
+                    ) : (
+                      part.text
+                    ),
+                  )}
             </p>
             {host && (
               <div className="chat-message-actions">

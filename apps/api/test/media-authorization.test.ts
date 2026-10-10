@@ -76,6 +76,20 @@ async function fixture(t: TestContext) {
   return { config, store, media, meeting, participant, signed };
 }
 
+test("media fencing invalidates camera consent by default, including legacy completion", async (t) => {
+  const f = await fixture(t);
+  fenceParticipantMedia(f.meeting, f.participant, true);
+  assert.equal(f.participant.cameraConsentVersion ?? 0, 0);
+  fenceParticipantMedia(f.meeting, f.participant);
+  assert.equal(f.participant.cameraConsentVersion, 1);
+  fenceParticipantMedia(f.meeting, f.participant, true);
+  assert.equal(f.participant.cameraConsentVersion, 1);
+  delete f.participant.mediaIdentity;
+  const snapshot = structuredClone(f.participant);
+  assert.equal(completeMediaFence(f.participant, snapshot), true);
+  assert.equal(f.participant.cameraConsentVersion, 2);
+});
+
 test("media admission verifies a real signed token against current application state", async (t) => {
   const f = await fixture(t);
   const token = await f.media.token(f.meeting, f.participant);

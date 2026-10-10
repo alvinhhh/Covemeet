@@ -865,6 +865,285 @@ test("admission rejects a password changed while verification was pending", asyn
   assert.equal((await f.store.get(m.code))!.participants.length, 1);
 });
 
+test("mute all blocks guests in the current room and respects co-host authority", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const path = `/api/meetings/${m.code}`;
+  const cohost = await f.join(m.code, "198.51.100.31");
+  const otherCohost = await f.join(m.code, "198.51.100.32");
+  const guest = await f.join(m.code, "198.51.100.33");
+  const outside = await f.join(m.code, "198.51.100.34");
+  const expired = await f.join(m.code, "198.51.100.35");
+  const waiting = await f.join(m.code, "198.51.100.36");
+  for (const p of [cohost, otherCohost, guest, outside, expired])
+    await f.action(m.code, p.id, "admit");
+  for (const p of [cohost, otherCohost])
+    ok(
+      await f.host.request("PUT", `${path}/participants/${p.id}/moderator`, {
+        enabled: true,
+      }),
+    );
+  const breakoutId = randomUUID();
+  await f.store.change(m.code, (room) => {
+    room.breakouts.push({
+      id: breakoutId,
+      name: "Group",
+      room: "breakout-test",
+    });
+    room.participants.find((p) => p.id === outside.id)!.breakoutId = breakoutId;
+    room.participants.find((p) => p.id === expired.id)!.expiresAt =
+      Date.now() - 1;
+  });
+  const result = await cohost.client.request(
+    "POST",
+    `${path}/participants/mute-all`,
+    { scope: "" },
+  );
+  ok(result);
+  assert.equal(result.json().muted, 1);
+  const after = (await f.store.get(m.code))!;
+  assert.equal(
+    after.participants.find((p) => p.id === guest.id)!.cameraConsentVersion ??
+      0,
+    0,
+  );
+  assert.equal(
+    after.participants.find((p) => p.id === guest.id)!.audioAllowed,
+    false,
+  );
+  for (const id of [
+    m.hostId,
+    cohost.id,
+    otherCohost.id,
+    outside.id,
+    expired.id,
+    waiting.id,
+  ])
+    assert.equal(
+      after.participants.find((p) => p.id === id)!.audioAllowed,
+      true,
+    );
+  assert.deepEqual(f.media.removed, [guest.id]);
+  ok(
+    await guest.client.request("POST", `${path}/media`, { audioAllowed: true }),
+  );
+  assert.equal(f.media.issued.at(-1)?.participant.audioAllowed, false);
+  rejected(
+    await guest.client.request(
+      "POST",
+      `${path}/participants/${guest.id}/action`,
+      { action: "allow-audio" },
+    ),
+  );
+
+  const hostResult = await f.host.request(
+    "POST",
+    `${path}/participants/mute-all`,
+    { scope: "" },
+  );
+  ok(hostResult);
+  assert.equal(hostResult.json().muted, 2);
+  assert.deepEqual(f.media.removed, [guest.id, cohost.id, otherCohost.id]);
+  assert.equal(
+    (await f.store.get(m.code))!.participants.find((p) => p.id === m.hostId)!
+      .audioAllowed,
+    true,
+  );
+  assert.equal(f.store.auditEvents.at(-1)?.action, "participants.mute-all");
+});
+
+test("mute all rejects unauthorized actors and stale room scopes", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  const path = `/api/meetings/${m.code}/participants/mute-all`;
+  assert.equal(
+    (
+      await new Client(f.app, "198.51.100.50").request("POST", path, {
+        scope: "",
+      })
+    ).statusCode,
+    401,
+  );
+  assert.equal(
+    (await guest.client.request("POST", path, { scope: "" })).statusCode,
+    403,
+  );
+  await f.action(m.code, guest.id, "admit");
+  assert.equal(
+    (await guest.client.request("POST", path, { scope: "" })).statusCode,
+    403,
+  );
+  for (const body of [
+    {},
+    { scope: "", ids: [guest.id] },
+    { scope: "x".repeat(65) },
+  ])
+    assert.equal((await f.host.request("POST", path, body)).statusCode, 400);
+  const breakoutId = randomUUID();
+  await f.store.change(m.code, (room) => {
+    room.breakouts.push({
+      id: breakoutId,
+      name: "Group",
+      room: "breakout-test",
+    });
+    room.participants.find((p) => p.id === m.hostId)!.breakoutId = breakoutId;
+  });
+  assert.equal(
+    (await f.host.request("POST", path, { scope: "" })).statusCode,
+    409,
+  );
+  const noTargets = await f.host.request("POST", path, { scope: breakoutId });
+  ok(noTargets);
+  assert.equal(noTargets.json().muted, 0);
+  assert.equal(
+    (await f.store.get(m.code))!.participants.find((p) => p.id === guest.id)!
+      .audioAllowed,
+    true,
+  );
+  assert.deepEqual(f.media.removed, []);
+
+  ok(
+    await f.host.request(
+      "PUT",
+      `/api/meetings/${m.code}/participants/${guest.id}/moderator`,
+      { enabled: true },
+    ),
+  );
+  await f.store.change(m.code, (room) => {
+    room.participants.find((p) => p.id === guest.id)!.enforcementPending = true;
+    room.participants.find((p) => p.id === m.hostId)!.enforcementPending = true;
+  });
+  assert.equal(
+    (await guest.client.request("POST", path, { scope: "" })).statusCode,
+    403,
+  );
+  assert.equal(
+    (await f.host.request("POST", path, { scope: breakoutId })).statusCode,
+    409,
+  );
+  await f.store.change(m.code, (room) => {
+    const p = room.participants.find((p) => p.id === guest.id)!;
+    p.enforcementPending = false;
+    delete p.moderator;
+  });
+  assert.equal(
+    (await guest.client.request("POST", path, { scope: "" })).statusCode,
+    403,
+  );
+});
+
+test("mute all keeps failed disconnects fenced and retries without reconnecting already muted guests", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const first = await f.join(m.code, "198.51.100.31");
+  const second = await f.join(m.code, "198.51.100.32");
+  for (const p of [first, second]) await f.action(m.code, p.id, "admit");
+  let failing = true;
+  const attempts: string[] = [];
+  t.mock.method(f.media, "remove", async (_m: Meeting, p: Participant) => {
+    attempts.push(p.id);
+    if (p.id === first.id && failing) throw new Error("Unavailable");
+  });
+  const path = `/api/meetings/${m.code}/participants/mute-all`;
+  const result = await f.host.request("POST", path, { scope: "" });
+  assert.equal(result.statusCode, 503);
+  assert.match(result.json().error, /disconnect is pending/);
+  assert.equal(f.store.auditEvents.at(-1)?.action, "participants.mute-all");
+  const beforeRetry = (await f.store.get(m.code))!;
+  for (const p of beforeRetry.participants.filter((p) => p.role !== "host"))
+    assert.equal(p.audioAllowed, false);
+  const pending = beforeRetry.participants.find((p) => p.id === first.id)!;
+  assert.equal(pending.enforcementPending, true);
+  assert.equal(
+    beforeRetry.participants.find((p) => p.id === second.id)!
+      .enforcementPending,
+    false,
+  );
+  rejected(
+    await first.client.request("POST", `/api/meetings/${m.code}/media`, {}),
+  );
+  failing = false;
+  const retried = await f.host.request("POST", path, { scope: "" });
+  ok(retried);
+  assert.equal(retried.json().muted, 1);
+  const cleared = (await f.store.get(m.code))!.participants.find(
+    (p) => p.id === first.id,
+  )!;
+  assert.equal(cleared.enforcementPending, false);
+  assert.equal(cleared.mediaVersion, pending.mediaVersion);
+  assert.deepEqual(attempts, [first.id, second.id, first.id]);
+  const repeated = await f.host.request("POST", path, { scope: "" });
+  assert.equal(repeated.json().muted, 0);
+  assert.deepEqual(attempts, [first.id, second.id, first.id]);
+});
+
+test("mute all isolates webinar backstage from the live stage and audience", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting({ mode: "webinar" });
+  const backstage = await f.join(m.code, "198.51.100.31");
+  const stage = await f.join(m.code, "198.51.100.32");
+  const viewer = await f.join(m.code, "198.51.100.33");
+  for (const p of [backstage, stage, viewer])
+    await f.action(m.code, p.id, "admit");
+  for (const p of [backstage, stage]) await f.action(m.code, p.id, "promote");
+  await f.store.change(m.code, (room) => {
+    room.webinar!.phase = "live";
+    room.participants.find((p) => p.id === m.hostId)!.webinarLocation =
+      "backstage";
+    room.participants.find((p) => p.id === stage.id)!.webinarLocation = "stage";
+  });
+  f.media.removed.length = 0;
+  const path = `/api/meetings/${m.code}/participants/mute-all`;
+  assert.equal(
+    (await f.host.request("POST", path, { scope: "" })).statusCode,
+    409,
+  );
+  const result = await f.host.request("POST", path, { scope: "@backstage" });
+  ok(result);
+  assert.equal(result.json().muted, 1);
+  assert.deepEqual(f.media.removed, [backstage.id]);
+  const saved = (await f.store.get(m.code))!;
+  assert.equal(
+    saved.participants.find((p) => p.id === stage.id)!.audioAllowed,
+    true,
+  );
+  assert.equal(
+    saved.participants.find((p) => p.id === viewer.id)!.audioAllowed,
+    false,
+  );
+});
+test("camera consent survives only audio changes and records missed revocation or room transfers", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  await f.action(m.code, guest.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  const state = async () =>
+    (await guest.client.request("GET", `${path}/state`)).json().me;
+  assert.equal((await state()).cameraConsentVersion, 0);
+  await f.action(m.code, guest.id, "block-audio");
+  await f.action(m.code, guest.id, "allow-audio");
+  assert.equal((await state()).cameraConsentVersion, 0);
+  await f.action(m.code, guest.id, "block-video");
+  await f.action(m.code, guest.id, "allow-video");
+  const restored = await state();
+  assert.equal(restored.videoAllowed, true);
+  assert.equal(restored.cameraConsentVersion, 2);
+  ok(await f.host.request("POST", `${path}/breakouts`, { name: "Group" }));
+  const breakoutId = (await f.store.get(m.code))!.breakouts[0]!.id;
+  ok(
+    await f.host.request("POST", `${path}/move`, {
+      participantId: guest.id,
+      breakoutId,
+    }),
+  );
+  ok(await guest.client.request("POST", `${path}/return-main`, {}));
+  const returned = await state();
+  assert.equal(returned.breakoutId, null);
+  assert.equal(returned.videoAllowed, true);
+  assert.equal(returned.cameraConsentVersion, 4);
+});
 test("source restrictions revoke previous grants and cannot be lifted by a guest", async (t) => {
   const f = await fixture(t);
   const m = await f.meeting();
@@ -2608,6 +2887,10 @@ test("handoff retries one physical fence and self-host return invalidates delaye
     }),
   );
   const returned = (await f.store.get(room.code))!;
+  assert.equal(
+    returned.participants.find((p) => p.id === room.hostId)!.cameraConsentVersion,
+    1,
+  );
   assert.equal(meetingController(returned)?.id, room.hostId);
   assert.equal(returned.hostControl!.revision, revision + 1);
   assert.deepEqual(returned.lifecycle, before.lifecycle);

@@ -4,6 +4,8 @@ This assessment covers the Linux/amd64 core API image built from source revision
 
 Source revision `dba5ee2c2a90ca3b925936d5a56da0c502cb14d2` adds a state-polling cache and focused tests. It changes no imports, native dependencies, Dockerfile, package lock, user, or entrypoint, and introduces no calls to the affected native paths or privileged tools listed below. Its reviewed source fingerprint is `17c22233aff38accd170c672e725f7e0ae3faba85d9e599a4da1ffa7315856d4`. CI applies these decisions to an image built from that source only if the exact runtime binaries and image configuration below also match; the prior image ID is the native inspection corpus, not an assertion about the new image ID.
 
+The room-scoped mute-all and camera-consent update uses the existing moderation, media fencing and store paths. It adds no imports of native modules or process-execution APIs and changes no dependencies, Docker configuration or entrypoint. The reviewed API/package source fingerprint is `b714a6832db0dabb1ae2801d135c821cd61b72dd8289829ba44c7563fa9cd140`; CI still requires the same runtime binary hashes and image configuration before applying these decisions.
+
 The four relevant inspected binaries have these SHA-256 hashes:
 
 | File | SHA-256 |

@@ -26,12 +26,18 @@ export function participantRoom(m: Meeting, p: Participant) {
 export const participantDataScope = (m: Meeting, p: Participant) =>
   p.breakoutId ?? (webinarBackstage(m, p) ? "@backstage" : "");
 
-export function fenceParticipantMedia(m: Meeting, p: Participant) {
+export function fenceParticipantMedia(
+  m: Meeting,
+  p: Participant,
+  preserveCamera = false,
+) {
   // Pending cleanup owns this immutable target even if another restriction arrives.
   p.previousMediaIdentity ??= mediaIdentity(p);
   p.previousRoom ??= participantRoom(m, p);
   p.mediaIdentity = randomUUID();
   p.mediaVersion++;
+  if (!preserveCamera)
+    p.cameraConsentVersion = (p.cameraConsentVersion ?? 0) + 1;
   p.enforcementPending = true;
   delete p.gatewayConnectionId;
   delete p.gatewayPresenceUntil;
@@ -50,6 +56,7 @@ export function completeMediaFence(p: Participant, snapshot: Participant) {
   if (!p.mediaIdentity) {
     p.mediaIdentity = randomUUID();
     p.mediaVersion++;
+    p.cameraConsentVersion = (p.cameraConsentVersion ?? 0) + 1;
     delete p.gatewayConnectionId;
     delete p.gatewayPresenceUntil;
   }

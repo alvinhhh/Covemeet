@@ -1480,6 +1480,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
         videoAllowed: x.videoAllowed,
         screenShareAllowed: canShareScreen(x),
         mediaVersion: x.mediaVersion,
+        cameraConsentVersion: x.cameraConsentVersion ?? 0,
         mediaIdentity: mediaIdentity(x),
         breakoutId: x.breakoutId,
         enforcementPending: !!x.enforcementPending,
@@ -1675,6 +1676,63 @@ export async function createApp(config: Config, store: Store, media: Media) {
     );
     return { ok: true };
   });
+  app.post(
+    "/api/meetings/:code/participants/mute-all",
+    {
+      config: {
+        rateLimit: {
+          max: 30,
+          timeWindow: "1 minute",
+          keyGenerator: browserRateKey,
+        },
+      },
+    },
+    async (req) => {
+      const { scope } = z
+        .object({ scope: z.string().max(64) })
+        .strict()
+        .parse(req.body);
+      const changed: Participant[] = [];
+      let actorId!: string;
+      const m = await store.change(codeOf(req), (m) => {
+        active(m);
+        const self = moderationActor(req, m);
+        if (self.enforcementPending)
+          throw new HttpError(409, "Wait for your room connection to complete");
+        if (participantDataScope(m, self) !== scope)
+          throw new HttpError(409, "Room changed; refresh and try again");
+        actorId = self.id;
+        for (const p of m.participants) {
+          if (
+            p.id === self.id ||
+            p.role === "host" ||
+            p.role === "viewer" ||
+            (self.role !== "host" && !!p.moderator) ||
+            p.status !== "admitted" ||
+            !occupiesSeat(p) ||
+            (p.phone && p.phone.leaseExpiresAt <= Date.now()) ||
+            participantDataScope(m, p) !== scope ||
+            (!p.audioAllowed && !p.enforcementPending)
+          )
+            continue;
+          if (p.audioAllowed) fenceParticipantMedia(m, p, true);
+          p.audioAllowed = false;
+          if (p.phone) p.phone.muted = true;
+          p.auditReferenced = true;
+          changed.push(structuredClone(p));
+        }
+        return structuredClone(m);
+      });
+      await store.audit(
+        m.code,
+        actorId,
+        "participants.mute-all",
+        scope || "main",
+      );
+      await enforce(m, changed);
+      return { ok: true, muted: changed.length };
+    },
+  );
   app.post("/api/meetings/:code/participants/:id/action", {
     config: { rateLimit: false },
     onRequest: authenticatedRateLimit(app, async (req) => {
@@ -1791,7 +1849,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
           p.expiresAt = p.phone.callExpiresAt;
         }
       } else {
-        fenceParticipantMedia(m, p);
+        fenceParticipantMedia(
+          m,
+          p,
+          body.action === "block-audio" || body.action === "allow-audio",
+        );
         if (body.action === "kick" || body.action === "ban") {
           p.status = body.action === "ban" ? "banned" : "kicked";
           if (body.action === "ban") {

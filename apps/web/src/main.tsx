@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useLayoutEffect,
@@ -46,6 +47,7 @@ import { companySlug, routeBranding } from "./team-branding";
 import { BrandingEditor } from "./branding";
 import { selectStage, type StageView } from "./stage-policy";
 import { FullscreenControl } from "./fullscreen-control";
+import { cameraIntentFor, rememberCameraChoice } from "./camera-intent";
 import {
   observeAudioSignals,
   offscreenSpeakers,
@@ -1169,6 +1171,48 @@ function Conference({
   );
   const [unreadChat, setUnreadChat] = useState(0);
   const roomScope = participantRoomScope(state.meeting.mode, state.me);
+  const [attempt, setAttempt] = useState(0);
+  const cameraScope = `${state.meeting.code}:${roomScope}`;
+  const [cameraIntent, setCameraIntent] = useState(() =>
+    cameraIntentFor(state.me, cameraScope, attempt),
+  );
+  const currentCameraIntent = cameraIntentFor(
+    state.me,
+    cameraScope,
+    attempt,
+    cameraIntent,
+  );
+  if (currentCameraIntent !== cameraIntent)
+    setCameraIntent(currentCameraIntent);
+  const cameraChanged = useCallback(
+    (enabled: boolean, userInitiated: boolean) => {
+      setCameraIntent((current) =>
+        rememberCameraChoice(
+          current,
+          {
+            participantId: state.me.id,
+            scope: cameraScope,
+            mediaVersion: state.me.mediaVersion,
+            cameraConsentVersion: currentCameraIntent.cameraConsentVersion,
+            attempt,
+            generation: currentCameraIntent.generation,
+            allowed: currentCameraIntent.allowed,
+          },
+          enabled,
+          userInitiated,
+        ),
+      );
+    },
+    [
+      state.me.id,
+      state.me.mediaVersion,
+      attempt,
+      cameraScope,
+      currentCameraIntent.allowed,
+      currentCameraIntent.generation,
+      currentCameraIntent.cameraConsentVersion,
+    ],
+  );
   const chatRoom = `${state.meeting.code}:${state.me.id}:${roomScope}`;
   const chatRecipient = chatRecipients[chatRoom] ?? "everyone";
   const chatDraftKey = `${chatRoom}:${chatRecipient}`;
@@ -1221,7 +1265,6 @@ function Conference({
     ? audioSignals
     : new Map<string, AudioSignal>();
   const [mediaError, setMediaError] = useState("");
-  const [attempt, setAttempt] = useState(0);
   const host = state.me.role === "host";
   const moderator = host || !!state.me.moderator;
   const canEnd = state.meeting.canEnd ?? host;
@@ -1466,7 +1509,11 @@ function Conference({
               serverUrl={credentials.url}
               connect
               audio={false}
-              video={false}
+              video={
+                currentCameraIntent.enabled
+                  ? captureDevice(inputDevices.cameraId)
+                  : false
+              }
               options={roomOptions}
               connectOptions={connectionOptions}
               onConnected={() => setMediaError("")}
@@ -1494,6 +1541,7 @@ function Conference({
                     me={state.me}
                     inputDevices={inputDevices}
                     setInputDevices={setInputDevices}
+                    cameraChanged={cameraChanged}
                   />,
                   mediaControlsTarget,
                 )}
@@ -1554,6 +1602,13 @@ function Conference({
                 }
                 action={(id, data) =>
                   mutate(`/participants/${encodeURIComponent(id)}/action`, data)
+                }
+                muteAll={() =>
+                  mutate("/participants/mute-all", {
+                    scope:
+                      state.me.breakoutId ??
+                      (state.me.webinarBackstage ? "@backstage" : ""),
+                  })
                 }
                 grant={(id, enabled) =>
                   mutate(
@@ -2242,7 +2297,11 @@ function MediaControls({
   me,
   inputDevices,
   setInputDevices,
-}: { me: Participant } & InputDeviceProps) {
+  cameraChanged,
+}: {
+  me: Participant;
+  cameraChanged: (enabled: boolean, userInitiated: boolean) => void;
+} & InputDeviceProps) {
   const {
     localParticipant,
     isMicrophoneEnabled,
@@ -2330,6 +2389,10 @@ function MediaControls({
           className="button media-toggle"
           source={Track.Source.Camera}
           captureOptions={captureDevice(inputDevices.cameraId)}
+          onChange={cameraChanged}
+          onClick={() => {
+            if (isCameraEnabled) cameraChanged(false, true);
+          }}
           showIcon={false}
           onDeviceError={(e) => setError(e.message)}
           title={cameraAction}
@@ -2555,6 +2618,7 @@ function Participants({
   handPending,
   lowerHand,
   action,
+  muteAll,
   grant,
   stage,
   openPhone,
@@ -2565,6 +2629,7 @@ function Participants({
   handPending: string | null;
   lowerHand: (id: string) => Promise<boolean | undefined>;
   action: (id: string, data: object) => Promise<boolean>;
+  muteAll: () => Promise<boolean>;
   grant: (id: string, enabled: boolean) => Promise<boolean>;
   stage: (id: string, location: "backstage" | "stage") => Promise<boolean>;
   openPhone?: () => void;
@@ -2592,8 +2657,37 @@ function Participants({
   const audienceFull = !!webinar && webinar.viewers >= webinar.viewerLimit;
   const waiting = state.participants.filter((p) => p.status === "waiting");
   const admitted = admittedWithHandsFirst(state.participants);
+  const hasMuteTarget = admitted.some(
+    (p) =>
+      canControl(p) &&
+      p.role !== "viewer" &&
+      (p.audioAllowed || p.enforcementPending) &&
+      participantRoomScope(state.meeting.mode, p) ===
+        participantRoomScope(state.meeting.mode, state.me),
+  );
   return (
     <div className="panel-scroll">
+      {moderator && (
+        <Button
+          className="small full-width"
+          disabled={
+            busy ||
+            !hasMuteTarget ||
+            !!state.me.enforcementPending ||
+            state.meeting.ended
+          }
+          onClick={() => {
+            if (
+              window.confirm(
+                "Mute guests in this room? They cannot unmute until you allow their microphone again. Media briefly reconnects; screen sharing must be restarted.",
+              )
+            )
+              void muteAll();
+          }}
+        >
+          Mute all
+        </Button>
+      )}
       {openPhone && (
         <Button className="small full-width" onClick={openPhone}>
           Phone access

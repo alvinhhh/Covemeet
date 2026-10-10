@@ -163,3 +163,24 @@ test("removed message slots show a tombstone without their old text or actions",
     /Never display removed text|Reply privately|>Remove</,
   );
 });
+
+test("chat renders escaped link text with isolated new-tab navigation", () => {
+  const message = {
+    id: "link",
+    senderId: host.id,
+    name: host.name,
+    text: '<img src=x onerror=alert(1)>\nhttps://example.com/?a=1&b=2 "quoted"',
+    createdAt: "2026-10-06T00:00:00Z",
+  };
+  const markup = render({ state: { ...state, messages: [message] } });
+  assert.match(markup, /&lt;img src=x onerror=alert\(1\)&gt;\n/);
+  assert.match(
+    markup,
+    /<a href="https:\/\/example\.com\/\?a=1&amp;b=2" target="_blank" rel="noopener noreferrer">https:\/\/example\.com\/\?a=1&amp;b=2<\/a> &quot;quoted&quot;/,
+  );
+  assert.doesNotMatch(markup, /<img/);
+  const removed = render({
+    state: { ...state, messages: [{ ...message, deleted: true }] },
+  });
+  assert.doesNotMatch(removed, /<a |example\.com|onerror/);
+});

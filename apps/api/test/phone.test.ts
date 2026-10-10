@@ -132,6 +132,55 @@ async function fixture(t: TestContext, extra: Record<string, string> = {}) {
   return { config, store, media, app, browser, gateway, host, call };
 }
 
+test("mute all revokes phone publishing and requires caller consent after permission returns", async (t) => {
+  const f = await fixture(t);
+  const h = await f.host();
+  const call = await f.call(h);
+  const waiting = await f.call(h, "+15551234568");
+  assert.equal((await h.action(call.participantId, "admit")).statusCode, 200);
+  const speaking = (await call.update("toggle-mute")).json();
+  assert.equal(speaking.muted, false);
+  const result = await f.browser(
+    "POST",
+    `/api/meetings/${h.code}/participants/mute-all`,
+    { scope: "" },
+    h.cookie,
+  );
+  assert.equal(result.statusCode, 200, result.body);
+  assert.equal(result.json().muted, 1);
+  await assert.rejects(f.media.authorize(speaking.grant.token));
+  const blocked = (await call.update("toggle-mute")).json();
+  assert.equal(blocked.audioAllowed, false);
+  assert.equal(blocked.muted, true);
+  assert.equal(
+    (await f.media.verifier.verify(blocked.grant.token)).video?.canPublish,
+    false,
+  );
+  assert.equal((await waiting.update()).json().state, "waiting");
+  assert.equal(
+    (await f.store.get(h.code))!.participants.find(
+      (p) => p.id === waiting.participantId,
+    )!.audioAllowed,
+    true,
+  );
+  assert.equal(
+    (await h.action(call.participantId, "allow-audio")).statusCode,
+    200,
+  );
+  const allowed = (await call.update()).json();
+  assert.equal(allowed.muted, true);
+  assert.equal(
+    (await f.media.verifier.verify(allowed.grant.token)).video?.canPublish,
+    false,
+  );
+  const unmuted = (await call.update("toggle-mute")).json();
+  assert.equal(unmuted.muted, false);
+  assert.deepEqual(
+    (await f.media.verifier.verify(unmuted.grant.token)).video
+      ?.canPublishSources,
+    ["microphone"],
+  );
+});
 test("phone configuration is disabled by default and rejects shared keys or excessive limits", () => {
   assert.equal(loadConfig({ SESSION_SECRET: secret }).phoneEnabled, false);
   for (const override of [
