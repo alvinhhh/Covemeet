@@ -17,6 +17,10 @@ export type StageCandidate = {
 
 export const VIDEO_TILE_LIMIT = 16;
 const PINNED_SCREEN_LIMIT = 2;
+export type StageView = {
+  pinnedParticipantId?: string | null;
+  hideSelfView?: boolean;
+};
 
 export function selectStage<T extends StageCandidate>(
   candidates: T[],
@@ -28,6 +32,7 @@ export function selectStage<T extends StageCandidate>(
     webinarBackstage?: boolean;
   },
   requestedPage: number,
+  view: StageView = {},
 ) {
   const eligible = members.filter(
     (member) =>
@@ -47,13 +52,24 @@ export function selectStage<T extends StageCandidate>(
       .filter((member) => member.transport === "phone")
       .map(participantMediaIdentity),
   );
+  const localMember = eligible.find((member) => member.id === context.localId);
+  const localIdentity = localMember && participantMediaIdentity(localMember);
+  const pinnedMember = eligible.find(
+    (member) => member.id === view.pinnedParticipantId,
+  );
+  const pinnedIdentity = pinnedMember && participantMediaIdentity(pinnedMember);
   const tracks = [
     ...new Map(
       candidates
         .filter(
           (track) =>
             roles.has(track.mediaIdentity) &&
-            !(track.source === "camera" && phoneIds.has(track.mediaIdentity)),
+            !(track.source === "camera" && phoneIds.has(track.mediaIdentity)) &&
+            !(
+              view.hideSelfView &&
+              track.source === "camera" &&
+              track.mediaIdentity === localIdentity
+            ),
         )
         .map((track) => [track.key, track]),
     ).values(),
@@ -67,13 +83,16 @@ export function selectStage<T extends StageCandidate>(
   const pinned = tracks
     .filter((track) => track.source === "screen_share")
     .slice(0, PINNED_SCREEN_LIMIT);
-  const localMember = eligible.find((member) => member.id === context.localId);
-  const localIdentity = localMember && participantMediaIdentity(localMember);
+  const pinnedCamera = tracks.find(
+    (track) =>
+      track.mediaIdentity === pinnedIdentity && track.source === "camera",
+  );
+  if (pinnedCamera) pinned.push(pinnedCamera);
   const selfCamera = tracks.find(
     (track) =>
       track.mediaIdentity === localIdentity && track.source === "camera",
   );
-  if (selfCamera) pinned.push(selfCamera);
+  if (selfCamera && selfCamera !== pinnedCamera) pinned.push(selfCamera);
   const pinnedKeys = new Set(pinned.map((track) => track.key));
   const remaining = tracks.filter((track) => !pinnedKeys.has(track.key));
   const pageSize = VIDEO_TILE_LIMIT - pinned.length;
@@ -88,6 +107,8 @@ export function selectStage<T extends StageCandidate>(
       ...remaining.slice(page * pageSize, (page + 1) * pageSize),
     ],
     eligibleIds: new Set(roles.keys()),
+    pinnedParticipantId: pinnedCamera ? pinnedMember!.id : null,
+    selfViewAvailable: !!localMember && localMember.transport !== "phone",
     page,
     pageCount,
     total: tracks.length,

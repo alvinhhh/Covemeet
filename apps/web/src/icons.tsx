@@ -22,6 +22,8 @@ export type IconName =
   | "more"
   | "camera-off"
   | "hand"
+  | "fullscreen"
+  | "fullscreen-exit"
   | "pen";
 
 const paths: Record<IconName, ReactNode> = {
@@ -105,6 +107,8 @@ const paths: Record<IconName, ReactNode> = {
       <path d="M9 3H4v18h5M9 12h12m-5-5 5 5-5 5" />
     </>
   ),
+  fullscreen: <path d="M8 3H3v5M16 3h5v5M3 16v5h5M21 16v5h-5" />,
+  "fullscreen-exit": <path d="M3 8h5V3M21 8h-5V3M8 21v-5H3M16 21v-5h5" />,
   download: (
     <>
       <path d="M12 3v12m-5-5 5 5 5-5M4 15v6h16v-6" />

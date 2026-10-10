@@ -2478,6 +2478,26 @@ input[type="radio"] {
 .conference .meeting-header-actions {
   flex-shrink: 0;
 }
+.conference:fullscreen {
+  width: 100%;
+  height: 100%;
+}
+.conference .fullscreen-control {
+  position: relative;
+}
+.conference .fullscreen-error {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  z-index: 20;
+  width: 220px;
+  padding: 12px;
+  border: 1px solid #777;
+  border-radius: 8px;
+  background: #171717;
+  color: #fff;
+  font-size: 12px;
+}
 .conference .meeting-header-actions .button {
   min-height: 40px;
   border-radius: 10px;
@@ -2656,6 +2676,7 @@ input[type="radio"] {
   color: #b3b3b3;
   flex-shrink: 0;
   padding: 0 4px;
+  flex-wrap: wrap;
 }
 .conference .connection-label > span {
   width: 6px;
@@ -2680,6 +2701,32 @@ input[type="radio"] {
 .conference .video-pagination button {
   min-height: 28px;
   color: #ffffff;
+}
+.conference .stage-view-controls {
+  margin-left: auto;
+}
+.conference .stage-view-controls button,
+.conference .tile-pin {
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid #777;
+  border-radius: 6px;
+  background: #171717;
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.conference .tile-pin {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  min-width: 44px;
+  min-height: 44px;
+}
+.conference .tile-pin[aria-pressed="true"] {
+  background: #fff;
+  color: #171717;
 }
 .conference .video-grid {
   container-type: size;
@@ -2710,6 +2757,19 @@ input[type="radio"] {
 }
 .conference .video-tile.is-speaking {
   border-color: #c5c5c5;
+}
+.conference .video-tile.pinned-tile {
+  border-color: #fff;
+}
+.conference .video-grid:not(.has-screen) .pinned-tile {
+  grid-column: 1 / -1;
+  justify-self: center;
+}
+.conference .video-grid:not(.has-screen):not([data-tile-count="1"]) .pinned-tile {
+  width: min(100%, calc(60cqh * 16 / 9));
+  block-size: min(60cqh, calc(100cqw * 9 / 16));
+  align-self: start;
+  min-height: 0;
 }
 .conference .tile-hand {
   position: absolute;

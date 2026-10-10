@@ -231,3 +231,135 @@ test("current media identities preserve logical self and roles while retiring ol
     !next.visible.some((track) => track.mediaIdentity === "guest-current"),
   );
 });
+
+test("a local pin stays on every bounded page after shared screens without duplicating self", () => {
+  const people = members(40);
+  const tracks: StageCandidate[] = [
+    ...cameras(40),
+    ...cameras(3).map((track) => ({
+      ...track,
+      key: `${track.mediaIdentity}:screen`,
+      source: "screen_share" as const,
+    })),
+  ];
+  const view = { pinnedParticipantId: "p39" };
+  const first = selectStage(tracks, people, context, 0, view);
+  const seen = new Set<string>();
+  for (let page = 0; page < first.pageCount; page++) {
+    const selected = selectStage(tracks, people, context, page, view);
+    assert(selected.visible.length <= 16);
+    assert(
+      selected.visible
+        .slice(0, 2)
+        .every((track) => track.source === "screen_share"),
+    );
+    assert.equal(selected.visible[2].mediaIdentity, "p39");
+    assert.equal(selected.visible[3].mediaIdentity, "p0");
+    assert.equal(selected.pinnedParticipantId, "p39");
+    assert.equal(
+      new Set(selected.visible.map((track) => track.key)).size,
+      selected.visible.length,
+    );
+    for (const track of selected.visible) seen.add(track.key);
+  }
+  assert.equal(seen.size, tracks.length);
+  const selfPin = selectStage(tracks, people, context, 0, {
+    pinnedParticipantId: "p0",
+  });
+  assert.equal(
+    selfPin.visible.filter((track) => track.key === "p0:camera").length,
+    1,
+  );
+  assert.deepEqual(
+    selectStage(tracks, people, context, 0, { pinnedParticipantId: null }),
+    selectStage(tracks, people, context, 0),
+  );
+});
+
+test("hiding self removes only the local camera, keeps local screen and audio eligibility, and can be reversed", () => {
+  const people = members(3).map((member, i) => ({
+    ...member,
+    mediaIdentity: `current${i}`,
+  }));
+  const tracks: StageCandidate[] = [
+    ...cameras(3).map((track, i) => ({
+      ...track,
+      mediaIdentity: `current${i}`,
+    })),
+    { key: "self-screen", mediaIdentity: "current0", source: "screen_share" },
+  ];
+  const normal = selectStage(tracks, people, context, 0);
+  const hidden = selectStage(tracks, people, context, 0, {
+    hideSelfView: true,
+    pinnedParticipantId: "p0",
+  });
+  assert.deepEqual(hidden.eligibleIds, normal.eligibleIds);
+  assert.equal(hidden.selfViewAvailable, true);
+  assert.equal(hidden.pinnedParticipantId, null);
+  assert(hidden.visible.some((track) => track.key === "self-screen"));
+  assert(
+    !hidden.visible.some(
+      (track) =>
+        track.source === "camera" && track.mediaIdentity === "current0",
+    ),
+  );
+  assert.equal(hidden.total, normal.total - 1);
+  assert.deepEqual(
+    selectStage(tracks, people, context, 0, { hideSelfView: false }),
+    normal,
+  );
+  assert.equal(tracks.length, 4);
+});
+
+test("pins follow current identities without admitting retired, other-room, waiting, viewer, or phone tiles", () => {
+  const people = members(6).map((member, i) => ({
+    ...member,
+    mediaIdentity: i === 1 ? "guest-current" : member.id,
+    status: i === 2 ? "waiting" : member.status,
+    breakoutId: i === 3 ? "other-room" : null,
+    role: i === 4 ? ("viewer" as const) : member.role,
+    transport: i === 5 ? ("phone" as const) : ("browser" as const),
+  }));
+  const tracks: StageCandidate[] = [
+    ...cameras(7),
+    { key: "guest-camera", mediaIdentity: "guest-current", source: "camera" },
+  ];
+  const webinar = {
+    ...context,
+    mode: "webinar" as const,
+    webinarBackstage: false,
+  };
+  const pinned = selectStage(tracks, people, webinar, 0, {
+    pinnedParticipantId: "p1",
+  });
+  assert.equal(pinned.visible[0].mediaIdentity, "guest-current");
+  assert(!pinned.visible.some((track) => track.mediaIdentity === "p1"));
+  for (const id of ["p2", "p3", "p4", "p5", "p6"]) {
+    const selected = selectStage(tracks, people, webinar, 0, {
+      pinnedParticipantId: id,
+    });
+    assert.equal(selected.pinnedParticipantId, null);
+    assert.deepEqual(
+      selected.visible.map((track) => track.mediaIdentity),
+      ["p0", "guest-current"],
+    );
+  }
+  const removed = selectStage(
+    tracks,
+    people.filter((member) => member.id !== "p1"),
+    webinar,
+    99,
+    { pinnedParticipantId: "p1" },
+  );
+  assert.equal(removed.pinnedParticipantId, null);
+  assert.equal(removed.page, 0);
+  assert.deepEqual(
+    removed.visible.map((track) => track.mediaIdentity),
+    ["p0"],
+  );
+  assert.equal(
+    selectStage(tracks, people, { ...webinar, localId: "p4" }, 0)
+      .selfViewAvailable,
+    false,
+  );
+});

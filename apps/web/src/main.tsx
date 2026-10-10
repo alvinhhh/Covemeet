@@ -44,7 +44,8 @@ import { brandLogo } from "./brand";
 import { scheduledMeetingPending } from "./scheduled-status";
 import { companySlug, routeBranding } from "./team-branding";
 import { BrandingEditor } from "./branding";
-import { selectStage } from "./stage-policy";
+import { selectStage, type StageView } from "./stage-policy";
+import { FullscreenControl } from "./fullscreen-control";
 import {
   observeAudioSignals,
   offscreenSpeakers,
@@ -1150,10 +1151,12 @@ function Conference({
   refresh: () => void;
   handChanged: (id: string, update: HandUpdate) => void;
 } & InputDeviceProps) {
+  const conference = useRef<HTMLDivElement>(null);
   const [panel, setPanel] = useState<
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
   >(null);
   const [boardOpen, setBoardOpen] = useState(false);
+  const [stageView, setStageView] = useState<StageView>({});
   const boardViews = useRef(new Map<string, Viewport>());
   const [audioSignals, setAudioSignals] = useState<Map<string, AudioSignal>>(
     new Map(),
@@ -1378,6 +1381,8 @@ function Conference({
             participants={state.participants}
             mode={state.meeting.mode}
             boardOpen={boardOpen}
+            view={stageView}
+            setView={setStageView}
             signals={audioSignals}
             setSignals={setAudioSignals}
             board={board}
@@ -1772,7 +1777,7 @@ function Conference({
     </>
   );
   return (
-    <div className="conference">
+    <div className="conference" ref={conference}>
       <header className="meeting-header">
         <Logo name={config.brandName} small />
         <div className="meeting-title">
@@ -1796,6 +1801,7 @@ function Conference({
           </span>
         </div>
         <div className="meeting-header-actions">
+          <FullscreenControl target={conference} />
           {webinar?.canManage && webinar.phase === "backstage" && (
             <Button
               className="primary webinar-control"
@@ -1941,6 +1947,8 @@ function MediaStage({
   board,
   signals,
   setSignals,
+  view,
+  setView,
 }: {
   me: Participant;
   participants: Participant[];
@@ -1949,9 +1957,12 @@ function MediaStage({
   board: ReactNode;
   signals: Map<string, AudioSignal>;
   setSignals: (signals: Map<string, AudioSignal>) => void;
+  view: StageView;
+  setView: (view: StageView) => void;
 }) {
   const room = useRoomContext();
   const [page, setPage] = useState(0);
+  const { pinnedParticipantId, hideSelfView } = view;
   const tracks = useTracks(
     [
       { source: Track.Source.Camera, withPlaceholder: true },
@@ -1978,7 +1989,19 @@ function MediaStage({
       webinarBackstage: me.webinarBackstage,
     },
     page,
+    view,
   );
+  const pinnedMember = participants.find(
+    (member) => member.id === pinnedParticipantId,
+  );
+  const pinEligible =
+    !!pinnedMember &&
+    pinnedMember.transport !== "phone" &&
+    selection.eligibleIds.has(participantMediaIdentity(pinnedMember));
+  useEffect(() => {
+    if (pinnedParticipantId && !pinEligible)
+      setView({ ...view, pinnedParticipantId: null });
+  }, [pinnedParticipantId, pinEligible, view, setView]);
   const visible = selection.visible.map(({ track }) => track);
   const selectedVideoIds = (boardOpen ? [] : visible)
     .filter(isTrackReference)
@@ -2071,6 +2094,25 @@ function MediaStage({
             {otherSpeakers.map((participant) => participant.name).join(", ")}
           </div>
         )}
+        {!boardOpen && selection.selfViewAvailable && (
+          <div className="stage-view-controls">
+            <button
+              type="button"
+              onClick={() => {
+                setView({
+                  ...view,
+                  hideSelfView: !hideSelfView,
+                  pinnedParticipantId:
+                    !hideSelfView && pinnedParticipantId === me.id
+                      ? null
+                      : pinnedParticipantId,
+                });
+              }}
+            >
+              {hideSelfView ? "Show self-view" : "Hide self-view"}
+            </button>
+          </div>
+        )}
         {selection.pageCount > 1 && (
           <nav className="video-pagination" aria-label="Video pages">
             <button
@@ -2122,9 +2164,13 @@ function MediaStage({
               );
               const name =
                 participant?.name || track.participant.name || "Participant";
+              const pinned =
+                track.source === Track.Source.Camera &&
+                participant?.id === selection.pinnedParticipantId;
+              const pinLabel = `${pinned ? "Unpin" : "Pin"} ${name} for me`;
               return (
                 <div
-                  className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""}`}
+                  className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""} ${pinned ? "pinned-tile" : ""}`}
                   key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
                 >
                   {isTrackReference(track) && !track.publication.isMuted ? (
@@ -2146,6 +2192,23 @@ function MediaStage({
                         <Icon name="hand" size={18} />
                       </span>
                     )}
+                  {track.source === Track.Source.Camera && participant && (
+                    <button
+                      type="button"
+                      className="tile-pin"
+                      aria-label={pinLabel}
+                      title={pinLabel}
+                      aria-pressed={pinned}
+                      onClick={() =>
+                        setView({
+                          ...view,
+                          pinnedParticipantId: pinned ? null : participant.id,
+                        })
+                      }
+                    >
+                      {pinned ? "Unpin" : "Pin"}
+                    </button>
+                  )}
                   <div className="tile-caption">
                     <span className="tile-name" title={name}>
                       {name}
@@ -2162,9 +2225,11 @@ function MediaStage({
           </div>
           {visible.length === 0 && (
             <div className="empty-stage">
-              {mode === "webinar"
-                ? "Waiting for a presenter"
-                : "Waiting for participants"}
+              {hideSelfView && selection.selfViewAvailable
+                ? "Self-view hidden"
+                : mode === "webinar"
+                  ? "Waiting for a presenter"
+                  : "Waiting for participants"}
             </div>
           )}
         </>
