@@ -8,6 +8,8 @@ type StageMember = {
   breakoutId: string | null;
   webinarBackstage?: boolean;
   transport?: "browser" | "phone";
+  enforcementPending?: boolean;
+  mediaAllowed?: boolean;
 };
 export type StageCandidate = {
   key: string;
@@ -33,6 +35,7 @@ export function selectStage<T extends StageCandidate>(
     webinarBackstage?: boolean;
     speakingIds?: readonly string[];
     speakerIdentity?: string | null;
+    spotlightParticipantId?: string | null;
   },
   requestedPage: number,
   view: StageView = {},
@@ -61,6 +64,14 @@ export function selectStage<T extends StageCandidate>(
     (member) => member.id === view.pinnedParticipantId,
   );
   const pinnedIdentity = pinnedMember && participantMediaIdentity(pinnedMember);
+  const spotlightMember = eligible.find(
+    (member) =>
+      member.id === context.spotlightParticipantId &&
+      !member.enforcementPending &&
+      member.mediaAllowed !== false,
+  );
+  const spotlightIdentity =
+    spotlightMember && participantMediaIdentity(spotlightMember);
   const tracks = [
     ...new Map(
       candidates
@@ -94,6 +105,10 @@ export function selectStage<T extends StageCandidate>(
     (track) =>
       track.mediaIdentity === localIdentity && track.source === "camera",
   );
+  const spotlightCamera = tracks.find(
+    (track) =>
+      track.mediaIdentity === spotlightIdentity && track.source === "camera",
+  );
   const cameras = tracks.filter((track) => track.source === "camera");
   const previousSpeaker = cameras.find(
     (track) => track.mediaIdentity === context.speakerIdentity,
@@ -110,8 +125,12 @@ export function selectStage<T extends StageCandidate>(
     previousSpeaker ??
     cameras.find((track) => track.mediaIdentity !== localIdentity) ??
     selfCamera;
+  // A pin is this viewer's choice; a spotlight is the room's shared default.
+  // Both remain behind shared screens and respect hidden self-view.
   const featuredCamera =
-    pinnedCamera ?? (view.layout === "speaker" ? speakerCamera : undefined);
+    pinnedCamera ??
+    spotlightCamera ??
+    (view.layout === "speaker" ? speakerCamera : undefined);
   if (featuredCamera) pinned.push(featuredCamera);
   if (selfCamera && selfCamera !== featuredCamera) pinned.push(selfCamera);
   const pinnedKeys = new Set(pinned.map((track) => track.key));
@@ -129,6 +148,8 @@ export function selectStage<T extends StageCandidate>(
     ],
     eligibleIds: new Set(roles.keys()),
     pinnedParticipantId: pinnedCamera ? pinnedMember!.id : null,
+    spotlightKey:
+      featuredCamera === spotlightCamera ? spotlightCamera?.key : undefined,
     speakerIdentity: speakerCamera?.mediaIdentity ?? null,
     speakerKey: view.layout === "speaker" ? featuredCamera?.key : undefined,
     selfViewAvailable: !!localMember && localMember.transport !== "phone",

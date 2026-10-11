@@ -17,6 +17,133 @@ const cameras = (count: number): StageCandidate[] =>
     source: "camera",
   }));
 
+test("shared spotlight remains on each bounded page in both layouts after shared screens", () => {
+  const people = members(40);
+  const tracks: StageCandidate[] = [
+    ...cameras(40),
+    { key: "screen", mediaIdentity: "p1", source: "screen_share" },
+  ];
+  for (const layout of ["gallery", "speaker"] as const) {
+    const shared = {
+      ...context,
+      spotlightParticipantId: "p39",
+      speakingIds: ["p38"],
+    };
+    const first = selectStage(tracks, people, shared, 0, { layout });
+    const seen = new Set<string>();
+    for (let page = 0; page < first.pageCount; page++) {
+      const selected = selectStage(tracks, people, shared, page, { layout });
+      assert.equal(selected.visible[0].key, "screen");
+      assert.equal(selected.visible[1].key, "p39:camera");
+      assert.equal(selected.spotlightKey, "p39:camera");
+      assert.equal(selected.pinnedParticipantId, null);
+      assert(selected.visible.length <= 16);
+      assert.equal(
+        new Set(selected.visible.map((track) => track.key)).size,
+        selected.visible.length,
+      );
+      for (const track of selected.visible) seen.add(track.key);
+    }
+    assert.equal(seen.size, tracks.length);
+  }
+});
+
+test("a local pin overrides shared spotlight without changing it, and hidden self-view stays hidden", () => {
+  const shared = {
+    ...context,
+    spotlightParticipantId: "p2",
+    speakingIds: ["p3"],
+  };
+  const view = { layout: "speaker" as const, pinnedParticipantId: "p1" };
+  const pinned = selectStage(cameras(4), members(4), shared, 0, view);
+  assert.equal(pinned.visible[0].key, "p1:camera");
+  assert.equal(pinned.spotlightKey, undefined);
+  const unpinned = selectStage(cameras(4), members(4), shared, 0, {
+    layout: "speaker",
+  });
+  assert.equal(unpinned.spotlightKey, "p2:camera");
+  assert.equal(unpinned.speakerIdentity, "p3");
+  const hidden = selectStage(
+    cameras(4),
+    members(4),
+    { ...shared, spotlightParticipantId: "p0" },
+    0,
+    { hideSelfView: true },
+  );
+  assert.equal(hidden.spotlightKey, undefined);
+  assert(!hidden.visible.some((track) => track.mediaIdentity === "p0"));
+  assert.equal(
+    selectStage(
+      cameras(4),
+      members(4),
+      { ...shared, spotlightParticipantId: null },
+      0,
+    ).spotlightKey,
+    undefined,
+  );
+  assert.equal(shared.spotlightParticipantId, "p2");
+});
+
+test("spotlight resolves only current eligible room identities and ignores stale or removed targets", () => {
+  const people = members(7).map((member, i) => ({
+    ...member,
+    mediaIdentity: i === 1 ? "current" : member.id,
+    breakoutId: i === 2 ? "other-room" : null,
+    status: i === 3 ? "kicked" : member.status,
+    transport: i === 4 ? ("phone" as const) : ("browser" as const),
+    webinarBackstage: i === 5,
+    role: i === 6 ? ("viewer" as const) : member.role,
+  }));
+  const tracks: StageCandidate[] = [
+    ...cameras(7),
+    { key: "current:camera", mediaIdentity: "current", source: "camera" },
+  ];
+  const stage = {
+    ...context,
+    mode: "webinar" as const,
+    webinarBackstage: false,
+  };
+  assert.equal(
+    selectStage(tracks, people, { ...stage, spotlightParticipantId: "p1" }, 0)
+      .spotlightKey,
+    "current:camera",
+  );
+  for (const id of ["p2", "p3", "p4", "p5", "p6", "removed"]) {
+    const selected = selectStage(
+      tracks,
+      people,
+      { ...stage, spotlightParticipantId: id },
+      0,
+    );
+    assert.equal(selected.spotlightKey, undefined);
+    assert.deepEqual(
+      selected.visible.map((track) => track.mediaIdentity),
+      ["p0", "current"],
+    );
+  }
+  assert.equal(
+    selectStage(
+      tracks,
+      people.filter((p) => p.id !== "p1"),
+      { ...stage, spotlightParticipantId: "p1" },
+      0,
+    ).spotlightKey,
+    undefined,
+  );
+  for (const readiness of [
+    { enforcementPending: true },
+    { mediaAllowed: false },
+  ]) {
+    const selected = selectStage(
+      tracks,
+      people.map((p) => (p.id === "p1" ? { ...p, ...readiness } : p)),
+      { ...stage, spotlightParticipantId: "p1" },
+      0,
+    );
+    assert.equal(selected.spotlightKey, undefined);
+  }
+});
+
 test("100-person meeting stays within 16 tiles on every page, keeps self visible and reaches every participant", () => {
   const people = members(100),
     tracks = cameras(100);

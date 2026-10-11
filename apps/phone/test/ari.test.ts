@@ -8,7 +8,12 @@ import {
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocketServer, type WebSocket } from "ws";
-import { AriClient, AriRequestError, type AriEvent } from "../src/ari.js";
+import {
+  AriClient,
+  AriRequestError,
+  type AriConfig,
+  type AriEvent,
+} from "../src/ari.js";
 
 const password = "synthetic-ari-test-password-123456789";
 const channel = {
@@ -38,6 +43,7 @@ async function fixture(
   t: TestContext,
   handler?: (req: IncomingMessage, res: ServerResponse) => void,
   autoPong = true,
+  timing: Pick<AriConfig, "requestTimeoutMs" | "heartbeatMs"> = {},
 ) {
   const requests: {
     method: string;
@@ -94,8 +100,8 @@ async function fixture(
     password,
     app: "covemeet",
     development: true,
-    requestTimeoutMs: 150,
-    heartbeatMs: 100,
+    // Protocol checks use runtime deadlines; fault tests opt into short clocks.
+    ...timing,
     onEvent: (event) => {
       events.push(event);
     },
@@ -306,7 +312,7 @@ for (const [name, event] of [
   });
 
 test("ARI missed pong closes admission, intentional close does not signal failure", async (t) => {
-  const f = await fixture(t, undefined, false);
+  const f = await fixture(t, undefined, false, { heartbeatMs: 100 });
   await f.client.connect();
   await waitFor(() => f.failures.length === 1);
   assert.equal(f.client.connected, false);
@@ -358,26 +364,31 @@ for (const scenario of [
   "empty-success",
 ] as const)
   test(`ARI ${scenario} retains unknown mutation outcome without retry`, async (t) => {
-    const f = await fixture(t, (_req, res) => {
-      if (scenario === "timeout") return;
-      if (scenario === "oversized") {
-        res.writeHead(200).end("x".repeat(270000));
-        return;
-      }
-      if (scenario === "redirect") {
-        res.writeHead(307, { Location: "/ari/channels/redirected" }).end();
-        return;
-      }
-      if (scenario === "server-error") {
-        json(res, { message: "private detail" }, 503);
-        return;
-      }
-      if (scenario === "empty-success") {
-        res.writeHead(200).end();
-        return;
-      }
-      json(res, { ...channel, id: "wrong-channel" });
-    });
+    const f = await fixture(
+      t,
+      (_req, res) => {
+        if (scenario === "timeout") return;
+        if (scenario === "oversized") {
+          res.writeHead(200).end("x".repeat(270000));
+          return;
+        }
+        if (scenario === "redirect") {
+          res.writeHead(307, { Location: "/ari/channels/redirected" }).end();
+          return;
+        }
+        if (scenario === "server-error") {
+          json(res, { message: "private detail" }, 503);
+          return;
+        }
+        if (scenario === "empty-success") {
+          res.writeHead(200).end();
+          return;
+        }
+        json(res, { ...channel, id: "wrong-channel" });
+      },
+      true,
+      scenario === "timeout" ? { requestTimeoutMs: 150 } : {},
+    );
     await f.client.connect();
     await assert.rejects(
       f.client.originate({

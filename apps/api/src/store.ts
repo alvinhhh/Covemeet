@@ -1,4 +1,5 @@
 import { fenceParticipantMedia } from "./media-identity.js";
+import { clearStaleSpotlights } from "./spotlight.js";
 import pg from "pg";
 import {
   allocateRecordingStorage,
@@ -254,6 +255,7 @@ export type Meeting = {
   retentionPurgedAt?: number;
   recordingAllowed: boolean;
   chatMode?: "everyone" | "host-only" | "disabled";
+  spotlights?: { scope: string; participantId: string }[];
   createdAt: number;
   revision: number;
   passwordHash: string;
@@ -2476,7 +2478,9 @@ export class PgStore implements Store {
         ])
       ).rows[0]?.data as Meeting | undefined;
       if (!m) throw new HttpError(404, "Meeting unavailable");
+      clearStaleSpotlights(m);
       const result = await fn(m);
+      clearStaleSpotlights(m);
       m.revision++;
       await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
         code,
@@ -3674,7 +3678,9 @@ export class MemoryStore implements Store {
     return this.serialize(async () => {
       const m = await this.get(code);
       if (!m) throw new HttpError(404, "Meeting unavailable");
+      clearStaleSpotlights(m);
       const r = await fn(m);
+      clearStaleSpotlights(m);
       m.revision++;
       this.data.set(code, m);
       return r;

@@ -1428,6 +1428,7 @@ function Conference({
             me={state.me}
             participants={state.participants}
             mode={state.meeting.mode}
+            spotlightParticipantId={state.meeting.spotlightParticipantId}
             boardOpen={boardOpen}
             view={stageView}
             setView={setStageView}
@@ -1614,6 +1615,27 @@ function Conference({
                       state.me.breakoutId ??
                       (state.me.webinarBackstage ? "@backstage" : ""),
                   })
+                }
+                spotlight={(participant) =>
+                  mutate(
+                    "/spotlight",
+                    {
+                      scope:
+                        state.me.breakoutId ??
+                        (state.me.webinarBackstage ? "@backstage" : ""),
+                      target: participant
+                        ? {
+                            id: participant.id,
+                            mediaVersion: participant.mediaVersion,
+                          }
+                        : null,
+                      ...(!participant && {
+                        expectedParticipantId:
+                          state.meeting.spotlightParticipantId,
+                      }),
+                    },
+                    "PUT",
+                  )
                 }
                 grant={(id, enabled) =>
                   mutate(
@@ -2003,6 +2025,7 @@ function MediaStage({
   me,
   participants,
   mode,
+  spotlightParticipantId,
   boardOpen,
   board,
   signals,
@@ -2013,6 +2036,7 @@ function MediaStage({
   me: Participant;
   participants: Participant[];
   mode: "meeting" | "webinar";
+  spotlightParticipantId?: string | null;
   boardOpen: boolean;
   board: ReactNode;
   signals: Map<string, AudioSignal>;
@@ -2049,6 +2073,7 @@ function MediaStage({
       breakoutId: me.breakoutId,
       webinarBackstage: me.webinarBackstage,
       speakerIdentity,
+      spotlightParticipantId,
       speakingIds: participants
         .filter(
           (participant) =>
@@ -2260,7 +2285,7 @@ function MediaStage({
               const pinLabel = `${pinned ? "Unpin" : "Pin"} ${name} for me`;
               return (
                 <div
-                  className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""} ${pinned ? "pinned-tile" : ""} ${key === selection.speakerKey ? "speaker-tile" : ""}`}
+                  className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""} ${pinned ? "pinned-tile" : ""} ${key === selection.speakerKey ? "speaker-tile" : ""} ${key === selection.spotlightKey ? "spotlight-tile" : ""}`}
                   key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
                 >
                   {isTrackReference(track) && !track.publication.isMuted ? (
@@ -2312,6 +2337,7 @@ function MediaStage({
                       {track.source === Track.Source.ScreenShare
                         ? " · Screen"
                         : ""}
+                      {key === selection.spotlightKey ? " · Spotlight" : ""}
                     </span>
                     <SpeakingBadge surface="tile" name={name} signal={signal} />
                   </div>
@@ -2668,6 +2694,7 @@ function Participants({
   lowerHand,
   action,
   muteAll,
+  spotlight,
   grant,
   stage,
   openPhone,
@@ -2679,6 +2706,7 @@ function Participants({
   lowerHand: (id: string) => Promise<boolean | undefined>;
   action: (id: string, data: object) => Promise<boolean>;
   muteAll: () => Promise<boolean>;
+  spotlight: (participant: Participant | null) => Promise<boolean>;
   grant: (id: string, enabled: boolean) => Promise<boolean>;
   stage: (id: string, location: "backstage" | "stage") => Promise<boolean>;
   openPhone?: () => void;
@@ -2696,6 +2724,14 @@ function Participants({
     p.id !== state.me.id &&
     p.role !== "host" &&
     (host || !p.moderator);
+  const canSpotlight = (p: Participant) =>
+    moderator &&
+    p.status === "admitted" &&
+    p.transport !== "phone" &&
+    p.role !== "viewer" &&
+    participantMediaAllowed(p) &&
+    participantRoomScope(state.meeting.mode, p) ===
+      participantRoomScope(state.meeting.mode, state.me);
   const webinar = state.meeting.webinar;
   const canStage = (p: Participant) =>
     !!webinar?.canManage &&
@@ -2891,6 +2927,31 @@ function Participants({
               </button>
             )}
           </div>
+          {canSpotlight(p) && (
+            <div className="participant-actions">
+              <Button
+                className="small"
+                disabled={
+                  busy || !!state.me.enforcementPending || state.meeting.ended
+                }
+                aria-pressed={state.meeting.spotlightParticipantId === p.id}
+                aria-label={
+                  state.meeting.spotlightParticipantId === p.id
+                    ? `Remove spotlight from ${p.name}`
+                    : `Spotlight ${p.name} for this room`
+                }
+                onClick={() =>
+                  void spotlight(
+                    state.meeting.spotlightParticipantId === p.id ? null : p,
+                  )
+                }
+              >
+                {state.meeting.spotlightParticipantId === p.id
+                  ? "Remove spotlight"
+                  : "Spotlight"}
+              </Button>
+            </div>
+          )}
           {canStage(p) && (
             <div className="webinar-stage-action">
               <Button

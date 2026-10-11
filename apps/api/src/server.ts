@@ -16,6 +16,7 @@ import { createMailBudget, createMailTransport } from "@meeting-platform/mail";
 import { digestDownloadToken } from "@meeting-platform/recording";
 import { z } from "zod";
 import { whiteboardInput } from "./whiteboard.js";
+import { roomSpotlight, spotlightTarget } from "./spotlight.js";
 import type { Config } from "./config.js";
 import type { ChatMessage, Meeting, Participant, Store } from "./store.js";
 import { canShareScreen, clearRecordingLink } from "./store.js";
@@ -1503,6 +1504,9 @@ export async function createApp(config: Config, store: Store, media: Media) {
           code: m.code,
           title: m.title,
           mode: m.mode,
+          spotlightParticipantId: canSee
+            ? roomSpotlight(m, participantDataScope(m, p))
+            : null,
           webinar:
             m.mode === "webinar"
               ? {
@@ -1676,6 +1680,76 @@ export async function createApp(config: Config, store: Store, media: Media) {
     );
     return { ok: true };
   });
+  app.put(
+    "/api/meetings/:code/spotlight",
+    {
+      config: {
+        rateLimit: {
+          max: 30,
+          timeWindow: "1 minute",
+          keyGenerator: browserRateKey,
+        },
+      },
+    },
+    async (req) => {
+      const body = z
+        .union([
+          z
+            .object({
+              scope: z.string().max(64),
+              target: z
+                .object({ id: z.uuid(), mediaVersion: z.number().int().min(0) })
+                .strict(),
+            })
+            .strict(),
+          z
+            .object({
+              scope: z.string().max(64),
+              target: z.null(),
+              expectedParticipantId: z.uuid(),
+            })
+            .strict(),
+        ])
+        .parse(req.body);
+      const { scope, target } = body;
+      let actorId!: string;
+      const result = await store.change(codeOf(req), (m) => {
+        active(m);
+        const self = moderationActor(req, m);
+        if (self.enforcementPending)
+          throw new HttpError(409, "Wait for your room connection to complete");
+        if (participantDataScope(m, self) !== scope)
+          throw new HttpError(409, "Room changed; refresh and try again");
+        if (
+          body.target === null &&
+          m.spotlights?.find((entry) => entry.scope === scope)?.participantId !==
+            body.expectedParticipantId
+        )
+          throw new HttpError(409, "Spotlight changed; refresh and try again");
+        if (target) {
+          const p = spotlightTarget(m, scope, target.id);
+          if (!p || p.mediaVersion !== target.mediaVersion)
+            throw new HttpError(
+              409,
+              "Participant changed; refresh and try again",
+            );
+        }
+        actorId = self.id;
+        m.spotlights = (m.spotlights ?? []).filter(
+          (entry) => entry.scope !== scope,
+        );
+        if (target) m.spotlights.push({ scope, participantId: target.id });
+        return { ok: true, revision: m.revision + 1 };
+      });
+      await store.audit(
+        codeOf(req),
+        actorId,
+        target ? "spotlight.set" : "spotlight.clear",
+        target?.id ?? (scope || "main"),
+      );
+      return result;
+    },
+  );
   app.post(
     "/api/meetings/:code/participants/mute-all",
     {

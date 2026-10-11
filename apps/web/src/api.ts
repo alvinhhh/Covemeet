@@ -73,6 +73,7 @@ export type MeetingState = {
     code: string;
     title: string;
     mode: "meeting" | "webinar";
+    spotlightParticipantId?: string | null;
     webinar?: {
       presenters: number;
       viewers: number;

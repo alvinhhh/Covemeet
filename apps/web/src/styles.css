@@ -2759,6 +2759,7 @@ input[type="radio"] {
   aspect-ratio: 16 / 9;
   min-height: 140px;
   min-width: 0;
+  max-width: 100%;
   border: 2px solid transparent;
   border-radius: 16px;
   background: #292929;
@@ -2770,13 +2771,15 @@ input[type="radio"] {
 .conference .video-tile.pinned-tile {
   border-color: #fff;
 }
-.conference .video-grid:not(.has-screen) :is(.pinned-tile, .speaker-tile) {
+.conference
+  .video-grid:not(.has-screen)
+  :is(.pinned-tile, .speaker-tile, .spotlight-tile) {
   grid-column: 1 / -1;
   justify-self: center;
 }
 .conference
   .video-grid:not(.has-screen):not([data-tile-count="1"])
-  :is(.pinned-tile, .speaker-tile) {
+  :is(.pinned-tile, .speaker-tile, .spotlight-tile) {
   width: min(100%, calc(60cqh * 16 / 9));
   block-size: min(60cqh, calc(100cqw * 9 / 16));
   align-self: start;
@@ -2897,10 +2900,16 @@ input[type="radio"] {
 .conference .audio-level i.active {
   opacity: 1;
 }
-.conference .screen-tile {
+.conference .video-grid .video-tile.screen-tile {
   grid-column: 1 / -1;
-  min-height: 220px;
+  width: 100%;
+  aspect-ratio: auto;
+  block-size: min(60cqh, calc(100cqw * 9 / 16));
+  min-height: 0;
   background: #090909;
+}
+.conference .video-grid[data-tile-count="1"] .screen-tile {
+  block-size: min(100cqh, calc(100cqw * 9 / 16));
 }
 .conference .screen-tile video {
   object-fit: contain;

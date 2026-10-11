@@ -7,6 +7,7 @@ import { createApp } from "../src/server.js";
 import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import type { Media } from "../src/media.js";
 import { RecordingService } from "../src/recordings.js";
+import { roomSpotlight } from "../src/spotlight.js";
 import argon2 from "argon2";
 import {
   controllerPresent,
@@ -167,6 +168,482 @@ async function fixture(
   }
   return { app, store, media, host, create, meeting, join, action };
 }
+
+test("spotlight requires current host or co-host authority and reaches room state without changing media", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  const path = `/api/meetings/${m.code}`;
+  const host = (await f.store.get(m.code))!.participants.find(
+    (p) => p.id === m.hostId,
+  )!;
+  const body = {
+    scope: "",
+    target: { id: m.hostId, mediaVersion: host.mediaVersion },
+  };
+  assert.equal(
+    (
+      await new Client(f.app, "198.51.100.90").request(
+        "PUT",
+        `${path}/spotlight`,
+        body,
+      )
+    ).statusCode,
+    401,
+  );
+  assert.equal(
+    (await guest.client.request("PUT", `${path}/spotlight`, body)).statusCode,
+    403,
+  );
+  await f.action(m.code, guest.id, "admit");
+  assert.equal(
+    (await guest.client.request("PUT", `${path}/spotlight`, body)).statusCode,
+    403,
+  );
+  assert.equal(
+    (
+      await guest.client.request("PUT", `${path}/spotlight`, {
+        scope: "",
+        target: null,
+        expectedParticipantId: m.hostId,
+      })
+    ).statusCode,
+    403,
+  );
+  for (const invalid of [
+    {},
+    { ...body, role: "host" },
+    { ...body, target: { id: guest.id } },
+    { scope: "", target: null },
+  ])
+    assert.equal(
+      (await f.host.request("PUT", `${path}/spotlight`, invalid)).statusCode,
+      400,
+    );
+
+  const before = (await f.store.get(m.code))!;
+  const selected = await f.host.request("PUT", `${path}/spotlight`, body);
+  ok(selected);
+  assert.equal(selected.json().revision, before.revision + 1);
+  assert.equal(
+    (await guest.client.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    m.hostId,
+  );
+  assert.deepEqual(
+    (await f.store.get(m.code))!.participants,
+    before.participants,
+  );
+  assert.deepEqual(f.media.removed, []);
+  assert.equal(f.store.auditEvents.at(-1)?.action, "spotlight.set");
+
+  ok(
+    await f.host.request("PUT", `${path}/participants/${guest.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  ok(
+    await guest.client.request("PUT", `${path}/spotlight`, {
+      scope: "",
+      target: {
+        id: guest.id,
+        mediaVersion: before.participants.find((p) => p.id === guest.id)!
+          .mediaVersion,
+      },
+    }),
+  );
+  assert.equal(
+    (await f.host.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    guest.id,
+  );
+  ok(
+    await guest.client.request("PUT", `${path}/spotlight`, {
+      scope: "",
+      target: null,
+      expectedParticipantId: guest.id,
+    }),
+  );
+  assert.equal(
+    (await f.host.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    null,
+  );
+  ok(
+    await f.host.request("PUT", `${path}/participants/${guest.id}/moderator`, {
+      enabled: false,
+    }),
+  );
+  assert.equal(
+    (await guest.client.request("PUT", `${path}/spotlight`, body)).statusCode,
+    403,
+  );
+});
+
+test("spotlight rejects a stale clear after another moderator selects a replacement", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const cohost = await f.join(m.code);
+  await f.action(m.code, cohost.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  ok(
+    await f.host.request("PUT", `${path}/participants/${cohost.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  const participants = (await f.store.get(m.code))!.participants;
+  for (const [client, id] of [
+    [f.host, m.hostId],
+    [cohost.client, cohost.id],
+  ] as const)
+    ok(
+      await client.request("PUT", `${path}/spotlight`, {
+        scope: "",
+        target: {
+          id,
+          mediaVersion: participants.find((p) => p.id === id)!.mediaVersion,
+        },
+      }),
+    );
+  const before = (await f.store.get(m.code))!;
+  const stale = await f.host.request("PUT", `${path}/spotlight`, {
+    scope: "",
+    target: null,
+    expectedParticipantId: m.hostId,
+  });
+  assert.equal(stale.statusCode, 409);
+  assert.match(stale.json().error, /Spotlight changed/);
+  const after = (await f.store.get(m.code))!;
+  assert.deepEqual(after.spotlights, before.spotlights);
+  assert.equal(after.revision, before.revision);
+  assert.equal(
+    (await f.host.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    cohost.id,
+  );
+  ok(
+    await f.host.request("PUT", `${path}/spotlight`, {
+      scope: "",
+      target: null,
+      expectedParticipantId: cohost.id,
+    }),
+  );
+  assert.equal((await f.store.get(m.code))!.spotlights, undefined);
+});
+
+test("spotlight survives same-room mute, allow, rename and mute-all fences while pending media stays hidden", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  await f.action(m.code, guest.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  const original = (await f.store.get(m.code))!.participants.find(
+    (p) => p.id === guest.id,
+  )!;
+  ok(
+    await f.host.request("PUT", `${path}/spotlight`, {
+      scope: "",
+      target: { id: guest.id, mediaVersion: original.mediaVersion },
+    }),
+  );
+  const removed = f.media.remove.bind(f.media);
+  let pendingChecks = 0;
+  f.media.remove = async (room, participant) => {
+    const pending = (await f.store.get(m.code))!;
+    const target = pending.participants.find((p) => p.id === guest.id)!;
+    assert.equal(target.enforcementPending, true);
+    assert.deepEqual(pending.spotlights, [
+      { scope: "", participantId: guest.id },
+    ]);
+    assert.equal(
+      (await f.host.request("GET", `${path}/state`)).json().meeting
+        .spotlightParticipantId,
+      null,
+    );
+    assert.equal(
+      (
+        await f.host.request("PUT", `${path}/spotlight`, {
+          scope: "",
+          target: { id: guest.id, mediaVersion: target.mediaVersion },
+        })
+      ).statusCode,
+      409,
+    );
+    pendingChecks++;
+    await removed(room, participant);
+  };
+  for (const action of ["block-audio", "allow-audio", "rename", "mute-all"]) {
+    if (action === "mute-all")
+      ok(
+        await f.host.request("POST", `${path}/participants/mute-all`, {
+          scope: "",
+        }),
+      );
+    else
+      await f.action(
+        m.code,
+        guest.id,
+        action,
+        action === "rename" ? { name: "Renamed guest" } : {},
+      );
+    const current = (await f.store.get(m.code))!;
+    const target = current.participants.find((p) => p.id === guest.id)!;
+    assert.equal(target.enforcementPending, false);
+    assert(target.mediaVersion > original.mediaVersion);
+    assert.deepEqual(current.spotlights, [
+      { scope: "", participantId: guest.id },
+    ]);
+    assert.equal(
+      (await f.host.request("GET", `${path}/state`)).json().meeting
+        .spotlightParticipantId,
+      guest.id,
+    );
+  }
+  assert.equal(pendingChecks, 4);
+});
+
+test("spotlight is room scoped, rejects stale targets and actor scopes, and clears across transfers", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const cohost = await f.join(m.code, "198.51.100.31");
+  const guest = await f.join(m.code, "198.51.100.32");
+  const path = `/api/meetings/${m.code}`;
+  for (const p of [cohost, guest]) await f.action(m.code, p.id, "admit");
+  ok(
+    await f.host.request("PUT", `${path}/participants/${cohost.id}/moderator`, {
+      enabled: true,
+    }),
+  );
+  const scope = randomUUID();
+  await f.store.change(m.code, (room) => {
+    room.breakouts.push({
+      id: scope,
+      name: "Group",
+      room: "spotlight-breakout",
+    });
+    for (const p of room.participants)
+      if (p.id !== m.hostId) p.breakoutId = scope;
+  });
+  const participants = (await f.store.get(m.code))!.participants;
+  const target = {
+    id: guest.id,
+    mediaVersion: participants.find((p) => p.id === guest.id)!.mediaVersion,
+  };
+  assert.equal(
+    (await f.host.request("PUT", `${path}/spotlight`, { scope: "", target }))
+      .statusCode,
+    409,
+  );
+  assert.equal(
+    (
+      await cohost.client.request("PUT", `${path}/spotlight`, {
+        scope: "",
+        target,
+      })
+    ).statusCode,
+    409,
+  );
+  assert.equal(
+    (
+      await cohost.client.request("PUT", `${path}/spotlight`, {
+        scope,
+        target: { ...target, mediaVersion: target.mediaVersion + 1 },
+      })
+    ).statusCode,
+    409,
+  );
+  ok(
+    await cohost.client.request("PUT", `${path}/spotlight`, { scope, target }),
+  );
+  assert.equal(
+    (await guest.client.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    guest.id,
+  );
+  assert.equal(
+    (await f.host.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    null,
+  );
+  ok(
+    await f.host.request("PUT", `${path}/spotlight`, {
+      scope: "",
+      target: {
+        id: m.hostId,
+        mediaVersion: participants.find((p) => p.id === m.hostId)!.mediaVersion,
+      },
+    }),
+  );
+  assert.equal(
+    (await guest.client.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    guest.id,
+  );
+
+  ok(
+    await f.host.request("POST", `${path}/move`, {
+      participantId: guest.id,
+      breakoutId: null,
+    }),
+  );
+  assert.equal(
+    (await cohost.client.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    null,
+  );
+  assert.equal(
+    (await guest.client.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    m.hostId,
+  );
+  ok(
+    await f.host.request("POST", `${path}/move`, {
+      participantId: guest.id,
+      breakoutId: scope,
+    }),
+  );
+  assert.equal(
+    (await guest.client.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    null,
+  );
+  assert.equal(
+    (await cohost.client.request("PUT", `${path}/spotlight`, { scope, target }))
+      .statusCode,
+    409,
+  );
+  assert.deepEqual((await f.store.get(m.code))!.spotlights, [
+    { scope: "", participantId: m.hostId },
+  ]);
+});
+
+test("spotlight ignores expired snapshots and removes inactive, missing or ineligible targets on mutation", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  await f.action(m.code, guest.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  const original = (await f.store.get(m.code))!.participants.find(
+    (p) => p.id === guest.id,
+  )!;
+  const body = {
+    scope: "",
+    target: { id: guest.id, mediaVersion: original.mediaVersion },
+  };
+  const invalidate: ((room: Meeting, p: Participant) => void)[] = [
+    (_room, p) => {
+      p.status = "left";
+    },
+    (_room, p) => {
+      p.status = "kicked";
+    },
+    (_room, p) => {
+      p.status = "waiting";
+    },
+    (_room, p) => {
+      p.expiresAt = Date.now() - 1;
+    },
+    (_room, p) => {
+      p.role = "viewer";
+    },
+    (_room, p) => {
+      p.transport = "phone";
+    },
+    (_room, p) => {
+      p.breakoutId = randomUUID();
+    },
+    (room, p) => {
+      room.participants = room.participants.filter(
+        (member) => member.id !== p.id,
+      );
+    },
+  ];
+  for (const change of invalidate) {
+    await f.store.change(m.code, (room) => {
+      room.participants = room.participants.filter((p) => p.id !== guest.id);
+      room.participants.push(structuredClone(original));
+    });
+    ok(await f.host.request("PUT", `${path}/spotlight`, body));
+    const snapshot = (await f.store.get(m.code))!;
+    snapshot.participants.find((p) => p.id === guest.id)!.expiresAt =
+      Date.now() - 1;
+    assert.equal(roomSpotlight(snapshot, ""), null);
+    await f.store.change(m.code, (room) =>
+      change(room, room.participants.find((p) => p.id === guest.id)!),
+    );
+    assert.equal((await f.store.get(m.code))!.spotlights, undefined);
+    assert.equal(
+      (await f.host.request("GET", `${path}/state`)).json().meeting
+        .spotlightParticipantId,
+      null,
+    );
+    assert.equal(
+      (await f.host.request("PUT", `${path}/spotlight`, body)).statusCode,
+      409,
+    );
+  }
+  assert.equal(
+    (
+      await f.host.request("PUT", `${path}/spotlight`, {
+        scope: "",
+        target: { id: randomUUID(), mediaVersion: 0 },
+      })
+    ).statusCode,
+    409,
+  );
+});
+
+test("spotlight keeps webinar backstage and audience state separate", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting({ mode: "webinar" });
+  const viewer = await f.join(m.code);
+  await f.action(m.code, viewer.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  const host = (await f.store.get(m.code))!.participants.find(
+    (p) => p.id === m.hostId,
+  )!;
+  ok(
+    await f.host.request("PUT", `${path}/spotlight`, {
+      scope: "@backstage",
+      target: { id: m.hostId, mediaVersion: host.mediaVersion },
+    }),
+  );
+  assert.equal(
+    (await f.host.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    m.hostId,
+  );
+  assert.equal(
+    (await viewer.client.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    null,
+  );
+  assert.equal(
+    (
+      await f.host.request("PUT", `${path}/spotlight`, {
+        scope: "@backstage",
+        target: { id: viewer.id, mediaVersion: 0 },
+      })
+    ).statusCode,
+    409,
+  );
+  await f.store.change(m.code, (room) => {
+    room.webinar!.phase = "live";
+    room.participants.find((p) => p.id === m.hostId)!.webinarLocation = "stage";
+  });
+  assert.equal((await f.store.get(m.code))!.spotlights, undefined);
+  ok(
+    await f.host.request("PUT", `${path}/spotlight`, {
+      scope: "",
+      target: { id: m.hostId, mediaVersion: host.mediaVersion },
+    }),
+  );
+  assert.equal(
+    (await viewer.client.request("GET", `${path}/state`)).json().meeting
+      .spotlightParticipantId,
+    m.hostId,
+  );
+});
 
 test("hands require admission, accept explicit state, and preserve webinar media restrictions", async (t) => {
   const f = await fixture(t);
