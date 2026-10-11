@@ -171,6 +171,7 @@ async function fixture(
   const endedRooms: string[] = [];
   const media: Media = {
     available: true,
+    sendReaction: async () => {},
     token: async () => "unused",
     remove: async () => {},
     end: async (meeting) => {

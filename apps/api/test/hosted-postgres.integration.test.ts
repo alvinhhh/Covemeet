@@ -41,6 +41,7 @@ class CleanupMedia implements Media {
   async end() {
     if (this.failing) throw new Error("Synthetic cleanup failure");
   }
+  async sendReaction(_code: string, _reactionId: string) {}
   close() {}
 }
 

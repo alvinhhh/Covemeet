@@ -8,6 +8,8 @@ import { MemoryStore, type Meeting, type Participant } from "../src/store.js";
 import type { Media } from "../src/media.js";
 import { RecordingService } from "../src/recordings.js";
 import { roomSpotlight } from "../src/spotlight.js";
+import { acceptReaction, clearStaleReactions, reactionDelivery, roomReactions } from "../src/reactions.js";
+import { fenceParticipantMedia } from "../src/media-identity.js";
 import argon2 from "argon2";
 import {
   controllerPresent,
@@ -36,6 +38,8 @@ class TestMedia implements Media {
   async end(meeting: Meeting) {
     this.ended.push(meeting.code);
   }
+  sent: { code: string; id: string }[] = [];
+  async sendReaction(code: string, id: string) { this.sent.push({ code, id }); }
   close() {}
 }
 
@@ -168,6 +172,313 @@ async function fixture(
   }
   return { app, store, media, host, create, meeting, join, action };
 }
+
+test("reactions authenticate, reject arbitrary input and stale scope, and accept muted browser participants", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guest = await f.join(m.code);
+  const path = `/api/meetings/${m.code}`;
+  const body = () => {
+    const p = f.store.data
+      .get(m.code)!
+      .participants.find((p) => p.id === guest.id)!;
+    return { kind: "applause", scope: "", mediaVersion: p.mediaVersion };
+  };
+  assert.equal(
+    (
+      await new Client(f.app, "198.51.100.90").request(
+        "POST",
+        `${path}/reactions`,
+        body(),
+      )
+    ).statusCode,
+    401,
+  );
+  assert.equal(
+    (await guest.client.request("POST", `${path}/reactions`, body()))
+      .statusCode,
+    403,
+  );
+  await f.action(m.code, guest.id, "admit");
+  for (const patch of [
+    { kind: "html" },
+    { senderId: m.hostId },
+    { timestamp: Date.now() },
+  ])
+    assert.equal(
+      (
+        await guest.client.request("POST", `${path}/reactions`, {
+          ...body(),
+          ...patch,
+        })
+      ).statusCode,
+      400,
+    );
+  for (const patch of [
+    { scope: "other-room" },
+    { mediaVersion: body().mediaVersion - 1 },
+  ])
+    assert.equal(
+      (
+        await guest.client.request("POST", `${path}/reactions`, {
+          ...body(),
+          ...patch,
+        })
+      ).statusCode,
+      409,
+    );
+  await f.action(m.code, guest.id, "block-audio");
+  await f.action(m.code, guest.id, "block-video");
+  const accepted = await guest.client.request(
+    "POST",
+    `${path}/reactions`,
+    body(),
+  );
+  ok(accepted);
+  const reaction = accepted.json().reaction;
+  assert.equal(reaction.participantId, guest.id);
+  assert.equal(reaction.kind, "applause");
+  assert.equal(reaction.expiresAt - reaction.createdAt, 6000);
+  assert.deepEqual(f.media.sent, [{ code: m.code, id: reaction.id }]);
+  const state = (await f.host.request("GET", `${path}/state`)).json();
+  assert.equal(state.reactions.items[0].id, reaction.id);
+  assert.deepEqual(state.messages, []);
+  assert.equal(
+    (await guest.client.request("POST", `${path}/reactions`, body()))
+      .statusCode,
+    429,
+  );
+  await f.action(m.code, guest.id, "kick");
+  assert.equal(
+    (await guest.client.request("POST", `${path}/reactions`, body()))
+      .statusCode,
+    403,
+  );
+  assert.deepEqual(
+    (await f.host.request("GET", `${path}/state`)).json().reactions.items,
+    [],
+  );
+});
+
+test("reactions serialize concurrent cooldowns, keep same-NAT budgets independent and survive delivery failure via state", async (t) => {
+  const f = await fixture(t);
+  const m = await f.meeting();
+  const guests = await Promise.all([
+    f.join(m.code, "198.51.100.120"),
+    f.join(m.code, "198.51.100.120"),
+  ]);
+  for (const guest of guests) await f.action(m.code, guest.id, "admit");
+  const path = `/api/meetings/${m.code}`;
+  const body = (id: string) => ({
+    kind: "like",
+    scope: "",
+    mediaVersion: f.store.data
+      .get(m.code)!
+      .participants.find((p) => p.id === id)!.mediaVersion,
+  });
+  const results = await Promise.all(
+    Array.from({ length: 3 }, () =>
+      guests[0]!.client.request(
+        "POST",
+        `${path}/reactions`,
+        body(guests[0]!.id),
+      ),
+    ),
+  );
+  assert.deepEqual(results.map((r) => r.statusCode).sort(), [200, 429, 429]);
+  // Exhaust this session without waiting; the durable minimum interval still rejects.
+  for (let i = 0; i < 28; i++)
+    assert.equal(
+      (
+        await guests[0]!.client.request(
+          "POST",
+          `${path}/reactions`,
+          body(guests[0]!.id),
+        )
+      ).statusCode,
+      429,
+    );
+  f.media.sendReaction = async () => {
+    throw new Error("Synthetic SDK outage");
+  };
+  ok(
+    await guests[1]!.client.request(
+      "POST",
+      `${path}/reactions`,
+      body(guests[1]!.id),
+    ),
+  );
+  assert.equal(
+    (await f.host.request("GET", `${path}/state`)).json().reactions.items
+      .length,
+    2,
+  );
+});
+
+test("reactions isolate breakout/backstage rooms and hidden webinar viewers in state and fast destinations", async (t) => {
+  const f = await fixture(t);
+  const created = await f.meeting();
+  const m = (await f.store.get(created.code))!;
+  const base = m.participants[0]!;
+  const now = Date.now();
+  const member = (
+    id: string,
+    overrides: Partial<Participant> = {},
+  ): Participant => ({
+    ...base,
+    id,
+    mediaIdentity: `media-${id}`,
+    role: "participant",
+    ...overrides,
+  });
+  const viewer = member("viewer", { role: "viewer" });
+  const otherViewer = member("other-viewer", { role: "viewer" });
+  const presenter = member("presenter", { webinarLocation: "stage" });
+  const host = member("host", { role: "host", webinarLocation: "stage" });
+  const backstage = member("backstage", { webinarLocation: "backstage" });
+  const breakout = member("breakout", { breakoutId: "breakout-id" });
+  m.mode = "webinar";
+  m.webinar = {
+    phase: "live",
+    revision: 0,
+    backstageRoom: "private-backstage",
+  };
+  m.breakouts = [
+    { id: "breakout-id", name: "Breakout", room: "private-breakout" },
+  ];
+  m.participants = [viewer, otherViewer, presenter, host, backstage, breakout];
+  const reaction = acceptReaction(
+    m,
+    viewer,
+    { kind: "love", scope: "", mediaVersion: viewer.mediaVersion },
+    now,
+  ).reaction;
+  assert.deepEqual(
+    reactionDelivery(m, reaction.id, now)!.destinationIdentities.sort(),
+    ["media-viewer", "media-presenter", "media-host"].sort(),
+  );
+  assert.equal(reactionDelivery(m, reaction.id, now)!.room, m.room);
+  for (const p of [otherViewer, backstage, breakout])
+    assert.deepEqual(roomReactions(m, p, now).items, []);
+  for (const p of [viewer, presenter, host])
+    assert.equal(roomReactions(m, p, now).items[0]!.id, reaction.id);
+  const side = acceptReaction(
+    m,
+    backstage,
+    {
+      kind: "laugh",
+      scope: "@backstage",
+      mediaVersion: backstage.mediaVersion,
+    },
+    now,
+  ).reaction;
+  assert.deepEqual(reactionDelivery(m, side.id, now)!.destinationIdentities, [
+    "media-backstage",
+  ]);
+  assert.equal(reactionDelivery(m, side.id, now)!.room, "private-backstage");
+  const split = acceptReaction(
+    m,
+    breakout,
+    {
+      kind: "celebrate",
+      scope: "breakout-id",
+      mediaVersion: breakout.mediaVersion,
+    },
+    now,
+  ).reaction;
+  assert.equal(reactionDelivery(m, split.id, now)!.room, "private-breakout");
+  assert.deepEqual(reactionDelivery(m, split.id, now)!.destinationIdentities, [
+    "media-breakout",
+  ]);
+  m.webinar.phase = "backstage";
+  assert.deepEqual(roomReactions(m, viewer, now).items, []);
+  assert.throws(
+    () =>
+      acceptReaction(
+        m,
+        otherViewer,
+        {
+          kind: "surprised",
+          scope: "",
+          mediaVersion: otherViewer.mediaVersion,
+        },
+        now,
+      ),
+    /inactive/,
+  );
+});
+
+test("reactions expire without a write and pruning retains cooldown through fences and room moves", async (t) => {
+  const f = await fixture(t);
+  const created = await f.meeting();
+  const m = (await f.store.get(created.code))!;
+  const p = m.participants[0]!;
+  const now = Date.now();
+  const body = {
+    kind: "surprised" as const,
+    scope: "",
+    mediaVersion: p.mediaVersion,
+  };
+  const first = acceptReaction(m, p, body, now).reaction;
+  assert.deepEqual(roomReactions(m, p, now + 6000).items, []);
+  assert.equal(reactionDelivery(m, first.id, now + 6000), undefined);
+  fenceParticipantMedia(m, p);
+  clearStaleReactions(m, now + 100);
+  assert.equal(p.reaction, undefined);
+  assert.equal(p.reactionNotBefore, now + 2000);
+  p.enforcementPending = false;
+  assert.throws(
+    () =>
+      acceptReaction(
+        m,
+        p,
+        { ...body, mediaVersion: p.mediaVersion },
+        now + 101,
+      ),
+    /Wait a moment/,
+  );
+  const next = acceptReaction(
+    m,
+    p,
+    { ...body, mediaVersion: p.mediaVersion },
+    now + 2000,
+  ).reaction;
+  assert.notEqual(next.id, first.id);
+  p.breakoutId = "deleted-room";
+  assert.equal(reactionDelivery(m, next.id, now + 2000), undefined);
+  clearStaleReactions(m, now + 8000);
+  assert.equal(p.reaction, undefined);
+  assert.equal(p.reactionNotBefore, undefined);
+  p.breakoutId = null;
+  for (const overrides of [
+    { status: "waiting" },
+    { status: "left" },
+    { expiresAt: now },
+    { transport: "phone" },
+    { enforcementPending: true },
+  ] as Partial<Participant>[])
+    assert.throws(
+      () =>
+        acceptReaction(
+          m,
+          { ...p, ...overrides },
+          { ...body, mediaVersion: p.mediaVersion },
+          now + 8000,
+        ),
+      /inactive/,
+    );
+  m.ended = true;
+  assert.throws(
+    () =>
+      acceptReaction(
+        m,
+        p,
+        { ...body, mediaVersion: p.mediaVersion },
+        now + 8000,
+      ),
+    /inactive/,
+  );
+});
 
 test("spotlight requires current host or co-host authority and reaches room state without changing media", async (t) => {
   const f = await fixture(t);

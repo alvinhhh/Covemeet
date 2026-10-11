@@ -68,7 +68,26 @@ export type PhoneAccess = {
 
 export type ChatMode = "everyone" | "host-only" | "disabled";
 
+export type ReactionKind =
+  | "like"
+  | "applause"
+  | "love"
+  | "laugh"
+  | "surprised"
+  | "celebrate";
+export type Reaction = {
+  id: string;
+  participantId: string;
+  mediaIdentity: string;
+  mediaVersion: number;
+  scope: string;
+  kind: ReactionKind;
+  createdAt: number;
+  expiresAt: number;
+};
+
 export type MeetingState = {
+  reactions?: { serverTime: number; items: Reaction[] };
   meeting: {
     code: string;
     title: string;

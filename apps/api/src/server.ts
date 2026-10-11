@@ -17,6 +17,7 @@ import { digestDownloadToken } from "@meeting-platform/recording";
 import { z } from "zod";
 import { whiteboardInput } from "./whiteboard.js";
 import { roomSpotlight, spotlightTarget } from "./spotlight.js";
+import { acceptReaction, clearStaleReactions, reactionAllowed, reactionInput, roomReactions } from "./reactions.js";
 import type { Config } from "./config.js";
 import type { ChatMessage, Meeting, Participant, Store } from "./store.js";
 import { canShareScreen, clearRecordingLink } from "./store.js";
@@ -1553,6 +1554,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
             ["starting", "recording", "stopping"].includes(r.status),
           ),
         },
+        reactions: roomReactions(m, p),
         me: pub(p),
         participants: m.participants
           .filter(
@@ -1593,6 +1595,35 @@ export async function createApp(config: Config, store: Store, media: Media) {
             : [],
         revision: m.revision,
       };
+    },
+  );
+  app.post(
+    "/api/meetings/:code/reactions",
+    {
+      config: { rateLimit: false },
+      onRequest: authenticatedRateLimit(
+        app,
+        async (req) => {
+          const meeting = await store.get(codeOf(req));
+          if (!meeting) return;
+          const participant = sessionParticipant(req, meeting);
+          return participant && reactionAllowed(meeting, participant)
+            ? `${meeting.id}:${participant.id}`
+            : undefined;
+        },
+        30,
+      ),
+    },
+    async (req) => {
+      const input = reactionInput.parse(req.body);
+      const result = await store.change(codeOf(req), (m) => {
+        active(m);
+        return acceptReaction(m, actor(req, m), input);
+      });
+      // Delivery is best effort after durable acceptance. State polling is fallback;
+      // an SDK outage must not hold the action open or cause a duplicate retry.
+      void media.sendReaction(codeOf(req), result.reaction.id).catch(() => {});
+      return result;
     },
   );
   app.put(
@@ -3012,6 +3043,11 @@ export async function createApp(config: Config, store: Store, media: Media) {
             m = (await store.get(m.code))!;
           }
           const now = Date.now();
+          if (clearStaleReactions(structuredClone(m), now))
+            m = await store.change(m.code, (state) => {
+              clearStaleReactions(state, now);
+              return structuredClone(state);
+            });
           if (m.participants.some((p) => expiredUnauditedGuest(p, now)))
             m = await store.change(m.code, (state) => {
               state.participants = state.participants.filter(

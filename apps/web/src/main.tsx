@@ -47,6 +47,7 @@ import { BrandingEditor } from "./branding";
 import { selectStage, type StageView } from "./stage-policy";
 import { FullscreenControl } from "./fullscreen-control";
 import { ScreenShareViewer } from "./screen-share-viewer";
+import { ReactionControl, ReactionListener, ReactionStrip, useReactions } from "./reactions";
 import { cameraIntentFor, rememberCameraChoice } from "./camera-intent";
 import {
   observeAudioSignals,
@@ -1159,6 +1160,7 @@ function Conference({
   handChanged: (id: string, update: HandUpdate) => void;
 } & InputDeviceProps) {
   const conference = useRef<HTMLDivElement>(null);
+  const reactions = useReactions(state, refresh);
   const [panel, setPanel] = useState<
     "participants" | "chat" | "recordings" | "breakouts" | "phone" | null
   >(null);
@@ -1466,6 +1468,7 @@ function Conference({
           </div>
         )}
       </div>
+      <ReactionStrip items={reactions.items} announcement={reactions.announcement} />
       <div className="stage-footer">
         <div className="meeting-caption">
           <Icon name="lock" size={14} />
@@ -1530,6 +1533,7 @@ function Conference({
                 )
               }
             >
+              <ReactionListener receive={reactions.receive} />
               <CallAudioRenderer speakerId={inputDevices.speakerId ?? ""} />
               <StartAudio label="Enable meeting audio" />
               {mediaError && (
@@ -1756,6 +1760,7 @@ function Conference({
                 </>
               )}
             </div>
+            <ReactionControl {...reactions} />
             <HandControl
               me={state.me}
               ended={state.meeting.ended || webinar?.phase === "ended"}

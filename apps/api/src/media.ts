@@ -21,6 +21,7 @@ import {
   ServerError,
   TokenVerifier,
   TrackSource,
+  DataPacket_Kind,
 } from "livekit-server-sdk";
 import { WebSocket, WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
@@ -34,10 +35,13 @@ import {
   safeEqual,
   HttpError,
 } from "./security.js";
+import { reactionDelivery, REACTION_TOPIC } from "./reactions.js";
+
 export interface Media {
   available: boolean;
   token(m: Meeting, p: Participant): Promise<string>;
   remove(m: Meeting, p: Participant): Promise<void>;
+  sendReaction(code: string, reactionId: string): Promise<void>;
   end(m: Meeting): Promise<void>;
   close(): void;
 }
@@ -96,6 +100,21 @@ export class LiveMedia implements Media {
       hidden: m.mode === "webinar" && p.role === "viewer",
     });
     return token.toJwt();
+  }
+  async sendReaction(code: string, reactionId: string) {
+    if (!this.available) return;
+    const meeting = await this.store.get(code);
+    const delivery = meeting && reactionDelivery(meeting, reactionId);
+    if (!delivery?.destinationIdentities.length) return;
+    await this.client.sendData(
+      delivery.room,
+      new TextEncoder().encode(JSON.stringify(delivery.packet)),
+      DataPacket_Kind.RELIABLE,
+      {
+        topic: REACTION_TOPIC,
+        destinationIdentities: delivery.destinationIdentities,
+      },
+    );
   }
   async authorize(token: string) {
     const c = await this.verifier.verify(token);

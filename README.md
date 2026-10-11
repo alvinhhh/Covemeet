@@ -10,6 +10,7 @@ Built with React, TypeScript, LiveKit, Fastify, PostgreSQL and Redis.
 - **Meetings and webinars** with screen sharing, chat, and presenter/viewer roles.
 - **Viewing controls** for gallery or speaker layout, pinning, hiding self-view and zooming shared screens. Choose microphone, camera and supported speaker outputs in the call.
 - **Host controls** for admitting guests, locking meetings, muting microphones, disabling cameras, kicking participants and banning them from a meeting.
+- **Reactions** let participants send likes, applause and other responses during a meeting.
 - **Room spotlight** lets hosts and co-hosts feature a participant. Personal pins override the shared spotlight; screen shares keep priority.
 - **Breakout rooms** with separate chat, host announcements and return-to-main controls.
 - **Shared whiteboard** with drawing, text, pan and zoom, and host editing controls.

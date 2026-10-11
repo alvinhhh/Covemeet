@@ -80,6 +80,7 @@ async function fixture() {
   });
   const service = new PhoneDialogService(config, store, {
     available: true,
+    sendReaction: async () => {},
     token: async () => "",
     remove: async () => {},
     end: async () => {},

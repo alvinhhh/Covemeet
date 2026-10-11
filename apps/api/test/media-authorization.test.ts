@@ -612,3 +612,42 @@ test("webinar media tokens bind actual backstage or live rooms and fail during t
     new Set([m.room, m.webinar!.backstageRoom]),
   );
 });
+
+test("reaction SDK bridge uses explicit current identities and skips stale or empty delivery", async (t) => {
+  const f = await fixture(t);
+  const { acceptReaction, REACTION_TOPIC } = await import("../src/reactions.js");
+  const { DataPacket_Kind } = await import("livekit-server-sdk");
+  const result = await f.store.change(f.meeting.code, (m) => acceptReaction(m, m.participants[0]!, {
+    kind: "like", scope: "", mediaVersion: m.participants[0]!.mediaVersion,
+  }));
+  const calls: unknown[][] = [];
+  f.media.client.sendData = async (...args: unknown[]) => { calls.push(args); };
+  await f.media.sendReaction(f.meeting.code, result.reaction.id);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]![0], f.meeting.room);
+  assert.equal(calls[0]![2], DataPacket_Kind.RELIABLE);
+  assert.deepEqual(calls[0]![3], { topic: REACTION_TOPIC, destinationIdentities: [f.participant.id] });
+  const payload = JSON.parse(new TextDecoder().decode(calls[0]![1] as Uint8Array));
+  assert.equal(payload.reaction.id, result.reaction.id);
+  assert.equal(payload.version, 1);
+  const token = await f.media.token(f.meeting, f.participant);
+  assert.equal(JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString()).video.canPublishData, false);
+  // The bridge must reread recipient role/scope/identity after REST acceptance.
+  await f.store.change(f.meeting.code, (m) => {
+    m.mode = "webinar";
+    m.webinar = { phase: "live", revision: 0, backstageRoom: "backstage" };
+    const sender = m.participants[0]!;
+    sender.role = "viewer";
+    m.participants.push(
+      { ...sender, id: "hidden-viewer", mediaIdentity: "hidden-viewer", reaction: undefined },
+      { ...sender, id: "presenter", mediaIdentity: "current-presenter", role: "participant", webinarLocation: "stage", reaction: undefined },
+      { ...sender, id: "backstage", mediaIdentity: "backstage", role: "participant", webinarLocation: "backstage", reaction: undefined },
+    );
+  });
+  await f.media.sendReaction(f.meeting.code, result.reaction.id);
+  assert.deepEqual(calls[1]![3], { topic: REACTION_TOPIC, destinationIdentities: [f.participant.id, "current-presenter"] });
+  await f.store.change(f.meeting.code, (m) => { fenceParticipantMedia(m, m.participants[0]!); });
+  await f.media.sendReaction(f.meeting.code, result.reaction.id);
+  await f.media.sendReaction("missing", result.reaction.id);
+  assert.equal(calls.length, 2);
+});

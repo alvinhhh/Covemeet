@@ -6,7 +6,7 @@ This is the product and deployment checklist for the open-source core and its ho
 
 - Browser-only meetings with account-free guests, a prejoin microphone/camera check, guest links or code/password entry, and separate host authority.
 - Meetings for up to 100 participants; webinars for up to 1,000 viewers with a separate ten-member stage. Capacity must be measured on the deployed hardware.
-- Waiting room, kick versus meeting ban, meeting lock, microphone/camera/share restrictions, co-hosts, hand raising, chat moderation, breakouts and an infinite whiteboard.
+- Waiting room, kick versus meeting ban, meeting lock, microphone/camera/share restrictions, co-hosts, hand raising, room-scoped reactions, chat moderation, breakouts and an infinite whiteboard.
 - Webinar backstage, presenter preflight, start/end broadcast, stage promotion and recording that excludes private backstage media.
 - Optional encrypted recordings, verified-host password delivery, revocable 24-hour download links, and self-hosted control of encryption keys.
 - Audio phone/SIP admission through a separate locator/PIN, with the same lobby, permission and removal policy as browser guests.
@@ -26,7 +26,7 @@ Paid grants have no cumulative monthly meeting-time or recording-time cap. Hoste
 | Guest and host authority | Random 130-bit hosted codes; separate one-use host capabilities; signed host-only sessions; server authorization | Invitation/recovery abuse checks and supported-browser coverage |
 | Moderation and reconnect | Admission gateway, versioned permissions, physical media identities, pending cleanup and scoped co-host controls | Dependency failures, hostile reconnect, paired API/browser rollout and emergency termination |
 | IP/device bans | Meeting-scoped signed browser marker and keyed network matching | Proxy configuration, shared-network impact, retention and reversible bans |
-| Collaboration | Breakouts, scoped chat/private messages, chat moderation, whiteboard, hand raising, host succession and absence grace | Mobile/accessibility polish, reactions, polls, Q&A and advanced stage/layout controls |
+| Collaboration | Breakouts, scoped chat/private messages, chat moderation, whiteboard, hand raising, room-scoped reactions, host succession and absence grace | Reaction browser acceptance, mobile/accessibility polish, polls, Q&A and advanced stage/layout controls |
 | Layout and devices | Gallery/speaker view, personal pinning, host/co-host room spotlight, hide self-view, shared-screen zoom/Fit and in-call device selection | Spotlight browser acceptance, physical-device switching/recovery and supported-browser audio-output routing checks |
 | Webinars | Separate audience/stage limits, backstage lifecycle and stage-only recording path | Full-size media load, presenter/device workflows, reconnect and receiving-client isolation checks |
 | HTTPS and signaling | Separate origins, exact proxy trust, cookie-bound signaling and private backend listeners | Public certificate renewal, external port/firewall checks and production logging configuration |

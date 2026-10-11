@@ -76,6 +76,7 @@ async function fixture() {
   const media: Media & { fail: boolean; afterRemove?: () => Promise<void> } = {
     fail: false,
     available: true,
+    sendReaction: async () => {},
     token: async () => "unused",
     async remove() {
       if (this.fail) throw new Error("synthetic media failure");

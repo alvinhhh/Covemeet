@@ -3636,3 +3636,98 @@ input[type="radio"] {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
+
+/* Reactions remain separate from video sizing and media controls. */
+.conference .reaction-control {
+  position: relative;
+  flex: 0 0 auto;
+}
+.conference .reaction-picker {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 30;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  width: 240px;
+  max-width: calc(100vw - 32px);
+  padding: 10px;
+  background: #171717;
+  color: #fff;
+  border: 1px solid #666;
+  border-radius: 10px;
+}
+.conference .reaction-picker button {
+  min-height: 40px;
+  padding: 6px 10px;
+  color: inherit;
+  background: #292929;
+  border: 1px solid #777;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.conference .reaction-picker button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.conference .reaction-picker button:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+.conference .reaction-picker > span {
+  grid-column: 1 / -1;
+  font-size: 12px;
+}
+.conference .reaction-error {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 31;
+  width: 240px;
+  max-width: calc(100vw - 32px);
+  padding: 8px;
+  color: #fff;
+  background: #171717;
+  border: 1px solid #777;
+  border-radius: 6px;
+}
+.conference .reaction-strip {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0 8px;
+  pointer-events: none;
+}
+.conference .reaction-strip:has(.reaction-item) {
+  padding-block: 4px;
+}
+.conference .reaction-item {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #fff;
+  background: #252525;
+  border: 1px solid #666;
+  border-radius: 6px;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+.conference .reaction-item strong {
+  font-weight: 600;
+}
+@media (max-width: 700px) {
+  .conference .reaction-picker,
+  .conference .reaction-error {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: calc(88px + env(safe-area-inset-bottom));
+    width: auto;
+    max-width: none;
+  }
+}

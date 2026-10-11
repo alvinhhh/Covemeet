@@ -1,5 +1,6 @@
 import { fenceParticipantMedia } from "./media-identity.js";
 import { clearStaleSpotlights } from "./spotlight.js";
+import { clearStaleReactions, type Reaction } from "./reactions.js";
 import pg from "pg";
 import {
   allocateRecordingStorage,
@@ -107,6 +108,8 @@ export type Participant = {
   role: "host" | "participant" | "viewer";
   status: "waiting" | "admitted" | "kicked" | "banned" | "left";
   handRaised?: boolean;
+  reaction?: Reaction;
+  reactionNotBefore?: number;
   moderator?: { grantedBy: string; grantedAt: number; revision: number };
   auditReferenced?: boolean;
   audioAllowed: boolean;
@@ -2479,8 +2482,10 @@ export class PgStore implements Store {
       ).rows[0]?.data as Meeting | undefined;
       if (!m) throw new HttpError(404, "Meeting unavailable");
       clearStaleSpotlights(m);
+      clearStaleReactions(m);
       const result = await fn(m);
       clearStaleSpotlights(m);
+      clearStaleReactions(m);
       m.revision++;
       await c.query("UPDATE meetings SET data=$2 WHERE code=$1", [
         code,
@@ -3679,8 +3684,10 @@ export class MemoryStore implements Store {
       const m = await this.get(code);
       if (!m) throw new HttpError(404, "Meeting unavailable");
       clearStaleSpotlights(m);
+      clearStaleReactions(m);
       const r = await fn(m);
       clearStaleSpotlights(m);
+      clearStaleReactions(m);
       m.revision++;
       this.data.set(code, m);
       return r;

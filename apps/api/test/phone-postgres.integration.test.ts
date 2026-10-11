@@ -41,6 +41,7 @@ test(
     });
     const media: Media = {
       available: true,
+      sendReaction: async () => {},
       token: async (_m: Meeting, p: Participant) => `test-${p.id}`,
       remove: async () => {},
       end: async () => {},
