@@ -15,7 +15,6 @@ import { createRoot } from "react-dom/client";
 import { createPortal } from "react-dom";
 import {
   LiveKitRoom,
-  RoomAudioRenderer,
   StartAudio,
   TrackToggle,
   VideoTrack,
@@ -47,6 +46,7 @@ import { companySlug, routeBranding } from "./team-branding";
 import { BrandingEditor } from "./branding";
 import { selectStage, type StageView } from "./stage-policy";
 import { FullscreenControl } from "./fullscreen-control";
+import { ScreenShareViewer } from "./screen-share-viewer";
 import { cameraIntentFor, rememberCameraChoice } from "./camera-intent";
 import {
   observeAudioSignals,
@@ -54,6 +54,11 @@ import {
   type AudioSignal,
 } from "./audio-signal";
 import { DeviceCheck, deviceError } from "./device-check";
+import {
+  CallAudioRenderer,
+  CallSpeakerSelect,
+  audioOutputError,
+} from "./audio-output";
 import {
   CallDeviceSelect,
   captureDevice,
@@ -1524,7 +1529,7 @@ function Conference({
                 )
               }
             >
-              <RoomAudioRenderer />
+              <CallAudioRenderer speakerId={inputDevices.speakerId ?? ""} />
               <StartAudio label="Enable meeting audio" />
               {mediaError && (
                 <div className="media-error">
@@ -2017,7 +2022,8 @@ function MediaStage({
 }) {
   const room = useRoomContext();
   const [page, setPage] = useState(0);
-  const { pinnedParticipantId, hideSelfView } = view;
+  const [speakerIdentity, setSpeakerIdentity] = useState<string | null>(null);
+  const { pinnedParticipantId, hideSelfView, layout = "gallery" } = view;
   const tracks = useTracks(
     [
       { source: Track.Source.Camera, withPlaceholder: true },
@@ -2042,10 +2048,21 @@ function MediaStage({
       mode,
       breakoutId: me.breakoutId,
       webinarBackstage: me.webinarBackstage,
+      speakerIdentity,
+      speakingIds: participants
+        .filter(
+          (participant) =>
+            participant.audioAllowed &&
+            signals.get(participantMediaIdentity(participant))?.speaking,
+        )
+        .map(participantMediaIdentity),
     },
     page,
     view,
   );
+  useEffect(() => {
+    setSpeakerIdentity(selection.speakerIdentity);
+  }, [selection.speakerIdentity]);
   const pinnedMember = participants.find(
     (member) => member.id === pinnedParticipantId,
   );
@@ -2149,23 +2166,41 @@ function MediaStage({
             {otherSpeakers.map((participant) => participant.name).join(", ")}
           </div>
         )}
-        {!boardOpen && selection.selfViewAvailable && (
+        {!boardOpen && (
           <div className="stage-view-controls">
-            <button
-              type="button"
-              onClick={() => {
-                setView({
-                  ...view,
-                  hideSelfView: !hideSelfView,
-                  pinnedParticipantId:
-                    !hideSelfView && pinnedParticipantId === me.id
-                      ? null
-                      : pinnedParticipantId,
-                });
-              }}
+            <div
+              className="stage-layout-controls"
+              role="group"
+              aria-label="Video layout"
             >
-              {hideSelfView ? "Show self-view" : "Hide self-view"}
-            </button>
+              {(["gallery", "speaker"] as const).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  aria-pressed={layout === option}
+                  onClick={() => setView({ ...view, layout: option })}
+                >
+                  {option === "gallery" ? "Gallery" : "Speaker"}
+                </button>
+              ))}
+            </div>
+            {selection.selfViewAvailable && (
+              <button
+                type="button"
+                onClick={() => {
+                  setView({
+                    ...view,
+                    hideSelfView: !hideSelfView,
+                    pinnedParticipantId:
+                      !hideSelfView && pinnedParticipantId === me.id
+                        ? null
+                        : pinnedParticipantId,
+                  });
+                }}
+              >
+                {hideSelfView ? "Show self-view" : "Hide self-view"}
+              </button>
+            )}
           </div>
         )}
         {selection.pageCount > 1 && (
@@ -2210,7 +2245,7 @@ function MediaStage({
               } as CSSProperties
             }
           >
-            {visible.map((track) => {
+            {selection.visible.map(({ track, key }) => {
               const signal = signals.get(track.participant.identity);
               const participant = participants.find(
                 (participant) =>
@@ -2225,11 +2260,17 @@ function MediaStage({
               const pinLabel = `${pinned ? "Unpin" : "Pin"} ${name} for me`;
               return (
                 <div
-                  className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""} ${pinned ? "pinned-tile" : ""}`}
+                  className={`video-tile ${track.source === Track.Source.ScreenShare ? "screen-tile" : ""} ${signal?.speaking ? "is-speaking" : ""} ${pinned ? "pinned-tile" : ""} ${key === selection.speakerKey ? "speaker-tile" : ""}`}
                   key={`${track.participant.identity}-${track.source}-${isTrackReference(track) ? track.publication.trackSid : "placeholder"}`}
                 >
                   {isTrackReference(track) && !track.publication.isMuted ? (
-                    <VideoTrack trackRef={track} manageSubscription={false} />
+                    track.source === Track.Source.ScreenShare ? (
+                      <ScreenShareViewer>
+                        <VideoTrack trackRef={track} manageSubscription={false} />
+                      </ScreenShareViewer>
+                    ) : (
+                      <VideoTrack trackRef={track} manageSubscription={false} />
+                    )
                   ) : (
                     <div className="tile-placeholder">
                       <span className="stage-avatar">{initials(name)}</span>
@@ -2384,6 +2425,14 @@ function MediaControls({
           onError={(error) => setError(deviceError(error, "audio"))}
         />
       </fieldset>
+      <CallSpeakerSelect
+        value={inputDevices.speakerId ?? ""}
+        onSelect={(speakerId) => {
+          setInputDevices((current) => ({ ...current, speakerId }));
+          setError("");
+        }}
+        onError={() => setError(audioOutputError)}
+      />
       <fieldset className="media-control-guard" disabled={!videoAllowed}>
         <TrackToggle
           className="button media-toggle"
@@ -3049,12 +3098,9 @@ function Participants({
           )}
         </div>
       ))}
-      {moderator && (
+      {moderator && admitted.some((p) => p.transport === "phone") && (
         <p className="panel-note">
-          Permission changes reconnect media. Participants choose when to turn
-          allowed devices back on.
-          {admitted.some((p) => p.transport === "phone") &&
-            " Allowing a phone caller to speak leaves the call muted until the caller unmutes."}
+          Phone callers unmute themselves after you allow their microphone.
         </p>
       )}
       {ban && moderator && (

@@ -363,3 +363,118 @@ test("pins follow current identities without admitting retired, other-room, wait
     false,
   );
 });
+
+test("speaker layout keeps an off-page speaker visible within the tile budget; gallery keeps its existing page", () => {
+  const people = members(100),
+    tracks = cameras(100);
+  const speaking = { ...context, speakingIds: ["p99"] };
+  assert.deepEqual(
+    selectStage(tracks, people, speaking, 2).visible,
+    selectStage(tracks, people, context, 2).visible,
+  );
+  assert.equal(selectStage(tracks, people, speaking, 2).speakerKey, undefined);
+  const view = { layout: "speaker" as const };
+  const first = selectStage(tracks, people, speaking, 0, view);
+  const seen = new Set<string>();
+  for (let page = 0; page < first.pageCount; page++) {
+    const selected = selectStage(tracks, people, speaking, page, view);
+    assert.equal(selected.speakerKey, "p99:camera");
+    assert.equal(selected.visible[0].mediaIdentity, "p99");
+    assert(selected.visible.some((track) => track.mediaIdentity === "p0"));
+    assert(selected.visible.length <= 16);
+    assert.equal(
+      new Set(selected.visible.map((track) => track.key)).size,
+      selected.visible.length,
+    );
+    for (const track of selected.visible) seen.add(track.key);
+  }
+  assert.equal(seen.size, 100);
+});
+
+test("speaker selection stays through silence and overlapping speech, then follows the next speaker", () => {
+  const view = { layout: "speaker" as const };
+  const select = (speakingIds: string[], speakerIdentity: string | null) =>
+    selectStage(
+      cameras(4),
+      members(4),
+      { ...context, speakingIds, speakerIdentity },
+      0,
+      view,
+    );
+  assert.equal(select([], null).speakerIdentity, "p1");
+  assert.equal(select(["p3"], "p1").speakerIdentity, "p3");
+  assert.equal(select([], "p3").speakerIdentity, "p3");
+  assert.equal(select(["p2", "p3"], "p3").speakerIdentity, "p3");
+  assert.equal(select(["p2"], "p3").speakerIdentity, "p2");
+});
+
+test("both layouts preserve an explicit pin and screen priority while speaker mode respects hidden self", () => {
+  const tracks: StageCandidate[] = [
+    ...cameras(40),
+    { key: "screen", mediaIdentity: "p1", source: "screen_share" },
+  ];
+  for (const layout of ["gallery", "speaker"] as const) {
+    const selected = selectStage(
+      tracks,
+      members(40),
+      { ...context, speakingIds: ["p38"] },
+      2,
+      { layout, pinnedParticipantId: "p39", hideSelfView: true },
+    );
+    assert.equal(selected.visible[0].key, "screen");
+    assert.equal(selected.visible[1].key, "p39:camera");
+    assert.equal(selected.pinnedParticipantId, "p39");
+    assert.equal(
+      selected.speakerKey,
+      layout === "speaker" ? "p39:camera" : undefined,
+    );
+    assert(!selected.visible.some((track) => track.mediaIdentity === "p0"));
+    assert(selected.visible.length <= 16);
+  }
+  const hidden = selectStage(
+    cameras(2),
+    members(2),
+    { ...context, speakingIds: ["p0"], speakerIdentity: "p0" },
+    0,
+    { layout: "speaker", hideSelfView: true },
+  );
+  assert.equal(hidden.speakerKey, "p1:camera");
+});
+
+test("speaker selection cannot retain retired, other-room, waiting, phone or backstage identities", () => {
+  const people = members(7).map((member, i) => ({
+    ...member,
+    mediaIdentity: i === 1 ? "current" : member.id,
+    breakoutId: i === 2 ? "other-room" : null,
+    status: i === 3 ? "waiting" : member.status,
+    transport: i === 4 ? ("phone" as const) : ("browser" as const),
+    webinarBackstage: i === 5,
+    role: i === 6 ? ("viewer" as const) : member.role,
+  }));
+  const tracks: StageCandidate[] = [
+    ...cameras(7),
+    { key: "current:camera", mediaIdentity: "current", source: "camera" },
+  ];
+  for (const invalid of ["p1", "p2", "p3", "p4", "p5", "p6", "unknown"]) {
+    const selected = selectStage(
+      tracks,
+      people,
+      {
+        ...context,
+        mode: "webinar",
+        webinarBackstage: false,
+        speakerIdentity: invalid,
+        speakingIds: [invalid],
+      },
+      0,
+      { layout: "speaker" },
+    );
+    assert.equal(selected.speakerIdentity, "current");
+    assert.equal(selected.speakerKey, "current:camera");
+    assert(!selected.visible.some((track) => track.mediaIdentity === invalid));
+  }
+  const empty = selectStage([], [], context, 0, { layout: "speaker" });
+  assert.equal(empty.speakerIdentity, null);
+  assert.equal(empty.speakerKey, undefined);
+  assert.equal(empty.pageCount, 1);
+});

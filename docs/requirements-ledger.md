@@ -27,6 +27,7 @@ Paid grants have no cumulative monthly meeting-time or recording-time cap. Hoste
 | Moderation and reconnect | Admission gateway, versioned permissions, physical media identities, pending cleanup and scoped co-host controls | Dependency failures, hostile reconnect, paired API/browser rollout and emergency termination |
 | IP/device bans | Meeting-scoped signed browser marker and keyed network matching | Proxy configuration, shared-network impact, retention and reversible bans |
 | Collaboration | Breakouts, scoped chat/private messages, chat moderation, whiteboard, hand raising, host succession and absence grace | Mobile/accessibility polish, reactions, polls, Q&A and advanced stage/layout controls |
+| Layout and devices | Gallery/speaker view, personal pinning, hide self-view, shared-screen zoom/Fit and in-call device selection | Host spotlight, physical-device switching/recovery and supported-browser audio-output routing checks |
 | Webinars | Separate audience/stage limits, backstage lifecycle and stage-only recording path | Full-size media load, presenter/device workflows, reconnect and receiving-client isolation checks |
 | HTTPS and signaling | Separate origins, exact proxy trust, cookie-bound signaling and private backend listeners | Public certificate renewal, external port/firewall checks and production logging configuration |
 | WebRTC/TURN | SFU transport and authenticated relay fixtures | Chrome/Firefox/Safari/mobile interoperability, ordinary UI fallback, external restrictive networks and packet-level protocol checks |

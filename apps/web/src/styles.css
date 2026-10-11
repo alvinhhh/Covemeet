@@ -2704,6 +2704,14 @@ input[type="radio"] {
 }
 .conference .stage-view-controls {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.conference .stage-layout-controls {
+  display: inline-flex;
+  gap: 4px;
 }
 .conference .stage-view-controls button,
 .conference .tile-pin {
@@ -2724,7 +2732,8 @@ input[type="radio"] {
   min-width: 44px;
   min-height: 44px;
 }
-.conference .tile-pin[aria-pressed="true"] {
+.conference .tile-pin[aria-pressed="true"],
+.conference .stage-layout-controls button[aria-pressed="true"] {
   background: #fff;
   color: #171717;
 }
@@ -2761,11 +2770,13 @@ input[type="radio"] {
 .conference .video-tile.pinned-tile {
   border-color: #fff;
 }
-.conference .video-grid:not(.has-screen) .pinned-tile {
+.conference .video-grid:not(.has-screen) :is(.pinned-tile, .speaker-tile) {
   grid-column: 1 / -1;
   justify-self: center;
 }
-.conference .video-grid:not(.has-screen):not([data-tile-count="1"]) .pinned-tile {
+.conference
+  .video-grid:not(.has-screen):not([data-tile-count="1"])
+  :is(.pinned-tile, .speaker-tile) {
   width: min(100%, calc(60cqh * 16 / 9));
   block-size: min(60cqh, calc(100cqw * 9 / 16));
   align-self: start;
@@ -3553,4 +3564,66 @@ input[type="radio"] {
 .leave-dialog .button-row {
   flex-wrap: wrap;
   margin-top: 24px;
+}
+
+.screen-viewer,
+.screen-viewport {
+  position: absolute;
+  inset: 0;
+}
+.screen-viewport {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.screen-viewport:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: -4px;
+}
+.screen-content {
+  position: relative;
+}
+.conference .screen-content video {
+  object-fit: contain;
+}
+.screen-zoom {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid #666;
+  border-radius: 8px;
+  background: #151515e6;
+  color: #fff;
+}
+.screen-zoom button {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 4px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.screen-zoom button:hover:not(:disabled) {
+  background: #444;
+}
+.screen-zoom button:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: -2px;
+}
+.screen-zoom button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.screen-zoom output {
+  min-width: 48px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }

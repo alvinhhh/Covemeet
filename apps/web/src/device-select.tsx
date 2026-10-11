@@ -11,12 +11,16 @@ import {
 } from "@livekit/components-react";
 import { RoomEvent, type Room } from "livekit-client";
 
-export type InputDevices = { cameraId: string; microphoneId: string };
+export type InputDevices = {
+  cameraId: string;
+  microphoneId: string;
+  speakerId?: string;
+};
 export type InputDeviceProps = {
   inputDevices: InputDevices;
   setInputDevices: Dispatch<SetStateAction<InputDevices>>;
 };
-type InputKind = "audioinput" | "videoinput";
+const outputChanges = new WeakMap<object, Promise<boolean>>();
 
 export function captureDevice(deviceId: string) {
   return { deviceId: deviceId ? { exact: deviceId } : "" };
@@ -29,13 +33,18 @@ export function DeviceSelect({
   disabled,
   onSelect,
 }: {
-  kind: InputKind;
+  kind: MediaDeviceKind;
   devices: MediaDeviceInfo[];
   value: string;
   disabled: boolean;
   onSelect: (deviceId: string) => void;
 }) {
-  const label = kind === "audioinput" ? "Microphone" : "Camera";
+  const label =
+    kind === "audioinput"
+      ? "Microphone"
+      : kind === "audiooutput"
+        ? "Speaker"
+        : "Camera";
   const inputs = devices.filter(
     (device) => device.kind === kind && device.deviceId,
   );
@@ -64,21 +73,34 @@ export function DeviceSelect({
 
 export async function switchCallDevice(
   room: Pick<Room, "switchActiveDevice">,
-  kind: InputKind,
+  kind: MediaDeviceKind,
   deviceId: string,
 ) {
-  const switched = await room.switchActiveDevice(kind, deviceId, !!deviceId);
-  // An unconstrained default resolves to a physical ID, so SDK equality may be false.
-  if (!switched && deviceId)
-    throw new DOMException(
-      "Selected device is unavailable",
-      "OverconstrainedError",
-    );
+  const change = () => room.switchActiveDevice(kind, deviceId, !!deviceId);
+  // A reconnect restoration must finish before a newer speaker choice is applied.
+  const operation =
+    kind === "audiooutput"
+      ? (outputChanges.get(room) ?? Promise.resolve(true))
+          .catch(() => false)
+          .then(change)
+      : change();
+  if (kind === "audiooutput") outputChanges.set(room, operation);
+  try {
+    const switched = await operation;
+    // An unconstrained default resolves to a physical ID, so SDK equality may be false.
+    if (!switched && deviceId)
+      throw new DOMException(
+        "Selected device is unavailable",
+        "OverconstrainedError",
+      );
+  } finally {
+    if (outputChanges.get(room) === operation) outputChanges.delete(room);
+  }
 }
 
 export function observeCallDevice(
   room: Pick<Room, "on" | "off">,
-  kind: InputKind,
+  kind: MediaDeviceKind,
   onSelect: (deviceId: string) => void,
 ) {
   const changed = (changedKind: MediaDeviceKind, deviceId: string) => {
@@ -97,7 +119,7 @@ export function CallDeviceSelect({
   onSelect,
   onError,
 }: {
-  kind: InputKind;
+  kind: MediaDeviceKind;
   value: string;
   disabled: boolean;
   onSelect: (deviceId: string) => void;
@@ -107,6 +129,18 @@ export function CallDeviceSelect({
   const { devices } = useMediaDeviceSelect({ kind, requestPermissions: false });
   const pending = useRef(false);
   const [busy, setBusy] = useState(false);
+  const ownerRef = useRef({ room, mounted: true });
+  if (ownerRef.current.room !== room)
+    ownerRef.current = { room, mounted: true };
+  const owner = ownerRef.current;
+  useEffect(() => {
+    owner.mounted = true;
+    pending.current = false;
+    setBusy(false);
+    return () => {
+      owner.mounted = false;
+    };
+  }, [owner]);
   useEffect(
     () =>
       observeCallDevice(room, kind, (deviceId) => {
@@ -120,12 +154,14 @@ export function CallDeviceSelect({
     setBusy(true);
     try {
       await switchCallDevice(room, kind, deviceId);
-      onSelect(deviceId);
+      if (owner.mounted && ownerRef.current === owner) onSelect(deviceId);
     } catch (error) {
-      onError(error);
+      if (owner.mounted && ownerRef.current === owner) onError(error);
     } finally {
-      pending.current = false;
-      setBusy(false);
+      if (owner.mounted && ownerRef.current === owner) {
+        pending.current = false;
+        setBusy(false);
+      }
     }
   }
   return (
