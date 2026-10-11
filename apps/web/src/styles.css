@@ -2946,16 +2946,19 @@ input[type="radio"] {
   line-height: 1.5;
 }
 .conference .meeting-bottom {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  gap: 24px;
+  display: flex;
+  justify-content: center;
+  position: relative;
   height: auto;
-  min-height: 110px;
-  padding: 22px 28px;
+  min-height: 0;
+  padding: 12px 24px;
   background: #141414;
   border: 0;
 }
 .conference .session-role {
+  position: absolute;
+  left: 24px;
+  max-width: max(0px, calc((100% - 840px) / 2));
   display: block;
   min-width: 0;
   overflow: hidden;
@@ -2974,22 +2977,18 @@ input[type="radio"] {
   color: #eeeeee;
 }
 .conference .meeting-dock {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 16px;
-  width: max-content;
-  max-width: 100%;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+  width: min(100%, 760px);
   min-width: 0;
-  justify-self: center;
 }
-.conference .stage-controls {
-  gap: 14px;
-}
+.conference .stage-controls,
 .conference .media-controls-slot {
   display: contents;
 }
 .conference .media-control-guard {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -3040,8 +3039,8 @@ input[type="radio"] {
   justify-content: center;
   align-items: center;
   gap: 5px;
-  width: auto;
-  min-width: 88px;
+  width: 100%;
+  min-width: 0;
   min-height: 64px;
   padding: 10px 14px;
   flex-shrink: 0;
@@ -3325,17 +3324,8 @@ input[type="radio"] {
   font-size: 13px;
 }
 @media (max-width: 1180px) {
-  .conference .meeting-bottom {
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 20px;
-    padding: 20px;
-  }
   .conference .session-role {
     display: none;
-  }
-  .conference .meeting-dock {
-    flex-wrap: wrap;
-    gap: 24px;
   }
   .conference .meeting-panel {
     width: 310px;
@@ -3459,44 +3449,32 @@ input[type="radio"] {
   }
 }
 
-/* Keep the stage usable on phones and short landscape windows. */
-@media (max-width: 900px), (max-height: 540px) {
+/* Keep all six primary actions visible on phones and short windows. */
+@media (max-width: 680px), (max-height: 540px) {
   .conference .meeting-bottom {
-    display: flex;
-    flex-wrap: nowrap;
-    align-items: center;
-    justify-content: flex-start;
-    min-height: 0;
-    gap: 6px;
     padding: 12px 12px max(12px, env(safe-area-inset-bottom));
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    scrollbar-width: thin;
   }
   .conference .session-role {
     display: none;
   }
-  .conference .meeting-dock,
-  .conference .stage-controls,
-  .conference .panel-tabs {
-    display: contents;
+  .conference .meeting-dock {
+    gap: 6px;
   }
-  .conference .stage-controls .button,
-  .conference .panel-tabs button {
-    width: auto;
-    min-width: 56px;
+  .conference .stage-controls > .button,
+  .conference .media-controls-slot > .button,
+  .conference .media-control-guard > .button,
+  .conference .reaction-control > .button,
+  .conference .meeting-tools > .button {
+    min-width: 44px;
     min-height: 56px;
     padding: 8px 6px;
-    gap: 4px;
-    font-size: 11px;
-    line-height: 16px;
   }
-  .conference .panel-tabs button {
-    order: 1;
-  }
-  /* Chat remains next to the primary controls; other tools scroll after it. */
-  .conference .panel-tabs button:nth-of-type(2) {
-    order: 0;
+  .conference .stage-controls > .button > span,
+  .conference .media-controls-slot > .button > span,
+  .conference .media-control-guard > .button > span,
+  .conference .reaction-control > .button > span,
+  .conference .meeting-tools > .button > span {
+    display: none;
   }
   .conference .device-error {
     position: fixed;
@@ -3729,5 +3707,101 @@ input[type="radio"] {
     bottom: calc(88px + env(safe-area-inset-bottom));
     width: auto;
     max-width: none;
+  }
+}
+
+/* Secondary tools stay mounted so opening the disclosure never changes media. */
+.conference .meeting-tools,
+.conference .reaction-control {
+  position: relative;
+  min-width: 0;
+}
+.conference .meeting-tools-panel {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  z-index: 25;
+  width: 360px;
+  max-width: calc(100vw - 24px);
+  max-height: min(520px, calc(100dvh - 180px));
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding: 12px;
+  border: 1px solid #666;
+  border-radius: 12px;
+  background: #171717;
+  color: #fff;
+}
+.conference .meeting-tools-panel[hidden] {
+  display: none;
+}
+.conference .meeting-tools-panel .panel-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+}
+.conference .meeting-tools-panel .button,
+.conference .meeting-tools-panel .panel-tabs button {
+  flex-direction: row;
+  min-width: 0;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px;
+  font-size: 12px;
+  gap: 8px;
+}
+.conference .meeting-tools-panel .button > span,
+.conference .meeting-tools-panel .panel-tabs button > span {
+  white-space: normal;
+}
+.conference .meeting-device-controls {
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid #555;
+  margin-top: 12px;
+  padding-top: 12px;
+}
+.conference .meeting-device-controls .field {
+  gap: 4px;
+}
+.conference .meeting-device-controls .field > span {
+  position: static;
+  width: auto;
+  height: auto;
+  clip-path: none;
+  overflow: visible;
+  color: #ddd;
+  font-size: 12px;
+}
+.conference .meeting-device-controls select {
+  width: 100%;
+  min-height: 44px;
+  font-size: 13px;
+}
+.conference .meeting-device-controls small {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #ccc;
+}
+.conference .tools-notification {
+  position: absolute;
+  top: 3px;
+  right: 8px;
+  font-size: 18px;
+  line-height: 18px;
+}
+@media (max-width: 680px), (max-height: 540px) {
+  .conference .meeting-tools-panel {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: calc(88px + env(safe-area-inset-bottom));
+    width: auto;
+    max-width: none;
+    max-height: calc(100dvh - 160px - env(safe-area-inset-bottom));
   }
 }
