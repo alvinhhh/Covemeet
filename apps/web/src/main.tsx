@@ -40,7 +40,8 @@ import { Icon } from "./icons";
 import "./styles.css";
 import { brandLogo } from "./brand";
 import { scheduledMeetingPending } from "./scheduled-status";
-import { companySlug, routeBranding } from "./team-branding";
+import { recurringMeetingStatus, seriesCode, seriesJoinPath, seriesPollDelay, type SeriesStatus } from "./series-status";
+import { companySlug, routeBranding, seriesBranding } from "./team-branding";
 import { BrandingEditor } from "./branding";
 import { selectStage, type StageView } from "./stage-policy";
 import { FullscreenControl } from "./fullscreen-control";
@@ -225,7 +226,7 @@ function App() {
     brandName: branding?.brandName || (company ? "Covemeet" : installation.brandName),
   };
   useEffect(() => {
-    if (!installation) return;
+    if (!installation || (installation.edition === "hosted" && seriesCode(path))) return;
     const controller = new AbortController();
     void routeBranding(installation, path, controller.signal).then(
       (branding) => {
@@ -333,6 +334,7 @@ function App() {
         <p>Loading control panel…</p>
       </Center>
     );
+  const recurringCode = config.edition === "hosted" ? seriesCode(path) : undefined;
   const room = path.match(/^\/(meet|join|host)\/([^/]+)\/?$/);
   const download = path.match(/^\/download\/([^/]+)\/?$/);
   const recordings = path.match(/^\/recordings\/([^/]+)\/?$/);
@@ -357,6 +359,9 @@ function App() {
         config={config}
       />
     );
+  else if (recurringCode)
+    view = <RecurringEntry key={recurringCode} code={recurringCode} config={config}
+      onBranding={(brand) => setRouteBrand({ route, refresh: brandRefresh, branding: brand })} />;
   else if (company)
     view = !resolvedBrand ? (
       <Center>
@@ -397,6 +402,49 @@ function App() {
       {view}
     </BrandingContext.Provider>
   );
+}
+
+function RecurringEntry({ code, config, onBranding }: { code: string; config: Config; onBranding: (brand?: Branding) => void }) {
+  const [status, setStatus] = useState<SeriesStatus>();
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let consecutiveFailures = 0;
+    let loadedProfile: string | undefined;
+    async function check() {
+      const current = await recurringMeetingStatus(config, code, controller.signal);
+      if (controller.signal.aborted) return;
+      const path = seriesJoinPath(current);
+      if (path) {
+        history.replaceState(null, "", path);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+        return;
+      }
+      setStatus(current);
+      consecutiveFailures = current.status === "retry" ? consecutiveFailures + 1 : 0;
+      if (current.status === "not-started" && current.brandingProfileId && current.brandingProfileId !== loadedProfile) {
+        const brand = await seriesBranding(config, current, controller.signal);
+        if (controller.signal.aborted) return;
+        loadedProfile = current.brandingProfileId;
+        onBranding(brand);
+      } else if (current.status === "unavailable") onBranding(undefined);
+      const delay = seriesPollDelay(current, consecutiveFailures, Math.random() * 3000);
+      if (delay !== undefined && !controller.signal.aborted) timer = setTimeout(check, delay);
+    }
+    setStatus(undefined);
+    void check();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [code, config.edition, config.portalOrigin, attempt]);
+  return <Center>
+    <Logo name={config.brandName} />
+    <div role="status" aria-live="polite">
+      {!status ? <><div className="spinner" /><p>Opening meeting…</p></> :
+        <h1>{status.status === "not-started" ? "Meeting has not started" : status.status === "retry" ? "Reconnecting…" : "Meeting unavailable"}</h1>}
+    </div>
+    <Button disabled={!status} onClick={() => setAttempt((value) => value + 1)}>Try again</Button>
+    <Button onClick={() => navigate("/")}>{homeLabel()}</Button>
+  </Center>;
 }
 
 function Center({ children }: { children: ReactNode }) {
@@ -469,6 +517,8 @@ function Home({
     try {
       const url = new URL(code);
       if (url.origin !== new URL(meetingOrigin).origin) throw new Error();
+      const recurringCode = config.edition === "hosted" && destination === "join" ? seriesCode(url.pathname) : undefined;
+      if (recurringCode) { navigate(new URL(`/series/${recurringCode}`, meetingOrigin).href); return; }
       code = url.pathname.split("/").filter(Boolean).at(-1) ?? "";
     } catch {
       /* A direct code is expected unless this is an installation meeting link. */

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { routeBranding } from "../src/team-branding";
+import { routeBranding, seriesBranding } from "../src/team-branding";
 import { publicJson } from "../src/scheduled-status";
 
 const config = {
@@ -192,4 +192,28 @@ test("unpublished, malformed, foreign assets and stale requests fail neutral", a
     ),
     { status: 0 },
   );
+});
+
+test("series pages use only the series binding and never override the destination room profile", async () => {
+  const series = "A".repeat(34), calls: string[] = [];
+  const fetcher: typeof fetch = async (url) => {
+    calls.push(String(url));
+    return Response.json(String(url).includes("/schedule-series/resolve/") ? { status: "not-started", brandingProfileId: id } : { profile });
+  };
+  assert.equal((await routeBranding(config, `/series/${series}`, signal(), fetcher))?.brandName, brand.brandName);
+  assert.deepEqual(calls, [`${config.portalOrigin}/api/schedule-series/resolve/${series}`, `${config.portalOrigin}/api/public/team-branding/${id}`]);
+  calls.length = 0;
+  assert.equal(await routeBranding(config, `/series/${series}`, signal(), async () => Response.json({ status: "unavailable", brandingProfileId: id })), undefined);
+  assert.equal(await routeBranding({ ...config, edition: "self-hosted" }, `/series/${series}`, signal(), fetcher), undefined);
+  assert.equal(calls.length, 0);
+});
+
+test("an already resolved series binding loads branding without a second resolver request", async () => {
+  const calls: string[] = [];
+  const result = await seriesBranding(config, { status: "not-started", brandingProfileId: id }, signal(), async (url) => {
+    calls.push(String(url)); return Response.json({ profile });
+  });
+  assert.equal(result?.brandName, brand.brandName);
+  assert.deepEqual(calls, [`${config.portalOrigin}/api/public/team-branding/${id}`]);
+  assert.equal(await seriesBranding(config, { status: "retry" }, signal(), async () => { throw new Error("must not fetch"); }), undefined);
 });

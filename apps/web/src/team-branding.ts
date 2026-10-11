@@ -1,4 +1,5 @@
 import type { Branding, Config } from "./api";
+import { recurringMeetingStatus, seriesCode, type SeriesStatus } from "./series-status";
 import {
   brandingProfileIdPattern,
   publicJson,
@@ -106,7 +107,10 @@ export async function routeBranding(
   const company = companySlug(path);
   let endpoint: string, expectedId: string | undefined;
   if (company) endpoint = `/api/public/team-pages/${company}`;
-  else {
+  else if (seriesCode(path)) {
+    const binding = await recurringMeetingStatus(config, seriesCode(path)!, signal, fetcher);
+    return seriesBranding(config, binding, signal, fetcher);
+  } else {
     const room = path.match(
       /^\/(?:meet|join|host|recordings|download)\/([A-Za-z0-9-]{6,48})\/?$/,
     );
@@ -142,4 +146,18 @@ export async function routeBranding(
   )
     return;
   return presentation(result.data?.profile, config.portalOrigin);
+}
+
+export async function seriesBranding(
+  config: Pick<Config, "edition" | "portalOrigin">,
+  binding: SeriesStatus,
+  signal: AbortSignal,
+  fetcher: typeof fetch = fetch,
+): Promise<Branding | undefined> {
+  if (config.edition !== "hosted" || !config.portalOrigin || signal.aborted ||
+    (binding.status !== "ready" && binding.status !== "not-started") ||
+    !binding.brandingProfileId || !brandingProfileIdPattern.test(binding.brandingProfileId)) return;
+  const result = await publicJson(`${config.portalOrigin}/api/public/team-branding/${binding.brandingProfileId}`, signal, fetcher);
+  if (signal.aborted || result.data?.profile?.id !== binding.brandingProfileId) return;
+  return presentation(result.data.profile, config.portalOrigin);
 }
