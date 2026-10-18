@@ -50,7 +50,7 @@ test("image scan retains every result, fails on findings/errors and verifies the
 test("reviewed image VEX requires unchanged source and binaries; new findings still fail", async (t) => {
   const repo = fileURLToPath(new URL("..", import.meta.url));
   for (const [files, expected] of [
-    [".dockerignore Dockerfile package.json package-lock.json apps/api packages", "bd821b5c477f4703582f4f72c1c10ac063f63d6e8729742decf237d48718047a"],
+    [".dockerignore Dockerfile package.json package-lock.json apps/api packages", "a86a096116f73f740019a731d6efc7c71f94a6e54ef1d0d59cbef20caa3ce3e3"],
     [".dockerignore infra/sip.Dockerfile infra/sip/entrypoint.sh infra/compose.sip-test.yaml", "09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f"],
     [".dockerignore infra/asterisk.Dockerfile infra/asterisk infra/compose.sip-test.yaml", "4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e"],
   ]) {
@@ -148,7 +148,7 @@ esac`,
   const env = {
     ...process.env, PATH: `${bin}:${process.env.PATH}`, STUB_GRYPE: path.join(bin, "grype"),
     SCAN_LOG: log,
-    SOURCE_DIGEST: "bd821b5c477f4703582f4f72c1c10ac063f63d6e8729742decf237d48718047a",
+    SOURCE_DIGEST: "a86a096116f73f740019a731d6efc7c71f94a6e54ef1d0d59cbef20caa3ce3e3",
   };
   const run = (extra = {}, target = "core=covemeet-core:generation-test") => spawnSync("bash", [script, target],
     { cwd: root, env: { ...env, ...extra }, encoding: "utf8" });
