@@ -238,6 +238,22 @@ export class LiveMedia implements Media {
         }
         wss.handleUpgrade(req, socket, head, (client) => {
           let closed = false;
+          let draining = false;
+          let drainUntil = Infinity;
+          let drainTimer: ReturnType<typeof setTimeout> | undefined;
+          let forwarding = Promise.resolve();
+          const pending: { data: Buffer; binary: boolean }[] = [];
+          const deadline = (state: Meeting, member: Participant) =>
+            Math.min(
+              member.expiresAt,
+              meetingDeadline(state),
+              member.phone?.leaseExpiresAt ?? Infinity,
+              metered ? (member.meter?.fundedUntil ?? 0) : Infinity,
+              metered
+                ? (member.meter?.presenceUntil ?? 0)
+                : (member.gatewayPresenceUntil ?? 0),
+            );
+          let authorityDeadline = deadline(m, p);
           let expiryTimer: ReturnType<typeof setTimeout> | undefined;
           const target = new URL(this.config.livekitUrl);
           target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
@@ -264,12 +280,28 @@ export class LiveMedia implements Media {
             if (closed) return;
             closed = true;
             if (expiryTimer) clearTimeout(expiryTimer);
+            if (drainTimer) clearTimeout(drainTimer);
+            pending.length = 0;
             upstream.terminate();
             client.terminate();
             set.delete(client);
             if (!set.size && this.sockets.get(identity) === set)
               this.sockets.delete(identity);
             // The durable last-pong deadline survives socket/process loss.
+          };
+          const limitDrain = () => {
+            if (closed || !draining) return;
+            drainUntil = Math.min(drainUntil, authorityDeadline);
+            if (drainTimer) clearTimeout(drainTimer);
+            drainTimer = setTimeout(stop, Math.max(0, drainUntil - Date.now()));
+            drainTimer.unref();
+          };
+          const rememberDeadline = (state: Meeting, member: Participant) => {
+            const next = deadline(state, member);
+            authorityDeadline = draining
+              ? Math.min(authorityDeadline, next)
+              : next;
+            limitDrain();
           };
           const retireUnmetered = async () => {
             // Persist a new physical identity before sending the destructive RPC.
@@ -293,9 +325,10 @@ export class LiveMedia implements Media {
             });
           };
           const checkExpiry = async () => {
+            if (closed || draining || client.readyState !== WebSocket.OPEN)
+              return;
             try {
               if (metered) {
-                if (closed) return;
                 if (
                   Date.now() - Math.min(clientPongAt, upstreamPongAt) >=
                   15000
@@ -306,11 +339,18 @@ export class LiveMedia implements Media {
                     ...meterInput,
                     action: "heartbeat",
                   });
-                  if (closed) return;
+                  if (
+                    closed ||
+                    draining ||
+                    client.readyState !== WebSocket.OPEN
+                  )
+                    return;
                 }
                 if (client.readyState === WebSocket.OPEN) client.ping();
                 if (upstream.readyState === WebSocket.OPEN) upstream.ping();
                 const current = await this.store.get(m.code);
+                if (closed || draining || client.readyState !== WebSocket.OPEN)
+                  return;
                 const member = current?.participants.find((x) => x.id === p.id);
                 if (
                   !current ||
@@ -320,6 +360,7 @@ export class LiveMedia implements Media {
                   member.meter.phase === "closing"
                 )
                   return stop();
+                rememberDeadline(current, member);
                 expiryTimer = setTimeout(
                   () => void checkExpiry(),
                   Math.max(
@@ -334,8 +375,9 @@ export class LiveMedia implements Media {
                 expiryTimer.unref();
                 return;
               }
-              if (closed) return;
               const state = await this.store.get(m.code);
+              if (closed || draining || client.readyState !== WebSocket.OPEN)
+                return;
               const member = state?.participants.find((x) => x.id === p.id);
               if (
                 !state ||
@@ -359,8 +401,15 @@ export class LiveMedia implements Media {
                 await retireUnmetered();
                 return;
               }
+              rememberDeadline(state, member);
               if (authorized) {
                 await this.store.change(m.code, (current) => {
+                  if (
+                    closed ||
+                    draining ||
+                    client.readyState !== WebSocket.OPEN
+                  )
+                    return;
                   const live = current.participants.find((x) => x.id === p.id);
                   if (
                     !live ||
@@ -372,7 +421,8 @@ export class LiveMedia implements Media {
                   live.gatewayPresenceUntil = Date.now() + GATEWAY_PRESENCE_MS;
                   refreshHostPresence(current, live);
                 });
-                if (closed) return;
+                if (closed || draining || client.readyState !== WebSocket.OPEN)
+                  return;
               }
               if (client.readyState === WebSocket.OPEN) client.ping();
               if (upstream.readyState === WebSocket.OPEN) upstream.ping();
@@ -382,6 +432,8 @@ export class LiveMedia implements Media {
               );
               expiryTimer.unref();
             } catch {
+              if (closed || draining || client.readyState !== WebSocket.OPEN)
+                return;
               stop();
               if (!metered) await retireUnmetered().catch(() => {});
               // Persisted presence survives a DB/gateway failure for worker cleanup.
@@ -390,11 +442,33 @@ export class LiveMedia implements Media {
           void checkExpiry();
           client.on("close", stop);
           client.on("error", stop);
-          upstream.on("close", stop);
+          upstream.on("close", (code) => {
+            if (closed) return;
+            if (code !== 1000 || client.readyState !== WebSocket.OPEN)
+              return stop();
+            draining = true;
+            pending.length = 0;
+            if (expiryTimer) clearTimeout(expiryTimer);
+            drainUntil = Date.now() + 1000;
+            limitDrain();
+            // Freeze the accepted queue; ws enqueues its close after these sends.
+            void forwarding
+              .then(() => {
+                if (closed) return;
+                if (
+                  Date.now() >= drainUntil ||
+                  client.readyState !== WebSocket.OPEN
+                )
+                  return stop();
+                client.close(1000, "Media connection closed");
+              })
+              .catch(stop);
+          });
           upstream.on("error", stop);
           let opening = Promise.resolve();
-          const pending: { data: Buffer; binary: boolean }[] = [];
           client.on("message", (data, binary) => {
+            if (closed || draining || upstream.readyState >= WebSocket.CLOSING)
+              return;
             if (!authorized || upstream.readyState !== WebSocket.OPEN) {
               if (pending.length > 32) return stop();
               pending.push({ data: Buffer.from(data as Buffer), binary });
@@ -406,35 +480,49 @@ export class LiveMedia implements Media {
             opening = (async () => {
               try {
                 const fresh = await this.authorize(token);
+                if (draining && Date.now() >= drainUntil) return stop();
+                if (closed || client.readyState !== WebSocket.OPEN) return;
                 if (
                   !metered &&
                   !ownsGatewayConnection(fresh.p, p, connectionId)
                 )
                   throw new HttpError(403, "Media session changed");
-                if (closed) return;
                 if (metered)
                   await this.store.updateParticipantMeter(m.code, {
                     ...meterInput,
                     action: "connected",
                   });
-                if (closed) return;
+                if (closed || client.readyState !== WebSocket.OPEN) return;
+                if (draining && Date.now() >= drainUntil) return stop();
                 authorized = true;
-                for (const item of pending)
-                  upstream.send(item.data, { binary: item.binary });
+                rememberDeadline(fresh.m, fresh.p);
+                if (!draining && upstream.readyState === WebSocket.OPEN)
+                  for (const item of pending)
+                    upstream.send(item.data, { binary: item.binary });
                 pending.length = 0;
               } catch {
+                if (closed || client.readyState !== WebSocket.OPEN) return;
                 stop();
                 if (!metered) await retireUnmetered().catch(() => {});
               }
             })();
           });
-          let forwarding = Promise.resolve();
           upstream.on("message", (data, binary) => {
+            if (closed || draining || client.readyState !== WebSocket.OPEN)
+              return;
             forwarding = forwarding.then(async () => {
               try {
                 await opening;
-                if (closed || !authorized) return;
+                if (draining && Date.now() >= drainUntil) return stop();
+                if (
+                  closed ||
+                  !authorized ||
+                  client.readyState !== WebSocket.OPEN
+                )
+                  return;
                 const fresh = await this.store.get(m.code);
+                if (draining && Date.now() >= drainUntil) return stop();
+                if (closed || client.readyState !== WebSocket.OPEN) return;
                 const current = fresh?.participants.find((x) => x.id === p.id);
                 if (
                   !fresh ||
@@ -446,6 +534,7 @@ export class LiveMedia implements Media {
                       current.meter.fundedUntil <= Date.now())) ||
                   (!metered &&
                     !ownsGatewayConnection(current, p, connectionId)) ||
+                  deadline(fresh, current) <= Date.now() ||
                   current.mediaVersion !== p.mediaVersion ||
                   mediaIdentity(current) !== identity
                 ) {
@@ -453,8 +542,12 @@ export class LiveMedia implements Media {
                   if (!metered) await retireUnmetered().catch(() => {});
                   return;
                 }
-                if (client.readyState === WebSocket.OPEN)
-                  client.send(data, { binary });
+                rememberDeadline(fresh, current);
+                if (draining && Date.now() >= drainUntil) return stop();
+                if (closed || client.readyState !== WebSocket.OPEN) return;
+                client.send(data, { binary }, (error) => {
+                  if (error) stop();
+                });
               } catch {
                 stop();
               }
