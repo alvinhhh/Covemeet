@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -22,6 +23,7 @@ import {
   useRoomContext,
   useTracks,
 } from "@livekit/components-react";
+import { cameraOptions } from "./background";
 import { RoomEvent, Track } from "livekit-client";
 import {
   api,
@@ -58,7 +60,6 @@ import {
 import { DeviceCheck } from "./device-check";
 import { CallAudioRenderer } from "./audio-output";
 import {
-  captureDevice,
   type InputDevices,
   type InputDeviceProps,
 } from "./device-select";
@@ -1241,6 +1242,20 @@ function Conference({
     attempt,
     cameraIntent,
   );
+  const reconnectOwner = useMemo(() => new AbortController(), [attempt, state.me.mediaVersion, roomScope]);
+  const reconnectCurrent = useRef({ mounted: true, enabled: currentCameraIntent.enabled, generation: currentCameraIntent.generation });
+  reconnectCurrent.current.enabled = currentCameraIntent.enabled;
+  reconnectCurrent.current.generation = currentCameraIntent.generation;
+  useEffect(() => {
+    reconnectCurrent.current.mounted = true;
+    return () => { reconnectCurrent.current.mounted = false; reconnectOwner.abort(); };
+  }, [reconnectOwner]);
+  const reconnectCamera = useMemo(() => currentCameraIntent.enabled ? cameraOptions(inputDevices.cameraId, inputDevices.background, {
+    signal: reconnectOwner.signal,
+    onError: () => setCameraIntent(current => current.generation === currentCameraIntent.generation ? { ...current, enabled: false } : current),
+    current: () => reconnectCurrent.current.mounted && reconnectCurrent.current.enabled && reconnectCurrent.current.generation === currentCameraIntent.generation,
+  }) : false,
+    [currentCameraIntent.enabled, currentCameraIntent.generation, inputDevices.cameraId, inputDevices.background, reconnectOwner]);
   if (currentCameraIntent !== cameraIntent)
     setCameraIntent(currentCameraIntent);
   const cameraChanged = useCallback(
@@ -1326,6 +1341,7 @@ function Conference({
     ? audioSignals
     : new Map<string, AudioSignal>();
   const [mediaError, setMediaError] = useState("");
+  const handleMediaError = useCallback((error: Error) => setMediaError(error.message), []);
   const host = state.me.role === "host";
   const moderator = host || !!state.me.moderator;
   const canEnd = state.meeting.canEnd ?? host;
@@ -1572,15 +1588,11 @@ function Conference({
               serverUrl={credentials.url}
               connect
               audio={false}
-              video={
-                currentCameraIntent.enabled
-                  ? captureDevice(inputDevices.cameraId)
-                  : false
-              }
+              video={reconnectCamera}
               options={roomOptions}
               connectOptions={connectionOptions}
               onConnected={() => setMediaError("")}
-              onError={(e) => setMediaError(e.message)}
+              onError={handleMediaError}
               onDisconnected={() =>
                 setMediaError(
                   "Media disconnected. Reconnect to request fresh access.",

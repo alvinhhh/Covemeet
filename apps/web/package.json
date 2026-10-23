@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@livekit/components-react": "^2.9.24",
+    "@mediapipe/tasks-vision": "0.10.14",
     "livekit-client": "^2.15.6",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"

@@ -202,7 +202,7 @@ export async function createApp(config: Config, store: Store, media: Media) {
     if (config.production)
       reply.header(
         "Content-Security-Policy",
-        `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:${config.edition === "hosted" ? ` ${config.portalOrigin}` : ""}; media-src 'self' blob:; connect-src 'self' wss:${config.edition === "hosted" ? ` ${config.portalOrigin}` : ""}; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'`,
+        `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:${config.edition === "hosted" ? ` ${config.portalOrigin}` : ""}; media-src 'self' blob:; connect-src 'self' wss:${config.edition === "hosted" ? ` ${config.portalOrigin}` : ""}; worker-src 'self' blob:; frame-ancestors 'self'; base-uri 'none'; object-src 'none'`,
       );
     // Security dispatch must use the matched route, including decoded static segments.
     const route = req.routeOptions.url;

@@ -12,6 +12,7 @@ import {
 import { RoomEvent, type Room } from "livekit-client";
 
 export type InputDevices = {
+  background?: import("./background").Background;
   cameraId: string;
   microphoneId: string;
   speakerId?: string;
@@ -118,12 +119,14 @@ export function CallDeviceSelect({
   disabled,
   onSelect,
   onError,
+  onChanging,
 }: {
   kind: MediaDeviceKind;
   value: string;
   disabled: boolean;
   onSelect: (deviceId: string) => void;
   onError: (error: unknown) => void;
+  onChanging?: (busy: boolean) => void;
 }) {
   const room = useRoomContext();
   const { devices } = useMediaDeviceSelect({ kind, requestPermissions: false });
@@ -152,12 +155,14 @@ export function CallDeviceSelect({
     if (disabled || pending.current) return;
     pending.current = true;
     setBusy(true);
+    onChanging?.(true);
     try {
       await switchCallDevice(room, kind, deviceId);
       if (owner.mounted && ownerRef.current === owner) onSelect(deviceId);
     } catch (error) {
       if (owner.mounted && ownerRef.current === owner) onError(error);
     } finally {
+      onChanging?.(false);
       if (owner.mounted && ownerRef.current === owner) {
         pending.current = false;
         setBusy(false);

@@ -1,0 +1,12 @@
+MediaPipe Selfie Segmentation model, version 1 (float16, square input).
+Copyright Google LLC. Apache License 2.0; see LICENSE.
+Source: https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/1/selfie_segmenter.tflite
+Model card and license: https://storage.googleapis.com/mediapipe-assets/Model%20Card%20MediaPipe%20Selfie%20Segmentation.pdf
+SHA-256: 191ac9529ae506ee0beefa6b2c945a172dab9d07d1e802a290a4e4038226658b
+
+MediaPipe Tasks Vision runtime 0.10.14, Copyright Google LLC, Apache License 2.0.
+The build includes its unmodified wasm/ files from the pinned npm dependency.
+Source: https://www.npmjs.com/package/@mediapipe/tasks-vision/v/0.10.14
+
+Segmentation can miss fine details, fast movement, or people in poor lighting.
+Background effects are visual effects, not a privacy or security boundary.

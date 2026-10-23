@@ -231,6 +231,22 @@ test("background cleanup isolates room failures and retries them next pass", asy
     });
 });
 
+for (const edition of ["hosted", "self-hosted"]) {
+  test(`${edition} camera effects permit WASM without enabling JavaScript eval or external scripts`, async (t) => {
+    const f = await fixture(t, edition);
+    f.config.production = true;
+    const response = await f.app.inject({ url: "/api/config" });
+    const policy = String(response.headers["content-security-policy"]);
+    const script = policy
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("script-src "));
+    assert.equal(script, "script-src 'self' 'wasm-unsafe-eval'");
+    assert.match(policy, /(?:^|; )object-src 'none'(?:;|$)/);
+    assert.match(policy, /(?:^|; )base-uri 'none'(?:;|$)/);
+  });
+}
+
 test("meeting branding is a machine-bound public profile, never a browser-selected tenant", async (t) => {
   const f = await fixture(t, "hosted", "https://covemeet.com");
   f.config.production = true;

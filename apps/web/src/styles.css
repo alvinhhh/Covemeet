@@ -3805,3 +3805,13 @@ input[type="radio"] {
     max-height: calc(100dvh - 160px - env(safe-area-inset-bottom));
   }
 }
+
+.background-controls { border: 0; margin: 0; padding: 12px 0; min-width: 0; }
+.background-controls legend { font-weight: 600; font-size: 14px; }
+.background-options { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.background-options .button[aria-pressed="true"] { background: #eee; color: #111; border-color: #999; }
+.background-file { display: grid; gap: 6px; font-size: 13px; max-width: 100%; }
+.background-file input { max-width: 100%; font-size: 12px; }
+.background-thumbnail { width: 96px; height: 54px; object-fit: cover; border-radius: 6px; margin-top: 10px; }
+.background-controls p { font-size: 13px; margin: 8px 0 0; }
+.background-controls:disabled { opacity: .65; }

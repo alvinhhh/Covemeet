@@ -1,7 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { TrackToggle, useLocalParticipant } from "@livekit/components-react";
-import { Track } from "livekit-client";
+import { Track, type LocalVideoTrack } from "livekit-client";
+import { BackgroundControls } from "./background-controls";
+import {
+  cameraOptions,
+  changeBackground,
+  stopBackgroundCamera,
+} from "./background";
 import { messageOf, type Participant } from "./api";
 import { Icon } from "./icons";
 import { deviceError } from "./device-check";
@@ -33,6 +39,34 @@ export function MediaControls({
   const audioAllowed = me.role !== "viewer" && me.audioAllowed;
   const videoAllowed = me.role !== "viewer" && me.videoAllowed;
   const screenShareAllowed = me.screenShareAllowed;
+  const cameraOwner = useMemo(
+    () => new AbortController(),
+    [localParticipant, videoAllowed],
+  );
+  const [cameraBusy, setCameraBusy] = useState(false);
+  const owner = useRef({ mounted: true, videoAllowed });
+  owner.current.videoAllowed = videoAllowed;
+  useEffect(() => {
+    owner.current.mounted = true;
+    return () => {
+      owner.current.mounted = false;
+      cameraOwner.abort();
+    };
+  }, [cameraOwner]);
+  useEffect(() => {
+    cameraChanged(isCameraEnabled, false);
+  }, [isCameraEnabled, cameraChanged]);
+  const [backgroundBusy, setBackgroundBusy] = useState(false);
+  const [backgroundFailed, setBackgroundFailed] = useState(false);
+  const backgroundFailure = useRef(0);
+  function backgroundError() {
+    backgroundFailure.current++;
+    cameraChanged(false, true);
+    setBackgroundFailed(true);
+    setError(
+      "Camera stopped because the background could not be applied. Choose a background again before starting video.",
+    );
+  }
   const microphoneAction = !audioAllowed
     ? "Microphone blocked by host"
     : isMicrophoneEnabled
@@ -95,17 +129,55 @@ export function MediaControls({
           </span>
         </TrackToggle>
       </fieldset>
-      <fieldset className="media-control-guard" disabled={!videoAllowed}>
-        <TrackToggle
+      <fieldset
+        className="media-control-guard"
+        disabled={
+          !videoAllowed || backgroundBusy || cameraBusy || backgroundFailed
+        }
+      >
+        <button
+          type="button"
           className="button media-toggle"
-          source={Track.Source.Camera}
-          captureOptions={captureDevice(inputDevices.cameraId)}
-          onChange={cameraChanged}
-          onClick={() => {
-            if (isCameraEnabled) cameraChanged(false, true);
+          aria-pressed={isCameraEnabled}
+          onClick={async () => {
+            if (cameraBusy || backgroundBusy || !videoAllowed) return;
+            setCameraBusy(true);
+            const enabled = !isCameraEnabled;
+            const failure = backgroundFailure.current;
+            if (!enabled) cameraChanged(false, true);
+            try {
+              await localParticipant.setCameraEnabled(
+                enabled,
+                cameraOptions(inputDevices.cameraId, inputDevices.background, {
+                  signal: cameraOwner.signal,
+                  current: () =>
+                    owner.current.mounted &&
+                    owner.current.videoAllowed &&
+                    failure === backgroundFailure.current,
+                  onError: backgroundError,
+                }),
+              );
+              if (
+                !owner.current.mounted ||
+                !owner.current.videoAllowed ||
+                cameraOwner.signal.aborted ||
+                failure !== backgroundFailure.current
+              ) {
+                const track = localParticipant.getTrackPublication(
+                  Track.Source.Camera,
+                )?.track as LocalVideoTrack | undefined;
+                if (track) await stopBackgroundCamera(track);
+                return;
+              }
+              cameraChanged(enabled, true);
+            } catch (error) {
+              cameraChanged(false, true);
+              if (owner.current.mounted && failure === backgroundFailure.current)
+                setError(deviceError(error, "video"));
+            } finally {
+              if (owner.current.mounted) setCameraBusy(false);
+            }
           }}
-          showIcon={false}
-          onDeviceError={(e) => setError(e.message)}
           title={cameraAction}
           aria-label={cameraAction}
         >
@@ -119,7 +191,7 @@ export function MediaControls({
                 ? "Stop video"
                 : "Start video"}
           </span>
-        </TrackToggle>
+        </button>
       </fieldset>
       <fieldset className="media-control-guard" disabled={!screenShareAllowed}>
         <TrackToggle
@@ -155,14 +227,64 @@ export function MediaControls({
               }}
               onError={() => setError(audioOutputError)}
             />
+            <BackgroundControls
+              value={inputDevices.background}
+              disabled={!videoAllowed || backgroundBusy || cameraBusy}
+              onChange={async (background) => {
+                setBackgroundBusy(true);
+                const failure = backgroundFailure.current;
+                const track = localParticipant.getTrackPublication(
+                  Track.Source.Camera,
+                )?.track as LocalVideoTrack | undefined;
+                try {
+                  if (track?.isMuted)
+                    await localParticipant.unpublishTrack(track, true);
+                  else if (
+                    track &&
+                    !(await changeBackground(
+                      track,
+                      background,
+                      () =>
+                        owner.current.mounted &&
+                        owner.current.videoAllowed &&
+                        failure === backgroundFailure.current &&
+                        localParticipant.getTrackPublication(
+                          Track.Source.Camera,
+                        )?.track === track,
+                      undefined,
+                      cameraOwner.signal,
+                      backgroundError,
+                    ))
+                  )
+                    return;
+                  if (
+                    owner.current.mounted &&
+                    failure === backgroundFailure.current
+                  ) {
+                    setInputDevices((current) => ({ ...current, background }));
+                    setBackgroundFailed(false);
+                    setError("");
+                  }
+                } catch (error) {
+                  cameraChanged(false, true);
+                  if (owner.current.mounted) setBackgroundFailed(true);
+                  throw new Error(
+                    "Camera stopped because the background could not be applied. Choose a background again before starting video.",
+                  );
+                } finally {
+                  if (owner.current.mounted) setBackgroundBusy(false);
+                }
+              }}
+            />
             <CallDeviceSelect
               kind="videoinput"
               value={inputDevices.cameraId}
-              disabled={!videoAllowed}
+              disabled={!videoAllowed || backgroundBusy || cameraBusy}
               onSelect={(cameraId) => {
                 setInputDevices((current) => ({ ...current, cameraId }));
                 setError("");
               }}
+              onChanging={setCameraBusy}
               onError={(error) => setError(deviceError(error, "video"))}
             />
           </>,

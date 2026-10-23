@@ -6,6 +6,13 @@ import {
   type LocalAudioTrack,
   type LocalVideoTrack,
 } from "livekit-client";
+import { BackgroundControls } from "./background-controls";
+import {
+  cameraOptions,
+  changeBackground,
+  noBackground,
+  type Background,
+} from "./background";
 import { Icon } from "./icons";
 import { DeviceSelect, type InputDeviceProps } from "./device-select";
 
@@ -74,7 +81,10 @@ function useTestDevice(kind: "audio" | "video") {
     setTrack(undefined);
     setError("");
   }
-  async function start(deviceId: string) {
+  async function start(
+    deviceId: string,
+    background: Background = noBackground,
+  ) {
     if (owner.current?.pending) return;
     stop();
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -93,7 +103,13 @@ function useTestDevice(kind: "audio" | "video") {
           kind === "audio"
             ? createLocalAudioTrack(device)
             : createLocalVideoTrack({
-                ...device,
+                ...cameraOptions(deviceId, background, {
+                  signal: attempt.controller.signal,
+                  onError: () => {
+                    stop();
+                    setError("Background could not be applied. Try again.");
+                  },
+                }),
                 resolution: { width: 640, height: 360, frameRate: 15 },
               }),
         attempt.controller.signal,
@@ -130,6 +146,11 @@ function useTestDevice(kind: "audio" | "video") {
     start,
     stop,
     stopping: pending === "stopping",
+    captureOwner: owner.current,
+    isCurrent: (expected: typeof owner.current) =>
+      !!expected &&
+      owner.current === expected &&
+      !expected.controller.signal.aborted,
   };
 }
 
@@ -138,6 +159,7 @@ export function DeviceCheck({
   setInputDevices,
 }: InputDeviceProps) {
   const camera = useTestDevice("video");
+  const [backgroundBusy, setBackgroundBusy] = useState(false);
   const microphone = useTestDevice("audio");
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const { cameraId, microphoneId } = inputDevices;
@@ -232,15 +254,46 @@ export function DeviceCheck({
           </>
         )}
       </div>
+      <BackgroundControls
+        value={inputDevices.background}
+        disabled={!!camera.pending || backgroundBusy}
+        onChange={async (background) => {
+          setBackgroundBusy(true);
+          const track = camera.track as LocalVideoTrack | undefined;
+          const expected = camera.captureOwner;
+          try {
+            if (
+              track &&
+              !(await changeBackground(
+                track,
+                background,
+                () => camera.isCurrent(expected),
+                undefined,
+                expected?.controller.signal,
+                camera.stop,
+              ))
+            )
+              return;
+            if (!track || camera.isCurrent(expected))
+              setInputDevices((current) => ({ ...current, background }));
+          } catch (error) {
+            camera.stop();
+            throw error;
+          } finally {
+            setBackgroundBusy(false);
+          }
+        }}
+      />
       <div className="device-check-controls">
         <DeviceSelect
           kind="videoinput"
           devices={devices}
           value={cameraId}
-          disabled={!!camera.pending}
+          disabled={!!camera.pending || backgroundBusy}
           onSelect={(cameraId) => {
             setInputDevices((current) => ({ ...current, cameraId }));
-            if (camera.track) void camera.start(cameraId);
+            if (camera.track)
+              void camera.start(cameraId, inputDevices.background);
           }}
         />
         <button
@@ -250,7 +303,7 @@ export function DeviceCheck({
           onClick={() =>
             camera.track || camera.pending
               ? camera.stop()
-              : void camera.start(cameraId)
+              : void camera.start(cameraId, inputDevices.background)
           }
         >
           <Icon name={camera.track ? "camera-off" : "video"} size={18} />
