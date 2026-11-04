@@ -24,7 +24,7 @@ core_vex_ready() {
   local reference=$1 image=$2 container='' result=0 directory="$temporary/core-runtime"
   [[ "$reference" == covemeet-core:generation-test ]] || return 1
   [[ -z "$(git ls-files --others --exclude-standard -- .dockerignore Dockerfile package.json package-lock.json apps/api packages)" ]] || return 1
-  [[ "$(git ls-files -z -- .dockerignore Dockerfile package.json package-lock.json apps/api packages | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1)" == a534bace9af34bc4a15f02d6ebe9c141b1882b2af154ae32cbe3dcb55d7cf82f ]] || return 1
+  [[ "$(git ls-files -z -- .dockerignore Dockerfile package.json package-lock.json apps/api packages | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1)" == 8e6cc9337b78c5e8b5fe0592796608798d7f9083ea4216ad59e676840613e983 ]] || return 1
   [[ "$(docker image inspect --format '{{.Architecture}}|{{.Config.User}}|{{json .Config.Cmd}}|{{json .Config.Entrypoint}}' "$image")" == 'amd64|node|["node","apps/api/dist/index.js"]|["docker-entrypoint.sh"]' ]] || return 1
   mkdir -p "$directory"
   container=$(docker create "$image") || return 1
@@ -34,7 +34,7 @@ core_vex_ready() {
   docker cp -L "$container:/usr/lib/x86_64-linux-gnu/libz.so.1" "$directory/libz.so.1" || result=1
   if [[ $result -eq 0 ]]; then
     (cd "$directory" && printf '%s\n' \
-      '7fde7b8afa198da66257f42ee2001d874c7355631e6d1579a5fb5ef1f246df4c  node' \
+      'e32e2d16081cf644f88392934288086e7662529d0d43277c34f7aad2207cfafb  node' \
       '9792e3cbb541c8f44c7acf5f14f4022ea62998ecc787d326bed4d8b6547dfd92  libc.so.6' \
       '972bb2a18b71140dab0240f8a1f68ab3fb1d56bcd4c4f824a91b70888faf5a00  libstdc++.so.6' \
       '85590dd58edf5445e18bc7193e5ebc01ac5841f1ae187e97705a662e90c6421e  libz.so.1' \
@@ -44,12 +44,27 @@ core_vex_ready() {
   return "$result"
 }
 
+# Only fixed predicate names, digests, counts and tool exit codes reach this file.
+gate_equal() {
+  local passed=false
+  [[ "$2" == "$3" ]] && passed=true
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$passed" >> "$4" || return 1
+  [[ "$passed" == true ]]
+}
+
 phone_vex_ready() {
   local kind=$1 reference=$2 image=$3 expected_source expected_config files modules='' count=0
-  local directory="$temporary/$kind-runtime" container='' result=0 hash path name
+  local directory="$temporary/$kind-runtime" diagnostics="$output/$kind.vex-gate.tsv"
+  local container='' result=0 hash path name actual code copied modules_copied=1 executable_copied=1
+  printf 'predicate\texpected\tactual\tpassed\n' > "$diagnostics"
+  code=0
+  rm -f -- "$output/$kind.packages.tsv" "$output/$kind.module-names.txt" "$output/$kind.module-sha256.txt" \
+    "$output/$kind.asterisk.imports.txt" "$output/$kind.asterisk.dependencies.txt" \
+    "$output/$kind.func_version.so.imports.txt" "$output/$kind.func_version.so.dependencies.txt" || code=$?
+  gate_equal previous-evidence-remove-exit 0 "$code" "$diagnostics" || return 1
   case "$kind" in
     sip)
-      [[ "$reference" == covemeet-sip:local ]] || return 1
+      gate_equal reference covemeet-sip:local "$reference" "$diagnostics" || return 1
       set -- .dockerignore infra/sip.Dockerfile infra/sip/entrypoint.sh infra/compose.sip-test.yaml
       expected_source=09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f
       expected_config='amd64||["/bin/sh","/usr/local/bin/covemeet-sip-entrypoint"]|null'
@@ -64,7 +79,7 @@ a90205500fbd60bed950af82c7d798853365898b863efd132fa6259bf1e14a86 /usr/local/bin/
 6267f2b1ca9c8fe84bef85c2069944c964c6f269f5dd8b903bc8639c3ea8c9f2 /var/lib/dpkg/status'
       ;;
     asterisk)
-      [[ "$reference" == covemeet-asterisk:local ]] || return 1
+      gate_equal reference covemeet-asterisk:local "$reference" "$diagnostics" || return 1
       set -- .dockerignore infra/asterisk.Dockerfile infra/asterisk infra/compose.sip-test.yaml
       expected_source=4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e
       expected_config='amd64|10001:10001|["/usr/sbin/asterisk","-f","-n","-C","/etc/asterisk/asterisk.conf"]|null'
@@ -76,46 +91,108 @@ a90205500fbd60bed950af82c7d798853365898b863efd132fa6259bf1e14a86 /usr/local/bin/
 621fb67b4f6f9acc78c7777d1937ce6baf7104be4a7726b28321c5c6f6e05c3a /usr/local/lib/libxml2.so.16
 4cde661dc336a1a835e605532086c629f6279a312374c91795215b8489ad4bcf /usr/lib/x86_64-linux-gnu/libedit.so.2
 7f7c057d4a04af01365ebf056a59521499ab4454783c4f7b74bce9f53b80b471 /usr/lib/x86_64-linux-gnu/libncurses.so.6
-11f89467141e6fea87e22e93050e6fc1243efdcf7779e7500497488215c7b79e /var/lib/dpkg/status'
+72b9f22b0f3d4d4998c70f7533d44b2379eb14be47224c4050dfb60eb4f8256e /var/lib/dpkg/status'
       # Upstream embeds the build date, host and kernel in asterisk and
       # func_version.so. The other 303 modules retain exact reviewed hashes.
       modules=df3f803bc4f92b7128a1519d1021ceffbe52bf8211b937fb318fdda1d0cc690e
       ;;
     *) return 1 ;;
   esac
-  [[ -z "$(git ls-files --others --exclude-standard -- "$@")" ]] || return 1
-  [[ "$(git ls-files -z -- "$@" | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1)" == "$expected_source" ]] || return 1
-  [[ "$(docker image inspect --format '{{.Architecture}}|{{.Config.User}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}' "$image")" == "$expected_config" ]] || return 1
+  code=0
+  actual=$(git ls-files --others --exclude-standard -- "$@" 2>/dev/null) || code=$?
+  gate_equal source-list-exit 0 "$code" "$diagnostics" || return 1
+  if [[ -n "$actual" ]]; then actual=present; else actual=absent; fi
+  gate_equal untracked-source absent "$actual" "$diagnostics" || return 1
+  code=0
+  actual=$(git ls-files -z -- "$@" | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1) || code=$?
+  gate_equal source-digest-exit 0 "$code" "$diagnostics" || return 1
+  gate_equal source-sha256 "$expected_source" "$actual" "$diagnostics" || return 1
+  code=0
+  actual=$(docker image inspect --format '{{.Architecture}}|{{.Config.User}}|{{json .Config.Entrypoint}}|{{json .Config.Cmd}}' "$image" 2>/dev/null) || code=$?
+  gate_equal image-inspect-exit 0 "$code" "$diagnostics" || return 1
+  # Inspect output can contain caller-supplied command values; retain only digests.
+  code=0
+  hash=$(printf '%s' "$expected_config" | sha256sum | cut -d ' ' -f1) || code=$?
+  gate_equal expected-config-hash-exit 0 "$code" "$diagnostics" || return 1
+  code=0
+  copied=$(printf '%s' "$actual" | sha256sum | cut -d ' ' -f1) || code=$?
+  gate_equal actual-config-hash-exit 0 "$code" "$diagnostics" || return 1
+  gate_equal launch-config-sha256 "$hash" "$copied" "$diagnostics" || return 1
+  [[ "$actual" == "$expected_config" ]] || return 1
   mkdir -p "$directory"
-  container=$(docker create "$image") || return 1
+  code=0
+  container=$(docker create "$image" 2>/dev/null) || code=$?
+  gate_equal container-create-exit 0 "$code" "$diagnostics" || return 1
   while read -r hash path; do
     name=${path##*/}
-    docker cp -L "$container:$path" "$directory/$name" || result=1
-    printf '%s  %s\n' "$hash" "$name" >> "$directory/checks"
-  done <<< "$files"
-  if [[ "$result" -eq 0 ]]; then
-    (cd "$directory" && sha256sum --check --strict --status checks) || result=1
-  fi
-  if [[ -n "$modules" ]]; then
-    docker cp -L "$container:/usr/sbin/asterisk" "$directory/asterisk" || result=1
-    docker cp -L "$container:/usr/lib/asterisk/modules" "$directory/modules" || result=1
-    if [[ "$result" -eq 0 ]]; then
-      count=$(find "$directory/modules" -maxdepth 1 -type f -name '*.so' | wc -l | tr -d ' ')
-      [[ "$count" == 304 ]] || result=1
-      [[ "$(cd "$directory/modules" && find . -maxdepth 1 -type f -name '*.so' -print | LC_ALL=C sort | sha256sum | cut -d ' ' -f1)" == 5a7d51791c588f57ffeb5199c1b7173a54c374f23cb45860d40ec6421cb4e347 ]] || result=1
-      [[ "$(cd "$directory/modules" && find . -maxdepth 1 -type f -name '*.so' ! -name func_version.so -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1)" == "$modules" ]] || result=1
-      for path in "$directory/asterisk" "$directory/modules/func_version.so"; do
-        # These two files contain variable build strings. Keep their native
-        # caller/dependency boundary pinned to the reviewed source instead.
-        readelf -h "$path" | grep -q 'Machine:.*Advanced Micro Devices X86-64' || result=1
-        nm -D --undefined-only "$path" > "$directory/symbols" || result=1
-        readelf -d "$path" > "$directory/dependencies" || result=1
-        if awk '{ name=$NF; sub(/@.*/, "", name); if (name ~ /^(gzwrite|gzprintf|gzvprintf|ns_printrr|ns_sprintrr|ns_sprintrrf|fp_nquery|strfmon|strfmon_l|acl_get_file|acl_set_file|acl_delete_def_file|acl_copy_file)$/) bad=1 } END { exit !bad }' "$directory/symbols"; then result=1; fi
-        if grep -Eq 'NEEDED.*\[(libresolv|libacl)\.so' "$directory/dependencies"; then result=1; fi
-      done
+    code=0
+    docker cp -L "$container:$path" "$directory/$name" 2>/dev/null || code=$?
+    gate_equal "copy:$path" 0 "$code" "$diagnostics" || result=1
+    if [[ "$code" -eq 0 ]]; then
+      actual=$(sha256sum "$directory/$name" | cut -d ' ' -f1) || code=$?
+      gate_equal "hash-exit:$path" 0 "$code" "$diagnostics" || result=1
+      gate_equal "sha256:$path" "$hash" "$actual" "$diagnostics" || result=1
+      if [[ "$name" == status ]]; then
+        code=0
+        awk '/^Package: / { package=$2 } /^Version: / { print package "\t" $2 }' "$directory/status" > "$output/$kind.packages.tsv" || code=$?
+        gate_equal package-inventory-exit 0 "$code" "$diagnostics" || result=1
+      fi
     fi
+  done <<< "$files"
+  if [[ -n "$modules" ]]; then
+    docker cp -L "$container:/usr/sbin/asterisk" "$directory/asterisk" 2>/dev/null && executable_copied=0 || executable_copied=$?
+    gate_equal copy:/usr/sbin/asterisk 0 "$executable_copied" "$diagnostics" || result=1
+    docker cp -L "$container:/usr/lib/asterisk/modules" "$directory/modules" 2>/dev/null && modules_copied=0 || modules_copied=$?
+    gate_equal copy:/usr/lib/asterisk/modules 0 "$modules_copied" "$diagnostics" || result=1
+    if [[ "$modules_copied" -eq 0 ]]; then
+      code=0
+      count=$(find "$directory/modules" -maxdepth 1 -type f -name '*.so' | wc -l | tr -d ' ') || code=$?
+      gate_equal module-count-exit 0 "$code" "$diagnostics" || result=1
+      gate_equal module-count 304 "$count" "$diagnostics" || result=1
+      code=0
+      (cd "$directory/modules" && find . -maxdepth 1 -type f -name '*.so' -print | LC_ALL=C sort) > "$output/$kind.module-names.txt" || code=$?
+      gate_equal module-name-list-exit 0 "$code" "$diagnostics" || result=1
+      code=0
+      actual=$(sha256sum < "$output/$kind.module-names.txt" | cut -d ' ' -f1) || code=$?
+      gate_equal module-names-exit 0 "$code" "$diagnostics" || result=1
+      gate_equal module-names-sha256 5a7d51791c588f57ffeb5199c1b7173a54c374f23cb45860d40ec6421cb4e347 "$actual" "$diagnostics" || result=1
+      code=0
+      (cd "$directory/modules" && find . -maxdepth 1 -type f -name '*.so' ! -name func_version.so -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > "$output/$kind.module-sha256.txt" || code=$?
+      gate_equal module-hash-list-exit 0 "$code" "$diagnostics" || result=1
+      code=0
+      actual=$(sha256sum < "$output/$kind.module-sha256.txt" | cut -d ' ' -f1) || code=$?
+      gate_equal module-binaries-exit 0 "$code" "$diagnostics" || result=1
+      gate_equal module-binaries-sha256 "$modules" "$actual" "$diagnostics" || result=1
+    fi
+    for path in "$directory/asterisk" "$directory/modules/func_version.so"; do
+      name=${path##*/}
+      if [[ "$name" == asterisk && "$executable_copied" -ne 0 ]] || [[ "$name" == func_version.so && "$modules_copied" -ne 0 ]]; then continue; fi
+      # These two files contain variable build strings. Keep their native
+      # caller/dependency boundary pinned to the reviewed source instead.
+      code=0
+      readelf -h "$path" > "$directory/header" 2>/dev/null || code=$?
+      gate_equal "readelf-header:$name" 0 "$code" "$diagnostics" || result=1
+      code=0
+      grep -q 'Machine:.*Advanced Micro Devices X86-64' "$directory/header" || code=$?
+      gate_equal "amd64:$name" 0 "$code" "$diagnostics" || result=1
+      code=0
+      nm -D --undefined-only "$path" > "$output/$kind.$name.imports.txt" 2>/dev/null || code=$?
+      gate_equal "nm:$name" 0 "$code" "$diagnostics" || result=1
+      code=0
+      actual=$(awk '{ name=$NF; sub(/@.*/, "", name); if (name ~ /^(gzwrite|gzprintf|gzvprintf|ns_printrr|ns_sprintrr|ns_sprintrrf|fp_nquery|strfmon|strfmon_l|acl_get_file|acl_set_file|acl_delete_def_file|acl_copy_file)$/) bad=1 } END { print bad ? "present" : "absent" }' "$output/$kind.$name.imports.txt") || code=$?
+      gate_equal "import-check-exit:$name" 0 "$code" "$diagnostics" || result=1
+      gate_equal "forbidden-imports:$name" absent "$actual" "$diagnostics" || result=1
+      code=0
+      readelf -d "$path" > "$output/$kind.$name.dependencies.txt" 2>/dev/null || code=$?
+      gate_equal "readelf-dynamic:$name" 0 "$code" "$diagnostics" || result=1
+      code=0
+      grep -Eq 'NEEDED.*\[(libresolv|libacl)\.so' "$output/$kind.$name.dependencies.txt" || code=$?
+      gate_equal "forbidden-dependencies:$name" 1 "$code" "$diagnostics" || result=1
+    done
   fi
-  docker rm "$container" >/dev/null || result=1
+  code=0
+  docker rm "$container" >/dev/null 2>&1 || code=$?
+  gate_equal container-remove-exit 0 "$code" "$diagnostics" || result=1
   return "$result"
 }
 

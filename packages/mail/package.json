@@ -20,7 +20,7 @@
     "@aws-sdk/client-sesv2": "3.1146.0",
     "@aws-sdk/client-sts": "3.1146.0",
     "@smithy/credential-provider-imds": "4.5.2",
-    "nodemailer": "10.0.14",
+    "nodemailer": "10.1.4",
     "pg": "8.23.1"
   },
   "devDependencies": {

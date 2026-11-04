@@ -2,8 +2,8 @@
   "@context": "https://openvex.dev/ns/v0.2.0",
   "@id": "urn:uuid:c5acea31-2fb1-48fe-ab38-4242e5cfb1a5",
   "author": "Covemeet",
-  "timestamp": "2026-10-10T09:27:24.368396Z",
-  "version": 2,
+  "timestamp": "2026-11-04T03:57:18Z",
+  "version": 3,
   "statements": [
     {
       "vulnerability": {
@@ -200,6 +200,62 @@
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "Asterisk does not run Perl Archive::Tar or parse attacker-supplied tar files; the inspected perl-base file list lacks that module.",
       "status_notes": "Reviewed Linux/amd64 Asterisk source and build recipe digest 4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e. The Dockerfile pins the Asterisk source archive SHA-256 3bd5ee040509a3d3cd9b1ba9520c18e6ec0a7e7981ca68c457dcd36ba3c54d94. The CI gate verifies launch configuration, exact support/runtime libraries and package inventory, 303 stable module hashes, all 304 module names, and affected native imports/dependencies in the build-metadata-bearing executable and func_version.so. It covers only the configured Asterisk service."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-84243"
+      },
+      "products": [
+        {
+          "@id": "covemeet-asterisk:local"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The pinned Asterisk startup explicitly selects C.UTF-8 for all locale categories; failure retains the initial C locale. The configured service does not accept caller-controlled locale environment or message catalogs, so the affected LANGUAGE catalog traversal path is not used. Reassess if startup locale or environment propagation changes.",
+      "status_notes": "Reviewed Linux/amd64 Asterisk source and build recipe digest 4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e. Applies only to this configured service after the CI gate verifies the reviewed source, launch configuration and exact runtime boundaries. The vulnerable package is present; arbitrary operator workloads and changed configuration are outside this assessment."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-119373"
+      },
+      "products": [
+        {
+          "@id": "covemeet-asterisk:local"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The configured Asterisk service uses a plain astdb key/value table and a Stasis-only inbound dialplan. The reviewed SQLite drivers and read-only operator configuration do not create FTS5 detail=none tables or expose caller-controlled prefix MATCH queries. Reassess if custom SQL, database configuration or module loading changes.",
+      "status_notes": "Reviewed Linux/amd64 Asterisk source and build recipe digest 4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e. Applies only to this configured service after the CI gate verifies the reviewed source, launch configuration and exact runtime boundaries. The vulnerable package is present; arbitrary operator workloads and changed configuration are outside this assessment."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-119374"
+      },
+      "products": [
+        {
+          "@id": "covemeet-asterisk:local"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The configured Asterisk astdb is initialized in a private tmpfs and does not import caller-supplied SQLite databases or use FTS5 secure-delete. Operator replacement of databases is outside this configured-service assessment. Reassess if database import, persistence initialization, custom SQL or FTS5 processing changes.",
+      "status_notes": "Reviewed Linux/amd64 Asterisk source and build recipe digest 4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e. Applies only to this configured service after the CI gate verifies the reviewed source, launch configuration and exact runtime boundaries. The vulnerable package is present; arbitrary operator workloads and changed configuration are outside this assessment."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-119379"
+      },
+      "products": [
+        {
+          "@id": "covemeet-asterisk:local"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The pinned Asterisk SQLite code uses ordinary open, prepare, bind, step and exec operations, not SQLite session changeset application. The configured service exposes no caller-supplied changeset path. Reassess if custom SQL, native SQLite callers or module loading changes.",
+      "status_notes": "Reviewed Linux/amd64 Asterisk source and build recipe digest 4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e. Applies only to this configured service after the CI gate verifies the reviewed source, launch configuration and exact runtime boundaries. The vulnerable package is present; arbitrary operator workloads and changed configuration are outside this assessment."
     }
   ]
 }

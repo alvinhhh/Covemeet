@@ -29,10 +29,10 @@ node scripts/local.mjs start --hosted
 
 The hosted overlay has a separate PostgreSQL database for accounts and sessions, with its own generated password and no published database port. Verification and password-reset mail goes to the local Mailpit inbox. The hosted repository documents account setup, Free hosting after email verification and paid plan access. Staff use named accounts and passkeys; the shared operator key is limited to local administration.
 
-Recording is off initially. Opt in explicitly to build and start the isolated recorder:
+Recording is off initially. To build and start the isolated recorder with the self-hosted core:
 
 ```sh
-node scripts/local.mjs start --hosted --recording
+node scripts/local.mjs start --self-hosted --recording
 ```
 
 Each start builds the current source unless `--no-build` is supplied. It preserves the selected edition and recording mode. `--self-hosted` switches back to the core control panel; `--no-recording` disables the global recorder and stops its worker. End active meetings and stop recordings before changing the edition or recording mode. Ordinary per-meeting recording controls remain in the product.
@@ -84,7 +84,7 @@ Only edge HTTPS, media listeners and test-mail UI are published, all on `127.0.0
 
 ## Recording and remaining boundaries
 
-The optional recorder shares a 4 GiB, UID 1000, mode `0700` raw-memory volume with the core. Only encrypted output uses the persistent recording volume. Configure encrypted swap or disable swap on the Docker host before sensitive testing; memory storage alone does not rule out swap. Space is bounded, so long/high-bitrate recordings can fail when it fills. The pinned recorder requires `SYS_ADMIN` for Chrome sandboxing and remains a privileged trust boundary. Test only silent synthetic video until the recording gates pass.
+The optional recorder shares a 4 GiB, UID 1000, mode `0700` raw-memory volume with the core. Only encrypted output uses the persistent recording volume. Configure encrypted swap or disable swap on the Docker host before sensitive testing; memory storage alone does not rule out swap. Space is bounded, so long/high-bitrate recordings can fail when it fills. The pinned recorder requires `SYS_ADMIN` for Chrome sandboxing and remains a privileged trust boundary. The existing recorder fixture checks silent synthetic video only. Recording audio needs a separate synthetic A/V check with non-playing sinks and decoded video and non-silent audio in the decrypted file.
 
 The browser-facing API/signaling leg uses HTTPS/WSS. Standard WebRTC media uses the SFU's DTLS-SRTP implementation, with protocol and moderation tests still required. Internal HTTP signaling, PostgreSQL/Redis connections and captured test SMTP stay on this local Docker bridge; this setup does not assert service-to-service TLS, FIPS validation or end-to-end encryption against the operator. Optional TURN is a local fixture only. Phone/SIP, external carrier, real SMTP delivery, production disaster recovery and validated 100/1,000-person capacity are not supplied by this local workflow.
 

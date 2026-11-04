@@ -18,7 +18,8 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import nodemailer, { type Transporter } from "nodemailer";
+import type { Transporter } from "nodemailer";
+import nodemailer from "../../../packages/mail/test/nodemailer.js";
 import {
   LocalKeyProvider,
   encryptRecording,

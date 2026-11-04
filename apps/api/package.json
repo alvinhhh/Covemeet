@@ -17,12 +17,12 @@
     "@fastify/rate-limit": "11.2.0",
     "@meeting-platform/recording": "*",
     "argon2": "0.45.1",
-    "fastify": "5.12.5",
+    "fastify": "5.12.7",
     "livekit-server-sdk": "2.19.1",
-    "nodemailer": "10.0.14",
+    "nodemailer": "10.1.4",
     "pg": "8.23.1",
     "ws": "^8.18.0",
-    "zod": "^4.0.0",
+    "zod": "4.6.6",
     "@meeting-platform/mail": "*"
   },
   "devDependencies": {
