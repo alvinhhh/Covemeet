@@ -1,7 +1,9 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { RoomServiceClient } from "livekit-server-sdk";
 import { WebSocket } from "ws";
@@ -769,6 +771,44 @@ const watchdog = setTimeout(() => {
   void save().finally(() => process.exit(1));
 }, 180000);
 try {
+  const dependencies = {};
+  for (const workspace of [
+    "apps/api",
+    "apps/phone",
+    "packages/mail",
+    "packages/recording",
+  ]) {
+    // Resolve from each owner, including dependencies nested below that workspace.
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `
+      import { readFileSync, statSync } from "node:fs";
+      import { fileURLToPath } from "node:url";
+      const manifest = JSON.parse(readFileSync("package.json", "utf8"));
+      const dependencies = Object.fromEntries(Object.keys(manifest.dependencies || {}).map(name => {
+        const resolved = import.meta.resolve(name);
+        if (!statSync(fileURLToPath(resolved)).isFile()) throw new Error(name + " is not a module");
+        return [name, resolved];
+      }));
+      console.log(JSON.stringify(dependencies));
+    `,
+      ],
+      {
+        cwd: fileURLToPath(new URL(`../../${workspace}/`, import.meta.url)),
+        encoding: "utf8",
+        timeout: 10000,
+      },
+    );
+    check(
+      result.status === 0,
+      `runtime-dependency-resolution-failed:${workspace}`,
+    );
+    dependencies[workspace] = JSON.parse(result.stdout);
+  }
+  await proof("runtime-workspace-dependencies", { dependencies });
   const a = await apiInstance(),
     b = await apiInstance();
   check((await a.store.all()).length === 0, "disposable-database-not-empty");

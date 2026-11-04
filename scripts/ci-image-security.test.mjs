@@ -50,7 +50,7 @@ test("image scan retains every result, fails on findings/errors and verifies the
 test("reviewed source fingerprints match the declared file sets", () => {
   const repo = fileURLToPath(new URL("..", import.meta.url));
   for (const [files, expected] of [
-    [".dockerignore Dockerfile package.json package-lock.json apps/api packages", "8e6cc9337b78c5e8b5fe0592796608798d7f9083ea4216ad59e676840613e983"],
+    [".dockerignore Dockerfile package.json package-lock.json apps/api packages", "7bc592868bb727efd0c59a74b008550144d2077cbc3dca11eccd884d4e22b13d"],
     [".dockerignore infra/sip.Dockerfile infra/sip/entrypoint.sh infra/compose.sip-test.yaml", "09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f"],
     [".dockerignore infra/asterisk.Dockerfile infra/asterisk infra/compose.sip-test.yaml", "4dd014d6b3e1511dc416d62fbb1ee7fc069f3c2f1766f5ee039627a8fa174d5e"],
   ]) {
@@ -77,16 +77,14 @@ test("reviewed image VEX requires unchanged source and binaries; new findings st
     const vexFile = fileURLToPath(new URL(`../security/${name}-image.vex.json`, import.meta.url));
     await copyFile(vexFile, path.join(root, `security/${name}-image.vex.json`));
     const vex = JSON.parse(await readFile(vexFile, "utf8"));
-    assert.equal(vex.statements.length, name === "sip" ? 14 : 18);
+    assert.equal(vex.statements.length, 18);
     assert.ok(vex.statements.every((statement) =>
       statement.status === "not_affected" && statement.products[0]["@id"] === product));
-    if (name !== "sip") {
-      const identifiers = ["CVE-2026-84243", "CVE-2026-119373", "CVE-2026-119374", "CVE-2026-119379"];
-      const additions = vex.statements.filter((statement) =>
-        identifiers.includes(statement.vulnerability.name));
-      assert.deepEqual(additions.map((statement) => statement.vulnerability.name).sort(), identifiers.sort());
-      assert.ok(additions.every((statement) => statement.justification === "vulnerable_code_not_in_execute_path"));
-    }
+    const identifiers = ["CVE-2026-84243", "CVE-2026-119373", "CVE-2026-119374", "CVE-2026-119379"];
+    const additions = vex.statements.filter((statement) =>
+      identifiers.includes(statement.vulnerability.name));
+    assert.deepEqual(additions.map((statement) => statement.vulnerability.name).sort(), identifiers.sort());
+    assert.ok(additions.every((statement) => statement.justification === "vulnerable_code_not_in_execute_path"));
   }
 
   const stubs = {
@@ -195,7 +193,7 @@ esac`,
   const env = {
     ...process.env, PATH: `${bin}:${process.env.PATH}`, STUB_GRYPE: path.join(bin, "grype"),
     SCAN_LOG: log,
-    SOURCE_DIGEST: "8e6cc9337b78c5e8b5fe0592796608798d7f9083ea4216ad59e676840613e983",
+    SOURCE_DIGEST: "7bc592868bb727efd0c59a74b008550144d2077cbc3dca11eccd884d4e22b13d",
   };
   const run = (extra = {}, target = "core=covemeet-core:generation-test") => spawnSync("bash", [script, target],
     { cwd: root, env: { ...env, ...extra }, encoding: "utf8" });

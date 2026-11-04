@@ -2,8 +2,8 @@
   "@context": "https://openvex.dev/ns/v0.2.0",
   "@id": "urn:uuid:a35e3f06-fab5-4ef8-b380-e4d0e5c80566",
   "author": "Covemeet",
-  "timestamp": "2026-10-10T09:26:28.146074Z",
-  "version": 3,
+  "timestamp": "2026-11-04T04:29:11.171Z",
+  "version": 4,
   "statements": [
     {
       "vulnerability": {
@@ -200,6 +200,62 @@
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "The SIP entrypoint and live process do not run Perl Archive::Tar or parse attacker-supplied tar files.",
       "status_notes": "Reviewed Linux/amd64 sip source digest 09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f; scripts/ci-image-security.sh verifies exact runtime binaries and launch configuration before applying this statement. It covers only the configured sip service, not other containers or host operator actions."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-84243"
+      },
+      "products": [
+        {
+          "@id": "covemeet-sip:local"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The fixed SIP entrypoint runs firewall setup and drops all capabilities before starting the pinned Go/Cgo service. SIP requests do not control process locale environment or message-catalog paths; the reviewed service exposes no gettext/catalog interface. The attacker-controlled LANGUAGE and non-C locale/catalog trust-boundary path is not used. Reassess if environment propagation, command execution or locale/catalog handling changes.",
+      "status_notes": "Reviewed Linux/amd64 sip source digest 09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f; scripts/ci-image-security.sh verifies exact runtime binaries, package inventory and launch configuration before applying this statement. Applies only to the configured SIP entrypoint and service; arbitrary operator commands, changed locale environment, native dependencies or service configuration require reassessment."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-119373"
+      },
+      "products": [
+        {
+          "@id": "covemeet-sip:local"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The pinned Go/Cgo SIP service uses C audio libraries and exposes no SQLite query or FTS5 table interface. It does not populate FTS5 detail=none tables or execute prefix MATCH queries; the affected doclist-merging path is outside the configured service. Reassess if SQLite, FTS5 or native database dependencies are introduced.",
+      "status_notes": "Reviewed Linux/amd64 sip source digest 09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f; scripts/ci-image-security.sh verifies exact runtime binaries, package inventory and launch configuration before applying this statement. Applies only to the configured SIP entrypoint and service; arbitrary operator commands, changed locale environment, native dependencies or service configuration require reassessment."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-119374"
+      },
+      "products": [
+        {
+          "@id": "covemeet-sip:local"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The configured SIP service does not import SQLite database files or invoke FTS5 secure-delete. The pinned executable and reviewed native audio dependency path provide no corrupted FTS5 index deletion interface. Reassess if database import, SQLite native dependencies or FTS5 processing is introduced.",
+      "status_notes": "Reviewed Linux/amd64 sip source digest 09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f; scripts/ci-image-security.sh verifies exact runtime binaries, package inventory and launch configuration before applying this statement. Applies only to the configured SIP entrypoint and service; arbitrary operator commands, changed locale environment, native dependencies or service configuration require reassessment."
+    },
+    {
+      "vulnerability": {
+        "name": "CVE-2026-119379"
+      },
+      "products": [
+        {
+          "@id": "covemeet-sip:local"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "The pinned SIP executable and reviewed native audio dependency path do not apply SQLite session changesets, and SIP requests expose no changeset input. The affected sqlite3changeset_apply path is outside the configured service. Reassess if SQLite changeset APIs or native database dependencies are introduced.",
+      "status_notes": "Reviewed Linux/amd64 sip source digest 09544f2da8f2be7875acfe1f38c9e368c69bc5cab47b7e436e1e692d4b31f35f; scripts/ci-image-security.sh verifies exact runtime binaries, package inventory and launch configuration before applying this statement. Applies only to the configured SIP entrypoint and service; arbitrary operator commands, changed locale environment, native dependencies or service configuration require reassessment."
     }
   ]
 }

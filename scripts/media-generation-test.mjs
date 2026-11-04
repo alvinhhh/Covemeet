@@ -8,27 +8,46 @@ import { fileURLToPath } from "node:url";
 // This runner never builds/restarts the user's local installation.
 if (!process.argv.includes("--execute-reviewed-fixture")) {
   console.log(
-    "Prepared only. Set MEDIA_GENERATION_IMAGE to a reviewed core image digest and pass --execute-reviewed-fixture.",
+    "Prepared only. Set MEDIA_GENERATION_IMAGE and MEDIA_GENERATION_API_IMAGE to reviewed fixture and API image digests, then pass --execute-reviewed-fixture.",
   );
   process.exit(0);
 }
 const image = process.env.MEDIA_GENERATION_IMAGE;
+const apiImage = process.env.MEDIA_GENERATION_API_IMAGE;
 if (!/^sha256:[a-f0-9]{64}$/.test(image || ""))
-  throw new Error("An explicit reviewed core image digest is required");
+  throw new Error("An explicit reviewed fixture image digest is required");
+if (!/^sha256:[a-f0-9]{64}$/.test(apiImage || ""))
+  throw new Error("An explicit reviewed API image digest is required");
 process.umask(0o077);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runtime = path.join(root, "runtime/media-generation-test");
 const resultDir = path.join(root, "test-results/media-generation");
 const journalFile = path.join(runtime, "owner.json");
 const run = promisify(execFile);
-const found = await run(
-  "docker",
-  ["image", "inspect", "--format", "{{.Id}}", image],
-  { timeout: 10000, maxBuffer: 4096 },
-);
-if (found.stdout.trim() !== image)
-  throw new Error("Reviewed image is unavailable");
-await access(path.join(root, "apps/phone/dist/gateway.js"));
+async function imageLayers(digest) {
+  const found = await run(
+    "docker",
+    ["image", "inspect", "--format", "{{.Id}}|{{json .RootFS.Layers}}", digest],
+    { timeout: 10000, maxBuffer: 16384 },
+  );
+  const [id, layers] = found.stdout.trim().split("|");
+  if (id !== digest) throw new Error("Reviewed image is unavailable");
+  return JSON.parse(layers);
+}
+const [apiLayers, fixtureLayers] = await Promise.all([
+  imageLayers(apiImage),
+  imageLayers(image),
+]);
+if (
+  !Array.isArray(apiLayers) ||
+  !Array.isArray(fixtureLayers) ||
+  apiLayers.length === 0 ||
+  fixtureLayers.length !== apiLayers.length + 1 ||
+  apiLayers.some((layer, index) => layer !== fixtureLayers[index])
+)
+  throw new Error(
+    "Fixture must extend the reviewed API image by one phone workspace layer",
+  );
 await mkdir(runtime, { recursive: true, mode: 0o700 });
 try {
   await access(journalFile);
@@ -55,6 +74,7 @@ const composeArgs = [
 const ownership = {
   project,
   image,
+  apiImage,
   createdAt: new Date().toISOString(),
   pid: process.pid,
 };
@@ -114,6 +134,15 @@ try {
   });
   journalCreated = true;
   await mkdir(resultDir, { recursive: true });
+  await writeFile(
+    path.join(resultDir, "image-relationship.json"),
+    JSON.stringify(
+      { apiImage, fixtureImage: image, apiLayers, fixtureLayers },
+      null,
+      2,
+    ) + "\n",
+    { mode: 0o600 },
+  );
   const key = randomBytes(12).toString("hex"),
     secret = randomBytes(32).toString("hex");
   await writeFile(
@@ -162,6 +191,7 @@ try {
     await readFile(path.join(resultDir, "media-generation.json"), "utf8"),
   );
   if (
+    report.image !== image ||
     !report.passed ||
     !report.cleanup?.nativeSdkDisposed ||
     !report.cleanup?.allFixturesReleased

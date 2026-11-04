@@ -26,7 +26,7 @@ services:
     mem_limit: 256m
     cpus: 0.5
   media-runner:
-    image: ${MEDIA_GENERATION_IMAGE:?Use an explicitly reviewed core image digest}
+    image: ${MEDIA_GENERATION_IMAGE:?Use an explicitly reviewed media fixture image digest}
     command: [node, scripts/validation/media-generation.mjs]
     environment:
       MEDIA_GENERATION_IMAGE: ${MEDIA_GENERATION_IMAGE}
@@ -38,9 +38,6 @@ services:
       RUST_LOG: error
     volumes:
       - ../scripts/validation/media-generation.mjs:/app/scripts/validation/media-generation.mjs:ro
-      # The existing core image contains its matching API and native SDK dependencies.
-      # Reuse only the compiled cookie adapter from the same checkout's required build.
-      - ../apps/phone/dist:/app/apps/phone/dist:ro
       - ../test-results/media-generation:/results
     read_only: true
     tmpfs: [/tmp]
