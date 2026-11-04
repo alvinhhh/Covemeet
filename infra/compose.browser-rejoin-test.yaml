@@ -1,0 +1,75 @@
+# Disposable browser regression. Only the API has a loopback binding.
+services:
+  postgres:
+    image: ${BROWSER_REJOIN_POSTGRES_IMAGE:?Use the guarded runner}
+    environment:
+      POSTGRES_USER: rejoin
+      POSTGRES_DB: rejoin
+      POSTGRES_PASSWORD: ${BROWSER_REJOIN_DB_PASSWORD:?Use the guarded runner}
+    tmpfs: [/var/lib/postgresql/data]
+    mem_limit: 256m
+    cpus: 0.5
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U rejoin -d rejoin]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  livekit:
+    image: ${BROWSER_REJOIN_LIVEKIT_IMAGE:?Use the guarded runner}
+    command: [--config, /etc/livekit.yaml]
+    volumes:
+      - ${BROWSER_REJOIN_DIRECTORY:?Use the guarded runner}/livekit.yaml:/etc/livekit.yaml:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 0.5
+  core:
+    image: ${BROWSER_REJOIN_IMAGE:?Use the guarded runner}
+    networks: [default, browser]
+    ports:
+      - "127.0.0.1:${BROWSER_REJOIN_PORT:?Use the guarded runner}:4100"
+    environment:
+      NODE_ENV: development
+      EDITION: self-hosted
+      HOST: 0.0.0.0
+      PORT: 4100
+      SITE_ORIGIN: http://127.0.0.1:${BROWSER_REJOIN_PORT}
+      STATIC_DIR: /app/apps/web/dist
+      DATABASE_URL: postgresql://rejoin:${BROWSER_REJOIN_DB_PASSWORD}@postgres:5432/rejoin
+      SESSION_SECRET: ${BROWSER_REJOIN_SESSION_SECRET:?Use the guarded runner}
+      CREATION_KEY: ${BROWSER_REJOIN_CREATION_KEY:?Use the guarded runner}
+      LIVEKIT_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${BROWSER_REJOIN_LIVEKIT_KEY:?Use the guarded runner}
+      LIVEKIT_API_SECRET: ${BROWSER_REJOIN_LIVEKIT_SECRET:?Use the guarded runner}
+      RECORDING_ENABLED: "false"
+      RECORDING_DIR: /tmp/recordings
+      SMTP_HOST: ""
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:4100/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+networks:
+  default:
+    internal: true
+  browser:
+    driver: bridge

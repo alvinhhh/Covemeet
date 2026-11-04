@@ -791,15 +791,15 @@ export class RecordingService {
           }),
           {
             layout: "grid",
-            ...(this.config.edition === "hosted"
-              ? {
-                  encodingOptions: new EncodingOptions({
-                    width: 1280,
-                    height: 720,
-                    framerate: 24,
-                  }),
-                }
-              : {}),
+            encodingOptions: new EncodingOptions({
+              width: 1280,
+              height: 720,
+              framerate: 24,
+              // Keep the self-hosted preset's bitrate when using custom encoding.
+              ...(this.config.edition === "self-hosted"
+                ? { videoBitrate: 3000 }
+                : {}),
+            }),
           },
         );
         if (!info.egressId || !this.belongsToRecording(info, meeting, r))

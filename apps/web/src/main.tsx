@@ -835,6 +835,14 @@ function Home({
   );
 }
 
+function canRequestAdmission(state: MeetingState) {
+  return (
+    !state.meeting.ended &&
+    (state.me.status === "kicked" ||
+      (state.me.status === "left" && state.me.role !== "host"))
+  );
+}
+
 function Meeting({
   code,
   hostEntry,
@@ -902,7 +910,6 @@ function Meeting({
         if (controller.signal.aborted) return;
         onAvailable();
         setState((current) => newestMeetingState(current, data));
-        setNeedsJoin(false);
         setError("");
       } catch (e) {
         if (controller.signal.aborted) return;
@@ -930,6 +937,9 @@ function Meeting({
       clearTimeout(timeout);
     };
   }, [code, refresh, bootstrapping, hostError]);
+  useEffect(() => {
+    if (state && !canRequestAdmission(state)) setNeedsJoin(false);
+  }, [state]);
   if (hostError)
     return (
       <Center>
@@ -1034,7 +1044,7 @@ function Meeting({
         {state.me.enforcementPending && !state.meeting.ended && (
           <Notice kind="info">Meeting connections are still closing.</Notice>
         )}
-        {state.me.status === "kicked" && !state.meeting.ended && (
+        {canRequestAdmission(state) && (
           <Button onClick={() => setNeedsJoin(true)}>Request admission</Button>
         )}
         {state.me.role === "host" &&

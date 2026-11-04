@@ -46,6 +46,24 @@ MEDIA_GENERATION_IMAGE="$(docker image inspect covemeet-core:local --format '{{.
 
 The test uses an internal Docker network with no published ports. It mounts the matching compiled phone gateway adapter and writes `test-results/media-generation/media-generation.json`. It does not restart the local installation. If teardown cannot be confirmed, `runtime/media-generation-test/owner.json` retains the exact project and image alongside its private configuration; recover that project before running again. Run this test separately from other media, phone or recording jobs on a laptop.
 
+## Guest rejoin browser regression
+
+`browser-rejoin.test.mjs` uses the built application and an installed Chromium or Chrome with its sandbox enabled. It checks voluntary leave and reentry, form stability across real polls and a stale response, locked-room refusal, waiting-room media denial, host readmission, and banned/ended states. Device and screen capture are blocked and counted; playback is disabled. It has a 90-second test limit and ends only its own meeting before closing its browser.
+
+Install the separate validation dependencies, then run the guarded fixture against images already built from the current source:
+
+```sh
+npm ci --prefix scripts/validation --ignore-scripts --omit=optional
+BROWSER_EXECUTABLE="$(command -v google-chrome || command -v chromium)" \
+BROWSER_REJOIN_IMAGE="$(docker image inspect covemeet-core:generation-test --format '{{.Id}}')" \
+BROWSER_REJOIN_LIVEKIT_IMAGE="$(docker image inspect covemeet-livekit:local --format '{{.Id}}')" \
+  node scripts/browser-rejoin-test.mjs
+```
+
+The guarded runner requires the pinned PostgreSQL image locally, creates a fresh project, binds the API only on an available loopback port, and verifies that its public origin matches that port. It never builds or pulls images. Results are under `test-results/browser-rejoin/`. An unconfirmed cleanup retains the exact project journal and private configuration under `runtime/browser-rejoin-*`; recover that project before another run. Run separately from other media or recording fixtures.
+
+To use an already isolated, self-hosted test installation, set `BASE_URL` to its bare loopback HTTP(S) origin, `BROWSER_EXECUTABLE` to the installed browser's absolute path, and `BROWSER_REJOIN_CREATION_KEY_FILE` to a private file containing that installation's creation key. Then run `node --test scripts/validation/browser-rejoin.test.mjs`. `BROWSER_REJOIN_CREATION_KEY` is an alternative private environment input. HTTPS must already be trusted by both Node and the browser; certificate bypasses are not used.
+
 ## Local development
 
 From the core repository:

@@ -509,13 +509,16 @@ async function main() {
     await health(config);
     return;
   }
+  const upPolicy = flags.has("--no-build")
+    ? ["--no-build", "--pull", "never"]
+    : [];
   if (!flags.has("--no-build")) await config.compose(["build"]);
   if (!config.state.hosted)
     await stopContainers([
       ...(await projectContainers("portal")),
       ...(await projectContainers("portal-postgres")),
     ]);
-  await config.compose(["up", "-d", "--no-deps", "edge"]);
+  await config.compose(["up", "-d", "--no-deps", ...upPolicy, "edge"]);
   let copied = false;
   const pendingCertificate = `${certificatePath}.pending`;
   for (let attempt = 0; attempt < 30; attempt++) {
@@ -564,7 +567,14 @@ async function main() {
       "30",
       "egress",
     ]);
-  await config.compose(["up", "-d", "--wait", "--wait-timeout", "120"]);
+  await config.compose([
+    "up",
+    "-d",
+    "--wait",
+    "--wait-timeout",
+    "120",
+    ...upPolicy,
+  ]);
   if (turnCertificateChanged)
     await config.compose(["restart", "--timeout", "30", "livekit"]);
   await health(config);

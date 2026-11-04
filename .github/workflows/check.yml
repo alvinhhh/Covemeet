@@ -56,7 +56,7 @@ jobs:
         env:
           MAIL_TEST_DATABASE_URL: postgres://mail_test:ci-only-mail-test-password@127.0.0.1:5432/covemeet_mail_test
       - name: Local network and relay validation helpers
-        run: node --test scripts/local-network-test.test.mjs scripts/validation/browser-turn.test.mjs scripts/ci-image-security.test.mjs
+        run: node --test scripts/local-start.test.mjs scripts/local-network-test.test.mjs scripts/validation/browser-turn.test.mjs scripts/ci-image-security.test.mjs
       - run: npm run build
       - name: PostgreSQL certificate validation and plaintext refusal
         run: node scripts/database-tls-test.mjs
@@ -77,6 +77,23 @@ jobs:
         with:
           name: media-generation-validation
           path: test-results/media-generation/*.json
+          if-no-files-found: ignore
+      - name: Browser validation dependencies
+        timeout-minutes: 2
+        run: npm ci --prefix scripts/validation --ignore-scripts --omit=optional --no-audit
+      - name: Guest rejoin browser regression
+        timeout-minutes: 7
+        run: |
+          BROWSER_EXECUTABLE="$(command -v google-chrome || command -v chromium)" \
+          BROWSER_REJOIN_IMAGE="$(docker image inspect covemeet-core:generation-test --format '{{.Id}}')" \
+          BROWSER_REJOIN_LIVEKIT_IMAGE="$(docker image inspect covemeet-livekit:local --format '{{.Id}}')" \
+            node scripts/browser-rejoin-test.mjs
+      - name: Browser regression evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: browser-rejoin-validation
+          path: test-results/browser-rejoin/
           if-no-files-found: ignore
       - name: Isolated phone admission and audio relay
         run: node scripts/phone-test.mjs

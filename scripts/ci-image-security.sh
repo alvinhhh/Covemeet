@@ -24,7 +24,7 @@ core_vex_ready() {
   local reference=$1 image=$2 container='' result=0 directory="$temporary/core-runtime"
   [[ "$reference" == covemeet-core:generation-test ]] || return 1
   [[ -z "$(git ls-files --others --exclude-standard -- .dockerignore Dockerfile package.json package-lock.json apps/api packages)" ]] || return 1
-  [[ "$(git ls-files -z -- .dockerignore Dockerfile package.json package-lock.json apps/api packages | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1)" == 7bc592868bb727efd0c59a74b008550144d2077cbc3dca11eccd884d4e22b13d ]] || return 1
+  [[ "$(git ls-files -z -- .dockerignore Dockerfile package.json package-lock.json apps/api packages | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1)" == 1340acb37f0ee84e1d89b22465fd4d786e611ebc9a1fd492c57aef3085cab521 ]] || return 1
   [[ "$(docker image inspect --format '{{.Architecture}}|{{.Config.User}}|{{json .Config.Cmd}}|{{json .Config.Entrypoint}}' "$image")" == 'amd64|node|["node","apps/api/dist/index.js"]|["docker-entrypoint.sh"]' ]] || return 1
   mkdir -p "$directory"
   container=$(docker create "$image") || return 1

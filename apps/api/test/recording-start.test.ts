@@ -206,25 +206,28 @@ async function hostedFixture(
   return { ...f, now, owner, current, usage, another };
 }
 
-test("hosted capture requests explicit 720p24 while self-hosted keeps recorder defaults", async (t) => {
+test("capture requests 720p24 while preserving each edition's bitrate", async (t) => {
   const selfHosted = await fixture(t);
   await selfHosted.service.start(selfHosted.meeting);
-  assert.deepEqual(selfHosted.startOptions, [{ layout: "grid" }]);
   const hosted = await hostedFixture(t, null);
   hosted.config.edition = "hosted";
   await hosted.service.start(await hosted.current());
   for (const f of [selfHosted, hosted]) {
+    assert.equal(f.startOptions.length, 1);
+    const options = f.startOptions[0]!;
+    assert.equal(options.layout, "grid");
+    assert.ok(options.encodingOptions instanceof EncodingOptions);
+    assert.deepEqual(options.encodingOptions.toJson(), {
+      width: 1280,
+      height: 720,
+      framerate: 24,
+      ...(f === selfHosted ? { videoBitrate: 3000 } : {}),
+    });
     const request = f.jobs[0]?.request;
     assert.ok(request?.case === "roomComposite");
     assert.equal(request.value.fileOutputs[0]?.disableManifest, true);
+    assert.equal((await f.row()).status, "recording");
   }
-  const options = hosted.startOptions[0]!;
-  assert.equal(options.layout, "grid");
-  assert.ok(options.encodingOptions instanceof EncodingOptions);
-  assert.equal(options.encodingOptions.width, 1280);
-  assert.equal(options.encodingOptions.height, 720);
-  assert.equal(options.encodingOptions.framerate, 24);
-  assert.equal((await hosted.row()).status, "recording");
   assert.equal(
     (await hosted.store.hostedUsage(hosted.owner)).recordingSeconds,
     null,
