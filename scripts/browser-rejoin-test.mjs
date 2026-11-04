@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  access, chmod, mkdir, mkdtemp, rm, stat, writeFile,
+} from "node:fs/promises";
 import { constants } from "node:fs";
 import { createServer } from "node:net";
 import path from "node:path";
@@ -71,6 +73,11 @@ await new Promise((resolve, reject) =>
 );
 await mkdir(path.join(root, "runtime"), { recursive: true });
 const directory = await mkdtemp(path.join(root, "runtime/browser-rejoin-"));
+assert.equal(
+  (await stat(directory)).mode & 0o777,
+  0o700,
+  "Fixture runtime directory must remain private",
+);
 const project = `covemeet-browser-rejoin-${randomBytes(6).toString("hex")}`;
 const results = path.join(root, "test-results/browser-rejoin", project);
 await mkdir(results, { recursive: true });
@@ -116,6 +123,9 @@ await writeFile(
   ].join("\n"),
   { mode: 0o600 },
 );
+// Only this file is mounted; the private parent prevents other host users reading it.
+// Container root has no DAC override capability and may not own the Linux bind file.
+await chmod(path.join(directory, "livekit.yaml"), 0o444);
 const owner = {
   project,
   image,
@@ -141,6 +151,7 @@ const compose = [
 let passed = false,
   gone = false,
   attempted = false,
+  startupComplete = false,
   failure;
 try {
   assert.equal(
@@ -195,6 +206,7 @@ try {
     redirect: "error",
   }).then((r) => r.json());
   assert.equal(config.meetingOrigin, base);
+  startupComplete = true;
   let output;
   try {
     output = await run(
@@ -228,6 +240,40 @@ try {
   failure = error;
 } finally {
   if (attempted) {
+    if (!startupComplete) {
+      let diagnostic = {};
+      const redact = (text) => text
+        .replaceAll(livekitKey, "[redacted key]")
+        .replaceAll(livekitSecret, "[redacted secret]");
+      try {
+        const id = await docker([...compose, "ps", "--all", "-q", "livekit"]);
+        assert.match(id, /^[a-f0-9]{64}$/);
+        const state = JSON.parse(await docker([
+          "inspect", "--format",
+          '{"status":{{json .State.Status}},"exitCode":{{json .State.ExitCode}},"oomKilled":{{json .State.OOMKilled}},"error":{{json .State.Error}}}',
+          id,
+        ]));
+        diagnostic = { ...state, error: redact(state.error).slice(0, 2000) };
+        const logs = await run("docker", ["logs", "--timestamps", "--tail", "100", id], {
+          cwd: root,
+          env: dockerEnv,
+          timeout: 5000,
+          maxBuffer: 65536,
+        });
+        diagnostic.log = redact(logs.stdout + logs.stderr).slice(0, 16000);
+      } catch {
+        diagnostic.collectionError = "LiveKit startup diagnostics unavailable";
+      }
+      try {
+        await writeFile(
+          path.join(results, "livekit-startup.json"),
+          JSON.stringify(diagnostic, null, 2) + "\n",
+          { mode: 0o600 },
+        );
+      } catch {
+        // Evidence storage failure must not prevent owned-resource cleanup.
+      }
+    }
     try {
       await docker(
         [...compose, "down", "--volumes", "--remove-orphans"],
