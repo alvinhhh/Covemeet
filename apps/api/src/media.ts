@@ -25,6 +25,7 @@ import {
 } from "livekit-server-sdk";
 import { WebSocket, WebSocketServer } from "ws";
 import { randomUUID } from "node:crypto";
+import type { Duplex } from "node:stream";
 import type { FastifyInstance } from "fastify";
 import type { Config } from "./config.js";
 import type { Meeting, Participant, Store } from "./store.js";
@@ -50,6 +51,8 @@ export class LiveMedia implements Media {
   client: RoomServiceClient;
   verifier: TokenVerifier;
   sockets = new Map<string, Set<WebSocket>>();
+  private closing = false;
+  private pendingUpgrades = new Set<Duplex>();
   constructor(
     public config: Config,
     public store: Store,
@@ -183,6 +186,10 @@ export class LiveMedia implements Media {
       maxPayload: 1024 * 1024,
     });
     app.server.on("upgrade", async (req, socket, head) => {
+      if (this.closing) {
+        socket.destroy();
+        return;
+      }
       const url = new URL(req.url ?? "/", this.config.origin);
       if (!/^\/rtc(?:\/v1)?$/.test(url.pathname)) {
         socket.destroy();
@@ -193,8 +200,12 @@ export class LiveMedia implements Media {
         return;
       }
       const token = url.searchParams.get("access_token") ?? "";
+      this.pendingUpgrades.add(socket);
+      const forgetUpgrade = () => this.pendingUpgrades.delete(socket);
+      socket.once("close", forgetUpgrade);
       try {
         let { m, p } = await this.authorize(token);
+        if (this.closing || socket.destroyed) return;
         const cookie =
           app.parseCookie(req.headers.cookie ?? "")[`mp_${m.code}`] ?? "";
         if (!safeEqual(p.tokenHash, digest(cookie)))
@@ -216,6 +227,8 @@ export class LiveMedia implements Media {
         } else {
           const expected = p;
           const claimed = await this.store.change(m.code, (state) => {
+            if (this.closing || socket.destroyed)
+              throw new HttpError(503, "Media gateway is closing");
             const member = state.participants.find((x) => x.id === expected.id);
             if (
               !member ||
@@ -236,6 +249,7 @@ export class LiveMedia implements Media {
           m = claimed.meeting;
           p = claimed.participant;
         }
+        if (this.closing || socket.destroyed) return;
         wss.handleUpgrade(req, socket, head, (client) => {
           let closed = false;
           let draining = false;
@@ -555,8 +569,13 @@ export class LiveMedia implements Media {
           });
         });
       } catch {
-        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
-        socket.destroy();
+        if (!socket.destroyed) {
+          socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+          socket.destroy();
+        }
+      } finally {
+        this.pendingUpgrades.delete(socket);
+        socket.off("close", forgetUpgrade);
       }
     });
     app.get(
@@ -585,6 +604,9 @@ export class LiveMedia implements Media {
     );
   }
   close() {
+    this.closing = true;
+    for (const socket of this.pendingUpgrades) socket.destroy();
+    this.pendingUpgrades.clear();
     for (const set of this.sockets.values())
       for (const ws of set) ws.terminate();
     this.sockets.clear();

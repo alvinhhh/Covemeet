@@ -130,6 +130,7 @@ async function fixture(t: TestContext, metered = false) {
     return peer;
   };
   return {
+    app,
     token,
     store,
     media,
@@ -146,6 +147,90 @@ async function fixture(t: TestContext, metered = false) {
 async function flush() {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
+
+test("app close releases an active gateway without removing its SFU participant", { timeout: 6000 }, async (t) => {
+  const f = await fixture(t);
+  const client = f.open();
+  await once(client, "message");
+  const before = (await f.store.get(f.m.code))!.participants[0]!;
+  const clientClosed = once(client, "close");
+  const upstreamClosed = once(f.upstreams[0]!, "close");
+  await Promise.race([
+    Promise.all([f.app.close(), clientClosed, upstreamClosed]),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("API shutdown waited for active gateway sockets")), 1500).unref(),
+    ),
+  ]);
+  assert.equal(f.media.sockets.size, 0);
+  assert.deepEqual(f.removals, []);
+  const after = (await f.store.get(f.m.code))!.participants[0]!;
+  assert.equal(after.mediaVersion, before.mediaVersion);
+  assert.equal(after.gatewayConnectionId, before.gatewayConnectionId);
+  assert.equal(after.gatewayPresenceUntil, before.gatewayPresenceUntil);
+});
+
+for (const phase of ["authorization", "unmetered claim", "metered claim"] as const)
+  test(`app close rejects an upgrade resumed after ${phase}`, { timeout: 6000 }, async (t) => {
+    const f = await fixture(t, phase === "metered claim");
+    const entered = gate(), released = gate(), resumed = gate();
+    if (phase === "authorization") {
+      const authorize = f.media.authorize.bind(f.media);
+      f.media.authorize = async (token) => {
+        const result = await authorize(token);
+        entered.resolve();
+        await released.promise;
+        resumed.resolve();
+        return result;
+      };
+    } else if (phase === "unmetered claim") {
+      const change = f.store.change.bind(f.store);
+      f.store.change = async (code, mutate) => {
+        entered.resolve();
+        await released.promise;
+        try {
+          return await change(code, mutate);
+        } finally {
+          resumed.resolve();
+        }
+      };
+    } else {
+      const claim = f.store.updateParticipantMeter.bind(f.store);
+      f.store.updateParticipantMeter = async (code, input) => {
+        const result = await claim(code, input);
+        entered.resolve();
+        await released.promise;
+        resumed.resolve();
+        return result;
+      };
+    }
+    const client = f.open();
+    let opened = false;
+    client.on("open", () => { opened = true; });
+    client.on("error", () => {}); // Closing an unfinished handshake reports an error.
+    const clientClosed = new Promise<void>((resolve) => client.once("close", () => resolve()));
+    try {
+      await entered.promise;
+      const before = (await f.store.get(f.m.code))!.participants[0]!;
+      await Promise.race([
+        Promise.all([f.app.close(), clientClosed]),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("API shutdown waited for pending authorization")), 1500).unref(),
+        ),
+      ]);
+      released.resolve();
+      await resumed.promise;
+      await flush();
+      await flush();
+      assert.equal(opened, false);
+      assert.equal(client.readyState, WebSocket.CLOSED);
+      assert.equal(f.upstreams.length, 0);
+      assert.equal(f.media.sockets.size, 0);
+      assert.deepEqual(f.removals, []);
+      assert.deepEqual((await f.store.get(f.m.code))!.participants[0], before);
+    } finally {
+      released.resolve();
+    }
+  });
 
 test(
   "unmetered stale callback cannot remove a same-version successor, but current expiry still removes media",

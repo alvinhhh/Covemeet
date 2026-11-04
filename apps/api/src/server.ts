@@ -3119,10 +3119,13 @@ export async function createApp(config: Config, store: Store, media: Media) {
       });
   }, 5000);
   timer.unref();
-  app.addHook("onClose", async () => {
+  // Upgraded connections must close before Fastify waits for the HTTP server.
+  app.addHook("preClose", async () => {
     closing = true;
     clearInterval(timer);
     media.close();
+  });
+  app.addHook("onClose", async () => {
     await Promise.all([controlPass, filesPass, deliveryPass, retentionPass]);
     try {
       await mail?.close();
